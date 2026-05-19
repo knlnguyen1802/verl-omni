@@ -462,17 +462,53 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             torch.stack(all_timesteps).unsqueeze(0).expand(state.latents.shape[0], -1) if all_timesteps else None
         )
 
-        output.output = _maybe_to_cpu(output.output)
-        output.custom_output = {
-            "all_latents": _maybe_to_cpu(stacked_latents),
-            "all_log_probs": _maybe_to_cpu(stacked_log_probs),
-            "all_timesteps": _maybe_to_cpu(stacked_timesteps),
-            "prompt_embeds": _maybe_to_cpu(state.prompt_embeds),
-            "prompt_embeds_mask": _maybe_to_cpu(state.prompt_embeds_mask),
-            "negative_prompt_embeds": _maybe_to_cpu(state.negative_prompt_embeds),
-            "negative_prompt_embeds_mask": _maybe_to_cpu(state.negative_prompt_embeds_mask),
+        return self._pack_rollout_output(
+            image=output.output,
+            all_latents=stacked_latents,
+            all_log_probs=stacked_log_probs,
+            all_timesteps=stacked_timesteps,
+            prompt_embeds=state.prompt_embeds,
+            prompt_embeds_mask=state.prompt_embeds_mask,
+            negative_prompt_embeds=state.negative_prompt_embeds,
+            negative_prompt_embeds_mask=state.negative_prompt_embeds_mask,
+            base_output=output,
+        )
+
+    def _pack_rollout_output(
+        self,
+        *,
+        image,
+        all_latents,
+        all_log_probs,
+        all_timesteps,
+        prompt_embeds,
+        prompt_embeds_mask,
+        negative_prompt_embeds,
+        negative_prompt_embeds_mask,
+        base_output: DiffusionOutput | None = None,
+    ) -> DiffusionOutput:
+        """Move rollout tensors to CPU and pack them into a :class:`DiffusionOutput`.
+
+        Shared by :meth:`forward` (request-mode) and :meth:`post_decode`
+        (step-execution mode) so the CPU-move + ``custom_output`` shape lives
+        in one place. ``base_output`` (when provided) is mutated and returned
+        to preserve any metadata already set by the parent ``post_decode``
+        (e.g. ``stage_durations``).
+        """
+        custom_output = {
+            "all_latents": _maybe_to_cpu(all_latents),
+            "all_log_probs": _maybe_to_cpu(all_log_probs),
+            "all_timesteps": _maybe_to_cpu(all_timesteps),
+            "prompt_embeds": _maybe_to_cpu(prompt_embeds),
+            "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
+            "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
+            "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
         }
-        return output
+        if base_output is not None:
+            base_output.output = _maybe_to_cpu(image)
+            base_output.custom_output = custom_output
+            return base_output
+        return DiffusionOutput(output=_maybe_to_cpu(image), custom_output=custom_output)
 
     def forward(
         self,
@@ -714,15 +750,13 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(
-            output=_maybe_to_cpu(image),
-            custom_output={
-                "all_latents": _maybe_to_cpu(all_latents),
-                "all_log_probs": _maybe_to_cpu(all_log_probs),
-                "all_timesteps": _maybe_to_cpu(all_timesteps),
-                "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-                "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-                "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-                "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-            },
+        return self._pack_rollout_output(
+            image=image,
+            all_latents=all_latents,
+            all_log_probs=all_log_probs,
+            all_timesteps=all_timesteps,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
         )
