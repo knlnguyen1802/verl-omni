@@ -28,16 +28,16 @@ source .venv/bin/activate
 For NVIDIA GPU:
 
 ```bash
-uv pip install vllm==0.18.0
-uv pip install vllm-omni==0.18.0
+uv pip install vllm==0.20.2
+uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@c7178d89bb7a70817f239febc84c3b21a714dae7"
 ```
 
 For Ascend NPU:
 
 ```bash
-uv pip install vllm==0.18.0
-uv pip install vllm-ascend==0.18.0
-uv pip install vllm-omni==0.18.0
+uv pip install vllm==0.20.2
+uv pip install "vllm-ascend @ git+https://github.com/vllm-project/vllm-ascend.git@07f6fec2aa4404e1283c4cd6c0981aa878bc5be9"
+uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@c7178d89bb7a70817f239febc84c3b21a714dae7"
 ```
 
 3. Install `verl` followed by `verl-omni` from source:
