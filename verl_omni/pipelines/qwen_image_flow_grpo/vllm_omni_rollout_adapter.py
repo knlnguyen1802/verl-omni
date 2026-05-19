@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import os
 from typing import Any, Literal
 
@@ -103,41 +102,59 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
 
     def encode_prompt(
         self,
-        prompt_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        prompt: str | list[str] | None = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
+        prompt_name: str = "prompt",
+        prompts: list | None = None,
+        prompt_ids: torch.Tensor | list[int] | None = None,
+        attention_mask: torch.Tensor | None = None,
     ):
-        """Encode text prompt token IDs into dense embeddings.
+        """Encode text or pre-tokenized prompts into dense embeddings.
+
+        Override of :meth:`QwenImagePipeline.encode_prompt` that accepts
+        pre-tokenized ``prompt_ids`` in addition to raw text. When called from
+        :meth:`QwenImagePipeline._prepare_generation_context`, ``prompts``
+        (the raw OmniPromptType list) is forwarded; this override extracts
+        ``prompt_ids`` / ``prompt_mask`` from the structured entries so the
+        rollout pipeline can consume tokens produced upstream by the trainer
+        without re-tokenising text. Plain text entries (or the engine's dummy
+        warm-up run) fall back to tokenisation via the Qwen chat template.
 
         Args:
-            prompt_ids (torch.Tensor): Token IDs of shape ``(B, L)`` or ``(L,)``.
-            attention_mask (torch.Tensor, *optional*): Boolean mask of shape
-                ``(B, L)`` for *prompt_ids*; inferred as all-ones when ``None``.
-            num_images_per_prompt (int): Number of images to generate per prompt;
-                embeddings are repeated accordingly.
-            prompt_embeds (torch.Tensor, *optional*): Pre-computed embeddings;
-                when provided *prompt_ids* is ignored.
-            prompt_embeds_mask (torch.Tensor, *optional*): Attention mask for
-                pre-computed *prompt_embeds*.
-            max_sequence_length (int): Maximum sequence length; embeddings are
-                truncated to this value.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: A pair of
-                ``(prompt_embeds, prompt_embeds_mask)`` tensors of shape
-                ``(B * num_images_per_prompt, L, D)`` and
-                ``(B * num_images_per_prompt, L)`` respectively.
+            prompt: Ignored; the parent ``_prepare_generation_context`` passes
+                pre-extracted text here but this override sources tokens from
+                ``prompts`` (or the explicit ``prompt_ids`` kwarg).
+            num_images_per_prompt: Repetition count along the batch dim.
+            prompt_embeds: Pre-computed embeddings; bypasses encoding when given.
+            prompt_embeds_mask: Attention mask for ``prompt_embeds``.
+            max_sequence_length: Maximum embedding sequence length.
+            prompt_name: ``"prompt"`` or ``"negative_prompt"`` field selector.
+            prompts: Raw OmniPromptType list forwarded by the base pipeline.
+            prompt_ids: Optional pre-tokenized ids (used by :meth:`forward`).
+            attention_mask: Optional mask for ``prompt_ids``.
         """
-        prompt_ids = prompt_ids.unsqueeze(0) if prompt_ids.ndim == 1 else prompt_ids
-        attention_mask = (
-            attention_mask.unsqueeze(0) if attention_mask is not None and attention_mask.ndim == 1 else attention_mask
-        )
+        del prompt  # text path handled via prompts list / dummy fallback
+
+        if prompt_embeds is None and prompt_ids is None and prompts:
+            prompt_ids, attention_mask = self._extract_ids_from_prompts(prompts, prompt_name)
+
+        if prompt_embeds is None and prompt_ids is None:
+            return None, None
+
+        if isinstance(prompt_ids, list):
+            prompt_ids = torch.tensor(prompt_ids, device=self.device)
+        if prompt_ids is not None and prompt_ids.ndim == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+        if attention_mask is not None and attention_mask.ndim == 1:
+            attention_mask = attention_mask.unsqueeze(0)
 
         if prompt_embeds is None:
-            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(prompt_ids, attention_mask=attention_mask)
+            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
+                prompt_ids, attention_mask=attention_mask
+            )
 
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
@@ -148,198 +165,43 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
 
         return prompt_embeds, prompt_embeds_mask
 
-    def _extract_prompt_ids(self, prompts):
-        """Extract prompt_ids/mask and their negatives from the OmniCustomPrompt list.
+    def _extract_ids_from_prompts(self, prompts, prompt_name):
+        """Pull ``prompt_ids`` / ``prompt_mask`` for ``prompt_name`` out of *prompts*.
 
-        Falls back to tokenizing ``"prompt"`` / ``"negative_prompt"`` text fields
-        when ``prompt_ids`` is not provided (e.g. during the engine's dummy
-        warm-up run, which always submits a text prompt).
+        Falls back to tokenising the matching text field via the Qwen chat
+        template (covers the engine's dummy warm-up run, which always submits
+        a text prompt). Returns ``(None, None)`` when the field is absent
+        (e.g. negative side with no negative prompt configured).
         """
-        prompt_ids = None
-        prompt_mask = None
-        negative_prompt_ids = None
-        negative_prompt_mask = None
-        if prompts:
-            p0 = prompts[0]
-            if isinstance(p0, dict):
-                prompt_ids = p0.get("prompt_ids", None)
-                prompt_mask = p0.get("prompt_mask", None)
-                negative_prompt_ids = p0.get("negative_prompt_ids", None)
-                negative_prompt_mask = p0.get("negative_prompt_mask", None)
+        if not prompts:
+            return None, None
+        p0 = prompts[0]
+        is_negative = prompt_name == "negative_prompt"
+        ids_key = "negative_prompt_ids" if is_negative else "prompt_ids"
+        mask_key = "negative_prompt_mask" if is_negative else "prompt_mask"
+        text_key = "negative_prompt" if is_negative else "prompt"
 
-                # Fallback: tokenize raw text prompt (covers _dummy_run path).
-                if prompt_ids is None and p0.get("prompt"):
-                    prompt_ids, prompt_mask = self._tokenize_text_prompt(p0["prompt"])
-                if negative_prompt_ids is None and p0.get("negative_prompt"):
-                    negative_prompt_ids, negative_prompt_mask = self._tokenize_text_prompt(p0["negative_prompt"])
-            elif isinstance(p0, str):
-                prompt_ids, prompt_mask = self._tokenize_text_prompt(p0)
-        return prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask
-
-    def _tokenize_text_prompt(self, text: str | list[str]):
-        """Tokenize a text prompt using the Qwen chat template (parent behavior)."""
-        prompt = [text] if isinstance(text, str) else text
-        txt = [self.prompt_template_encode.format(e) for e in prompt]
-        tokens = self.tokenizer(
-            txt,
-            padding=True,
-            truncation=False,
-            return_tensors="pt",
-        ).to(self.device)
-        return tokens.input_ids, tokens.attention_mask
-
-    def prepare_encode(
-        self,
-        state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> "DiffusionRequestState":
-        """Populate *state* with encoded prompts, latents, timesteps, and CFG config.
-
-        Override of ``QwenImagePipeline.prepare_encode`` that accepts pre-tokenized
-        ``prompt_ids`` (and optional ``prompt_mask``) instead of raw text prompts,
-        matching the input contract of ``QwenImagePipelineWithLogProbForTest``.
-        """
-        sampling = state.sampling
-        prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask = self._extract_prompt_ids(
-            state.prompts or []
-        )
-
-        # Normalize list inputs to tensors on device.
-        if isinstance(prompt_ids, list):
-            prompt_ids = torch.tensor(prompt_ids, device=self.device)
-        if isinstance(negative_prompt_ids, list):
-            negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
-
-        if prompt_ids is None:
-            raise ValueError(
-                "QwenImagePipelineWithLogProbForTest.prepare_encode requires either "
-                "'prompt_ids' or a text 'prompt' in state.prompts[0]."
-            )
-
-        height = sampling.height or self.default_sample_size * self.vae_scale_factor
-        width = sampling.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = sampling.num_inference_steps or 50
-        sigmas = sampling.sigmas
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
-        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
-        true_cfg_scale = sampling.true_cfg_scale or 4.0
-        max_sequence_length = sampling.max_sequence_length or self.tokenizer_max_length
-
-        generator = sampling.generator
-        if generator is None and sampling.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(sampling.seed)
-
-        self._guidance_scale = guidance_scale
-        self._attention_kwargs = kwargs.get("attention_kwargs") or {}
-        self._current_timestep = None
-        self._interrupt = False
-
-        if prompt_ids is not None:
-            batch_size = prompt_ids.shape[0] if prompt_ids.ndim == 2 else 1
-        else:
-            batch_size = 1
-
-        has_neg_prompt = negative_prompt_ids is not None
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
-
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-            prompt_ids=prompt_ids,
-            attention_mask=prompt_mask,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-        )
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                prompt_ids=negative_prompt_ids,
-                attention_mask=negative_prompt_mask,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
-        else:
-            negative_prompt_embeds = None
-            negative_prompt_embeds_mask = None
-
-        num_channels_latents = self.transformer.in_channels // 4
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            self.device,
-            generator,
-            None,
-        )
-
-        img_shapes = [[(1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)]] * batch_size
-
-        timesteps, _ = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
-        self._num_timesteps = len(timesteps)
-
-        if self.transformer.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
-        else:
-            guidance = None
-
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
-
-        req_scheduler = copy.deepcopy(self.scheduler)
-        req_scheduler.set_begin_index(0)
-
-        # Resolve SDE / log-prob knobs from sampling extra_args so that the
-        # step-execution path mirrors ``forward()``'s rollout behaviour.
-        extra = sampling.extra_args or {}
-        noise_level = _coalesce_not_none(extra.get("noise_level", None), 0.7)
-        sde_window_size = _coalesce_not_none(extra.get("sde_window_size", None), None)
-        sde_window_range = _coalesce_not_none(extra.get("sde_window_range", None), (0, 5))
-        sde_type = _coalesce_not_none(extra.get("sde_type", None), "sde")
-        logprobs = _coalesce_not_none(extra.get("logprobs", None), True)
-        if sde_window_size is not None:
-            start = torch.randint(
-                sde_window_range[0],
-                sde_window_range[1] - sde_window_size + 1,
-                (1,),
-                generator=generator,
-                device=self.device,
-            ).item()
-            sde_window = (start, start + sde_window_size)
-        else:
-            sde_window = (0, len(timesteps) - 1)
-
-        state.prompt_embeds = prompt_embeds
-        state.prompt_embeds_mask = prompt_embeds_mask
-        state.negative_prompt_embeds = negative_prompt_embeds
-        state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
-        state.latents = latents
-        state.timesteps = timesteps
-        state.step_index = 0
-        state.scheduler = req_scheduler
-        state.do_true_cfg = do_true_cfg
-        state.guidance = guidance
-        state.img_shapes = img_shapes
-        state.txt_seq_lens = txt_seq_lens
-        state.negative_txt_seq_lens = negative_txt_seq_lens
-        state.sampling.cfg_normalize = True
-        # Persist the resolved generator so ``step_scheduler`` (executed
-        # one step at a time by the step-execution engine) keeps drawing
-        # from the same RNG stream as ``forward()``.
-        state.sampling.generator = generator
-        # Rollout / SDE state consumed by ``step_scheduler`` and packaged
-        # into ``custom_output`` by ``post_decode``.
-        state.sde_window = sde_window
-        state.noise_level = noise_level
-        state.sde_type = sde_type
-        state.logprobs = logprobs
-        state.all_latents = []
-        state.all_log_probs = []
-        state.all_timesteps = []
-
-        return state
+        if isinstance(p0, dict):
+            ids = p0.get(ids_key)
+            mask = p0.get(mask_key)
+            if ids is None and p0.get(text_key):
+                text = p0[text_key]
+                txt = [
+                    self.prompt_template_encode.format(t)
+                    for t in ([text] if isinstance(text, str) else text)
+                ]
+                tokens = self.tokenizer(
+                    txt, padding=True, truncation=False, return_tensors="pt"
+                ).to(self.device)
+                ids, mask = tokens.input_ids, tokens.attention_mask
+            return ids, mask
+        if isinstance(p0, str) and not is_negative:
+            txt = [self.prompt_template_encode.format(p0)]
+            tokens = self.tokenizer(
+                txt, padding=True, truncation=False, return_tensors="pt"
+            ).to(self.device)
+            return tokens.input_ids, tokens.attention_mask
+        return None, None
 
     def diffuse(
         self,
@@ -476,18 +338,19 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
     ) -> None:
         """One scheduler step that mirrors the per-iter body of :meth:`diffuse`.
 
-        The default ``QwenImagePipeline.step_scheduler`` calls the standard
-        scheduler.step without SDE noise / log-prob bookkeeping, which means
-        ``step_execution=True`` would silently drop ``all_latents`` /
-        ``all_log_probs`` / ``all_timesteps`` (and the
-        ``prompt_embeds_mask`` consumer downstream would then receive a
-        ``None`` value that turns into a non-tensor ``LinkedList`` inside the
-        training ``TensorDict``).  Override here to keep the step-mode and
-        request-mode trajectories equivalent.
+        Mirrors :meth:`forward`'s SDE noise / log-prob bookkeeping on the
+        step-execution path so that ``step_execution=True`` does not silently
+        drop ``all_latents`` / ``all_log_probs`` / ``all_timesteps``. SDE state
+        (window, noise level, generator, accumulators) is lazily initialised on
+        the first call so the subclass does not need to override
+        ``prepare_encode``.
         """
         del kwargs
         if self.interrupt:
             return
+
+        if state.step_index == 0:
+            self._init_sde_state(state)
 
         i = state.step_index
         timestep_value = state.timesteps[i]
@@ -521,6 +384,49 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             state.all_timesteps.append(timestep_value)
 
         state.step_index += 1
+
+    def _init_sde_state(self, state: DiffusionRequestState) -> None:
+        """Populate SDE / rollout fields on *state* from sampling extra_args.
+
+        Invoked from :meth:`step_scheduler` on the first step so the subclass
+        no longer needs to override ``prepare_encode`` purely for SDE/log-prob
+        bookkeeping. Mirrors the knob resolution previously done in the removed
+        ``prepare_encode``.
+        """
+        sampling = state.sampling
+        extra = sampling.extra_args or {}
+        noise_level = _coalesce_not_none(extra.get("noise_level", None), 0.7)
+        sde_window_size = _coalesce_not_none(extra.get("sde_window_size", None), None)
+        sde_window_range = _coalesce_not_none(extra.get("sde_window_range", None), (0, 5))
+        sde_type = _coalesce_not_none(extra.get("sde_type", None), "sde")
+        logprobs = _coalesce_not_none(extra.get("logprobs", None), True)
+
+        # Backfill a deterministic generator from sampling.seed so the per-step
+        # path draws from the same RNG stream as ``forward()``.
+        generator = sampling.generator
+        if generator is None and sampling.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(sampling.seed)
+            sampling.generator = generator
+
+        if sde_window_size is not None:
+            start = torch.randint(
+                sde_window_range[0],
+                sde_window_range[1] - sde_window_size + 1,
+                (1,),
+                generator=generator,
+                device=self.device,
+            ).item()
+            sde_window = (start, start + sde_window_size)
+        else:
+            sde_window = (0, len(state.timesteps) - 1)
+
+        state.sde_window = sde_window
+        state.noise_level = noise_level
+        state.sde_type = sde_type
+        state.logprobs = logprobs
+        state.all_latents = []
+        state.all_log_probs = []
+        state.all_timesteps = []
 
     def post_decode(
         self,
