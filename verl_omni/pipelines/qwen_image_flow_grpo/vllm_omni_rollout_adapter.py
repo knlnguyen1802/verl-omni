@@ -30,12 +30,6 @@ from .common import apply_true_cfg, build_img_shapes
 __all__ = ["QwenImagePipelineWithLogProb"]
 
 
-def _maybe_to_cpu(value):
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    return value
-
-
 def _coalesce_not_none(value, default):
     return default if value is None else value
 
@@ -203,133 +197,6 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             return tokens.input_ids, tokens.attention_mask
         return None, None
 
-    def diffuse(
-        self,
-        prompt_embeds,
-        prompt_embeds_mask,
-        negative_prompt_embeds,
-        negative_prompt_embeds_mask,
-        latents,
-        img_shapes,
-        txt_seq_lens,
-        negative_txt_seq_lens,
-        timesteps,
-        do_true_cfg,
-        guidance,
-        true_cfg_scale,
-        noise_level,
-        sde_window,
-        sde_type,
-        generator,
-        logprobs,
-    ):
-        """Run the full SDE diffusion loop and collect per-step rollout data.
-
-        Iterates over all timesteps, optionally applying True-CFG guidance, and
-        collects latents and log-probabilities within the SDE window.
-
-        Args:
-            prompt_embeds (torch.Tensor): Positive prompt embeddings.
-            prompt_embeds_mask (torch.Tensor): Attention mask for *prompt_embeds*.
-            negative_prompt_embeds (torch.Tensor): Negative prompt embeddings for CFG.
-            negative_prompt_embeds_mask (torch.Tensor): Attention mask for
-                *negative_prompt_embeds*.
-            latents (torch.Tensor): Initial noisy latents.
-            img_shapes (list): Per-sample image shapes used by the transformer.
-            txt_seq_lens (list[int]): Sequence lengths for positive prompt embeddings.
-            negative_txt_seq_lens (list[int]): Sequence lengths for negative prompt embeddings.
-            timesteps (torch.Tensor): Scheduler timestep sequence.
-            do_true_cfg (bool): Whether to apply True-CFG guidance.
-            guidance (torch.Tensor | None): Guidance scale tensor, or ``None``.
-            true_cfg_scale (float): Classifier-free guidance scale.
-            noise_level (float): SDE noise injection magnitude within the window.
-            sde_window (tuple[int, int]): ``(start, end)`` step indices defining
-                where SDE noise is injected and rollout data is collected.
-            sde_type (str): SDE variant; one of ``"sde"`` or ``"cps"``.
-            generator (torch.Generator | None): Optional random generator for
-                reproducibility.
-            logprobs (bool): Whether to compute and return per-step log-probabilities.
-
-        Returns:
-            tuple: A 4-tuple of
-                ``(latents, all_latents, all_log_probs, all_timesteps)`` where
-                *all_latents* has shape ``(B, W+1, ...)``
-                (W = SDE-window length), *all_log_probs* has shape ``(B, W)``
-                or ``None`` when *logprobs* is ``False``, and *all_timesteps*
-                has shape ``(B, W)``.
-        """
-        all_latents = []
-        all_log_probs = []
-        all_timesteps = []
-        self.scheduler.set_begin_index(0)
-        for i, timestep_value in enumerate(timesteps):
-            if self.interrupt:
-                continue
-
-            if i < sde_window[0]:
-                cur_noise_level = 0.0
-            elif i == sde_window[0]:
-                cur_noise_level = noise_level
-                all_latents.append(latents)
-            elif i > sde_window[0] and i < sde_window[1]:
-                cur_noise_level = noise_level
-            else:
-                cur_noise_level = 0.0
-
-            self._current_timestep = timestep_value
-            # Broadcast timestep to match batch size
-            timestep = timestep_value.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
-            self.transformer.do_true_cfg = do_true_cfg
-            # Forward pass for positive prompt (or unconditional if no CFG)
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-            # Forward pass for negative prompt (CFG)
-            if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-                noise_pred = apply_true_cfg(noise_pred, neg_noise_pred, true_cfg_scale)
-
-            # compute the previous noisy sample x_t -> x_t-1
-            latents, log_prob, _, _ = self.scheduler.step(
-                noise_pred,
-                timestep_value,
-                latents,
-                generator=generator,
-                noise_level=cur_noise_level,
-                sde_type=sde_type,
-                return_logprobs=logprobs,
-                return_dict=False,
-            )
-
-            if i >= sde_window[0] and i < sde_window[1]:
-                all_latents.append(latents)
-                all_log_probs.append(log_prob)
-                all_timesteps.append(timestep_value)
-
-        all_latents = torch.stack(all_latents, dim=1)
-        all_log_probs = torch.stack(all_log_probs, dim=1) if all_log_probs and all_log_probs[0] is not None else None
-        all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
-        return latents, all_latents, all_log_probs, all_timesteps
-
     def step_scheduler(
         self,
         state: DiffusionRequestState,
@@ -462,53 +329,20 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             torch.stack(all_timesteps).unsqueeze(0).expand(state.latents.shape[0], -1) if all_timesteps else None
         )
 
-        return self._pack_rollout_output(
-            image=output.output,
-            all_latents=stacked_latents,
-            all_log_probs=stacked_log_probs,
-            all_timesteps=stacked_timesteps,
-            prompt_embeds=state.prompt_embeds,
-            prompt_embeds_mask=state.prompt_embeds_mask,
-            negative_prompt_embeds=state.negative_prompt_embeds,
-            negative_prompt_embeds_mask=state.negative_prompt_embeds_mask,
-            base_output=output,
+        return DiffusionOutput(
+            output=output.output,
+            custom_output={
+                "all_latents": stacked_latents,
+                "all_log_probs": stacked_log_probs,
+                "all_timesteps": stacked_timesteps,
+                "prompt_embeds": state.prompt_embeds,
+                "prompt_embeds_mask": state.prompt_embeds_mask,
+                "negative_prompt_embeds": state.negative_prompt_embeds,
+                "negative_prompt_embeds_mask": state.negative_prompt_embeds_mask,
+            },
+            stage_durations=output.stage_durations,
+            to_cpu=True,
         )
-
-    def _pack_rollout_output(
-        self,
-        *,
-        image,
-        all_latents,
-        all_log_probs,
-        all_timesteps,
-        prompt_embeds,
-        prompt_embeds_mask,
-        negative_prompt_embeds,
-        negative_prompt_embeds_mask,
-        base_output: DiffusionOutput | None = None,
-    ) -> DiffusionOutput:
-        """Move rollout tensors to CPU and pack them into a :class:`DiffusionOutput`.
-
-        Shared by :meth:`forward` (request-mode) and :meth:`post_decode`
-        (step-execution mode) so the CPU-move + ``custom_output`` shape lives
-        in one place. ``base_output`` (when provided) is mutated and returned
-        to preserve any metadata already set by the parent ``post_decode``
-        (e.g. ``stage_durations``).
-        """
-        custom_output = {
-            "all_latents": _maybe_to_cpu(all_latents),
-            "all_log_probs": _maybe_to_cpu(all_log_probs),
-            "all_timesteps": _maybe_to_cpu(all_timesteps),
-            "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-            "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-            "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-            "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-        }
-        if base_output is not None:
-            base_output.output = _maybe_to_cpu(image)
-            base_output.custom_output = custom_output
-            return base_output
-        return DiffusionOutput(output=_maybe_to_cpu(image), custom_output=custom_output)
 
     def forward(
         self,
@@ -750,13 +584,16 @@ class QwenImagePipelineWithLogProb(QwenImagePipeline):
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return self._pack_rollout_output(
-            image=image,
-            all_latents=all_latents,
-            all_log_probs=all_log_probs,
-            all_timesteps=all_timesteps,
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+        return DiffusionOutput(
+            output=image,
+            custom_output={
+                "all_latents": all_latents,
+                "all_log_probs": all_log_probs,
+                "all_timesteps": all_timesteps,
+                "prompt_embeds": prompt_embeds,
+                "prompt_embeds_mask": prompt_embeds_mask,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            },
+            to_cpu=True,
         )
