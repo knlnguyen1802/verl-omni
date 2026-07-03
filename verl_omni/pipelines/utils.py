@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from diffusers import ModelMixin, SchedulerMixin
 from diffusers.training_utils import compute_density_for_timestep_sampling
 from tensordict import TensorDict
 from verl.utils.device import get_device_name
+from vllm_omni.diffusion.data import DiffusionOutput
 
 from verl_omni.workers.config import DiffusionModelConfig
 
@@ -200,3 +201,68 @@ def forward(
 ) -> torch.Tensor:
     """Forward the model for single-pass prediction-space objectives."""
     return DiffusionModelBase.get_class(model_config).forward(module, model_config, model_inputs, negative_model_inputs)
+
+
+def split_diffusion_output_by_request(
+    result: DiffusionOutput,
+    num_reqs: int,
+    num_outputs_per_prompt: int,
+) -> list[DiffusionOutput]:
+    """Split a batched ``DiffusionOutput`` into one output per request.
+
+    Mirrors vllm-omni's ``split_diffusion_output_by_request`` but also slices
+    every tensor inside ``custom_output`` along dim 0, so per-request RL
+    trajectories (``all_latents``, ``all_log_probs``, ``all_timesteps``,
+    prompt embeddings, and masks) stay aligned with their owning request.
+
+    The caller must build ``result`` with ``to_cpu=True`` (or otherwise move
+    tensors to CPU) before splitting; sliced tensors inherit the source
+    device, so no per-output copy is performed.
+
+    Args:
+        result: Batched ``DiffusionOutput`` whose ``output`` and
+            ``custom_output`` tensors have leading dim ``num_reqs *
+            num_outputs_per_prompt``.
+        num_reqs: Number of requests in the batch.
+        num_outputs_per_prompt: Outputs generated per request (``nipp``).
+
+    Returns:
+        ``list[DiffusionOutput]`` of length ``num_reqs``, each carrying the
+        ``nipp``-wide slice of every batched tensor.
+    """
+    if num_outputs_per_prompt <= 0:
+        raise ValueError(f"num_outputs_per_prompt must be positive, got {num_outputs_per_prompt}.")
+
+    def _slice(value: Any, start: int, stop: int) -> Any:
+        if isinstance(value, tuple):
+            return tuple(_slice(item, start, stop) for item in value)
+        if isinstance(value, list):
+            return value[start:stop]
+        if isinstance(value, torch.Tensor):
+            return value[start:stop]
+        return value
+
+    nipp = num_outputs_per_prompt
+    split_outputs: list[DiffusionOutput] = []
+    for idx in range(num_reqs):
+        start = idx * nipp
+        stop = (idx + 1) * nipp
+        split_outputs.append(
+            DiffusionOutput(
+                output=_slice(result.output, start, stop),
+                error=result.error,
+                error_status_code=result.error_status_code,
+                error_type=result.error_type,
+                aborted=result.aborted,
+                abort_message=result.abort_message,
+                finished=result.finished,
+                chunk_index=result.chunk_index,
+                total_chunks=result.total_chunks,
+                stage_durations=result.stage_durations,
+                peak_memory_mb=result.peak_memory_mb,
+                custom_output={
+                    key: _slice(value, start, stop) for key, value in (result.custom_output or {}).items()
+                },
+            )
+        )
+    return split_outputs

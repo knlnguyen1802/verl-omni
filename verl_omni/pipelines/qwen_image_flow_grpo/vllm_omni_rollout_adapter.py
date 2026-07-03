@@ -13,20 +13,71 @@
 # limitations under the License.
 
 import os
-from typing import Any, Literal
 
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.pipelines.utils import split_diffusion_output_by_request
 
 from .common import QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
 
 __all__ = ["QwenImagePipelineWithLogProb"]
+
+
+def _collate_prompt_tokens(
+    prompts: list,
+    ids_field: str,
+    mask_field: str,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+    """Collect per-request 1-D token-id sequences and right-pad to a common length.
+
+    Returns ``(ids, attention_mask)`` of shape ``(N, max_len)`` on ``device``, or
+    ``(None, None)`` when no request provides ``ids_field``. Each request's own
+    ``mask_field`` (if present) supplies valid positions; padding gets mask 0.
+    """
+    ids_per_req: list[list[int]] = []
+    mask_per_req: list[list[int]] = []
+    provided = False
+    for prompt in prompts:
+        if not isinstance(prompt, dict):
+            ids_per_req.append(None)  # type: ignore[arg-type]
+            mask_per_req.append(None)  # type: ignore[arg-type]
+            continue
+        raw_ids = prompt.get(ids_field)
+        if raw_ids is None:
+            ids_per_req.append(None)  # type: ignore[arg-type]
+            mask_per_req.append(None)  # type: ignore[arg-type]
+            continue
+        provided = True
+        ids_list = raw_ids.tolist() if isinstance(raw_ids, torch.Tensor) else list(raw_ids)
+        raw_mask = prompt.get(mask_field)
+        if raw_mask is None:
+            mask_list = [1] * len(ids_list)
+        else:
+            mask_list = raw_mask.tolist() if isinstance(raw_mask, torch.Tensor) else list(raw_mask)
+            mask_list = [int(bool(m)) for m in mask_list]
+        ids_per_req.append(ids_list)
+        mask_per_req.append(mask_list)
+
+    if not provided:
+        return None, None
+
+    max_len = max(len(x) for x in ids_per_req if x is not None)
+    num_reqs = len(ids_per_req)
+    ids = torch.zeros(num_reqs, max_len, dtype=torch.long)
+    mask = torch.zeros(num_reqs, max_len, dtype=torch.long)
+    for i, (x, m) in enumerate(zip(ids_per_req, mask_per_req)):
+        if x is None:
+            continue
+        ids[i, : len(x)] = torch.tensor(x, dtype=torch.long)
+        mask[i, : len(m)] = torch.tensor(m, dtype=torch.long)
+    return ids.to(device), mask.to(device)
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="flow_grpo")
@@ -40,7 +91,15 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
     and the corresponding timesteps.
 
     Registered under ``"QwenImagePipeline"`` for vllm-omni rollout dispatch.
+
+    The request-batch contract (``supports_request_batch = True``) lets the
+    vLLM-Omni scheduler coalesce compatible concurrent rollout requests into a
+    single fused ``forward``. Per-request prompts are right-padded to a common
+    length, the SDE window is shared across the wave, and the resulting
+    tensors are sliced back to one :class:`DiffusionOutput` per request.
     """
+
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -186,151 +245,90 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
         all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
         return latents, all_latents, all_log_probs, all_timesteps
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt_token_ids: torch.Tensor | list[int] | None = None,
-        prompt_mask: torch.Tensor | None = None,
-        negative_prompt_ids: torch.Tensor | list[int] | None = None,
-        negative_prompt_mask: torch.Tensor | None = None,
-        true_cfg_scale: float = 4.0,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 1.0,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        prompt_embeds_mask: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds_mask: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end_tensor_inputs: tuple[str, ...] = ("latents",),
-        max_sequence_length: int = 512,
-        noise_level: float = 0.7,
-        sde_window_size: int | None = None,
-        sde_window_range: tuple[int, int] = (0, 5),
-        sde_type: Literal["sde", "cps"] = "sde",
-        logprobs: bool = True,
-    ) -> DiffusionOutput:
-        """End-to-end image generation with rollout data collection.
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """End-to-end batched image generation with rollout data collection.
 
-        Encodes the prompt, prepares latents, runs the SDE diffusion loop via
-        :meth:`diffuse`, and decodes the final latents through the VAE.  Sampling
-        parameters in *req* take precedence over the keyword arguments.
+        Encodes prompts, prepares latents, runs the SDE diffusion loop via
+        :meth:`diffuse`, decodes the final latents through the VAE, and slices
+        the batched result into one :class:`DiffusionOutput` per request.
 
-        Args:
-            req (OmniDiffusionRequest): Rollout request containing prompts and
-                :class:`~vllm_omni.diffusion.data.OmniDiffusionSamplingParams`.
-            prompt_token_ids (torch.Tensor | list[int], *optional*): Token IDs for
-                the positive prompt.
-            prompt_mask (torch.Tensor, *optional*): Attention mask for *prompt_token_ids*.
-            negative_prompt_ids (torch.Tensor | list[int], *optional*): Token IDs
-                for the negative prompt used in True-CFG.
-            negative_prompt_mask (torch.Tensor, *optional*): Attention mask for
-                *negative_prompt_ids*.
-            true_cfg_scale (float): Classifier-free guidance scale; CFG is
-                disabled when ``<= 1``.
-            height (int, *optional*): Output image height in pixels.
-            width (int, *optional*): Output image width in pixels.
-            num_inference_steps (int): Number of denoising steps.
-            sigmas (list[float], *optional*): Custom sigmas for the scheduler.
-            guidance_scale (float): Distilled guidance scale embedded in the
-                transformer (``guidance_embeds`` mode).
-            num_images_per_prompt (int): Number of images to generate per prompt.
-            generator (torch.Generator | list[torch.Generator], *optional*):
-                Random generator(s) for reproducibility.
-            latents (torch.Tensor, *optional*): Pre-generated initial latents;
-                sampled from a Gaussian when ``None``.
-            prompt_embeds (torch.Tensor, *optional*): Pre-computed positive
-                prompt embeddings; bypasses the text encoder.
-            prompt_embeds_mask (torch.Tensor, *optional*): Attention mask for
-                pre-computed *prompt_embeds*.
-            negative_prompt_embeds (torch.Tensor, *optional*): Pre-computed
-                negative prompt embeddings.
-            negative_prompt_embeds_mask (torch.Tensor, *optional*): Attention
-                mask for *negative_prompt_embeds*.
-            output_type (str, *optional*): Format of the returned image;
-                ``"latent"`` returns raw latents, otherwise the VAE-decoded image.
-            attention_kwargs (dict, *optional*): Extra keyword arguments forwarded
-                to the attention layers.
-            callback_on_step_end_tensor_inputs (tuple[str, ...]): Names of tensors
-                to expose in the step-end callback.
-            max_sequence_length (int): Maximum prompt embedding sequence length.
-            noise_level (float): SDE noise injection magnitude within the window.
-            sde_window_size (int, *optional*): Number of SDE steps; when ``None``
-                the full timestep range is used.
-            sde_window_range (tuple[int, int]): ``(start, end)`` range from which
-                the SDE window start position is randomly sampled.
-            sde_type (str): SDE variant; ``"sde"`` or ``"cps"``.
-            logprobs (bool): Whether to compute per-step log-probabilities.
+        The vLLM-Omni scheduler groups only compatible requests (same shape,
+        CFG, step count, LoRA) into one wave, so sampling parameters are read
+        from the first request and applied to the whole batch. Per-request
+        prompts are right-padded to a common length. The SDE window is shared
+        across the wave; initial latent noise stays per-request via each
+        request's own generator (created from its seed by the runner before
+        this call).
 
         Returns:
-            DiffusionOutput: Contains the decoded *output* image and a
-                *custom_output* dict with keys ``"all_latents"``,
-                ``"all_log_probs"``, ``"all_timesteps"``, ``"prompt_embeds"``,
-                ``"prompt_embeds_mask"``, ``"negative_prompt_embeds"``, and
-                ``"negative_prompt_embeds_mask"``.
+            list[DiffusionOutput]: One per request, each carrying the decoded
+            *output* image slice and a *custom_output* dict with keys
+            ``"all_latents"``, ``"all_log_probs"``, ``"all_timesteps"``,
+            ``"prompt_embeds"``, ``"prompt_embeds_mask"``,
+            ``"negative_prompt_embeds"``, and ``"negative_prompt_embeds_mask"``.
         """
-        custom_prompt = req.prompts[0] if req.prompts else {}
-        if isinstance(custom_prompt, dict):
-            prompt_token_ids = custom_prompt.get("prompt_token_ids", prompt_token_ids)
-            prompt_mask = custom_prompt.get("prompt_mask", prompt_mask)
-            negative_prompt_ids = custom_prompt.get("negative_prompt_ids", negative_prompt_ids)
-            negative_prompt_mask = custom_prompt.get("negative_prompt_mask", negative_prompt_mask)
+        prompts = req.prompts
+        sampling_params_list = req.sampling_params_list
+        common = sampling_params_list[0]
 
-        sampling_params = req.sampling_params
-        height = sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = sampling_params.num_inference_steps or num_inference_steps
-        max_sequence_length = sampling_params.max_sequence_length or max_sequence_length
+        height = common.height or self.default_sample_size * self.vae_scale_factor
+        width = common.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = common.num_inference_steps or 50
+        sigmas = common.sigmas
+        max_sequence_length = common.max_sequence_length or 512
+        output_type = common.output_type or "pil"
+        true_cfg_scale = coalesce_not_none(common.true_cfg_scale, 4.0)
+        if common.guidance_scale_provided:
+            guidance_scale = common.guidance_scale
+        else:
+            guidance_scale = 1.0
 
-        noise_level = coalesce_not_none(sampling_params.extra_args.get("noise_level", None), noise_level)
-        sde_window_size = coalesce_not_none(sampling_params.extra_args.get("sde_window_size", None), sde_window_size)
-        sde_window_range = coalesce_not_none(sampling_params.extra_args.get("sde_window_range", None), sde_window_range)
-        sde_type = coalesce_not_none(sampling_params.extra_args.get("sde_type", None), sde_type)
-        logprobs = coalesce_not_none(sampling_params.extra_args.get("logprobs", None), logprobs)
+        extra = common.extra_args or {}
+        noise_level = coalesce_not_none(extra.get("noise_level", None), 0.7)
+        sde_window_size = coalesce_not_none(extra.get("sde_window_size", None), None)
+        sde_window_range = coalesce_not_none(extra.get("sde_window_range", None), (0, 5))
+        sde_type = coalesce_not_none(extra.get("sde_type", None), "sde")
+        logprobs = coalesce_not_none(extra.get("logprobs", None), True)
 
-        generator = sampling_params.generator or generator
-        if generator is None and sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(sampling_params.seed)
-        true_cfg_scale = coalesce_not_none(sampling_params.true_cfg_scale, true_cfg_scale)
-        req_num_outputs = getattr(sampling_params, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        req_num_outputs = getattr(common, "num_outputs_per_prompt", None)
+        num_images_per_prompt = req_num_outputs if req_num_outputs and req_num_outputs > 0 else 1
+
+        prompt_token_ids, prompt_mask = _collate_prompt_tokens(
+            prompts, "prompt_token_ids", "prompt_mask", self.device
+        )
+        negative_prompt_ids, negative_prompt_mask = _collate_prompt_tokens(
+            prompts, "negative_prompt_ids", "negative_prompt_mask", self.device
+        )
+
+        # Warmup / dummy run with no usable prompts: one empty output per request.
+        if prompt_token_ids is None:
+            return [DiffusionOutput(output=None, custom_output={}) for _ in range(req.num_reqs)]
+
+        batch_size = prompt_token_ids.shape[0]
+        has_neg_prompt = negative_prompt_ids is not None
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+
+        # Per-request generators are created from seeds by the runner before
+        # this call. Collate into one generator per generated image so initial
+        # latent noise stays per-request seeded. The SDE window and SDE noise
+        # injection share a single generator across the wave (GRPO-consistent).
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        if generator is None and common.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(common.seed)
+        # prepare_latents accepts a list whose length matches the image count;
+        # unwrap to a single generator when there is only one image to preserve
+        # the legacy single-request RNG path exactly.
+        latents_generator = generator[0] if isinstance(generator, list) and len(generator) == 1 else generator
+        window_generator = generator[0] if isinstance(generator, list) else generator
 
         self._guidance_scale = guidance_scale
-        self._attention_kwargs = attention_kwargs
+        self._attention_kwargs = None
         self._current_timestep = None
         self._interrupt = False
 
-        if prompt_token_ids is not None:
-            if isinstance(prompt_token_ids, list):
-                prompt_token_ids = torch.tensor(prompt_token_ids, device=self.device)
-            batch_size = prompt_token_ids.shape[0] if prompt_token_ids.ndim == 2 else 1
-        elif prompt_embeds is not None:
-            batch_size = prompt_embeds.shape[0]
-        else:
-            # Both prompt_token_ids and prompt_embeds are None (e.g. during warmup/dummy run).
-            # Return a minimal dummy output to avoid crashing.
-            return DiffusionOutput(output=None, custom_output={})
-
-        if isinstance(negative_prompt_ids, list):
-            negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
-
-        has_neg_prompt = negative_prompt_ids is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
-
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt_ids=prompt_token_ids,
             attention_mask=prompt_mask,
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
         )
@@ -338,11 +336,12 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
                 prompt_ids=negative_prompt_ids,
                 attention_mask=negative_prompt_mask,
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
 
         num_channels_latents = self.transformer.in_channels // 4
         latents = self.prepare_latents(
@@ -352,8 +351,8 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             width,
             prompt_embeds.dtype,
             self.device,
-            generator,
-            latents,
+            latents_generator,
+            None,
         )
         img_shapes = build_img_shapes(height, width, batch_size, self.vae_scale_factor)
 
@@ -379,7 +378,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
                 sde_window_range[0],
                 sde_window_range[1] - sde_window_size + 1,
                 (1,),
-                generator=generator,
+                generator=window_generator,
                 device=self.device,
             ).item()
             end = start + sde_window_size
@@ -403,7 +402,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             noise_level,
             sde_window,
             sde_type,
-            generator,
+            window_generator,
             logprobs,
         )
 
@@ -424,7 +423,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(
+        batch_result = DiffusionOutput(
             output=image,
             custom_output={
                 "all_latents": all_latents,
@@ -436,4 +435,9 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
                 "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
             },
             to_cpu=True,
+        )
+        return split_diffusion_output_by_request(
+            batch_result,
+            num_reqs=req.num_reqs,
+            num_outputs_per_prompt=num_images_per_prompt,
         )

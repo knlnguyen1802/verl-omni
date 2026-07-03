@@ -38,7 +38,8 @@ from __future__ import annotations
 import random as _random
 from typing import Any
 
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb
@@ -50,9 +51,13 @@ __all__ = ["QwenImageMixGRPOPipelineWithLogProb"]
 class QwenImageMixGRPOPipelineWithLogProb(QwenImagePipelineWithLogProb):
     """Rollout pipeline for Qwen-Image with the MixGRPO algorithm."""
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs: Any):
-        self._maybe_make_progressive_window(req.sampling_params.extra_args, kwargs)
-        return super().forward(req, **kwargs)
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        # The scheduler batches only compatible requests, so the first
+        # request's extra_args represent the whole wave. Mutate the SDE window
+        # position in place before delegating to the batched base forward.
+        extra = req.sampling_params_list[0].extra_args or {}
+        self._maybe_make_progressive_window(extra, {})
+        return super().forward(req)
 
     @staticmethod
     def _maybe_make_progressive_window(extra: dict[str, Any], kwargs: dict[str, Any]) -> None:
