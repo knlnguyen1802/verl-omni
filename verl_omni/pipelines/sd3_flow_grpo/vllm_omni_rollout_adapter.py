@@ -216,6 +216,12 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
         model_dtype = self._model_dtype()
         self.scheduler.set_begin_index(0)
 
+        # Pre-cast a model-dtype copy of the timestep schedule once, so the
+        # per-step transformer input does not trigger an ``aten::to`` (and an
+        # H2D copy) on every denoising iteration. The fp32 ``timesteps`` are
+        # retained for the scheduler's ``index_for_timestep`` equality lookup.
+        timesteps_model = timesteps.to(device=self.device, dtype=model_dtype)
+
         for i, timestep_value in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -231,10 +237,11 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
                 cur_noise_level = 0.0
 
             self._current_timestep = timestep_value
-            timestep = timestep_value.expand(latents.shape[0]).to(device=self.device, dtype=model_dtype)
+            timestep = timesteps_model[i].expand(latents.shape[0])
 
-            # Cast to model dtype for the transformer forward (the scheduler
-            # returns fp32 latents).
+            # Cast latents to model dtype for the transformer forward only; the
+            # scheduler keeps its own fp32 math, so we re-cast each step from the
+            # fp32 latents it returns.
             x = latents.to(model_dtype)
 
             positive_kwargs = {
