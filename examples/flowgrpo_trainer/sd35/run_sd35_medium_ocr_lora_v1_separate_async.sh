@@ -51,9 +51,7 @@ ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND:-TORCH_SDPA}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 
 # Separate-async specific knobs.
-# CKPT_BACKEND supports explicit backends ("nccl"/"nixl"/"mooncake"/"hccl") or
-# "auto" to select the first registered backend in that order.
-CKPT_BACKEND=${CKPT_BACKEND:-auto}
+CKPT_BACKEND=${CKPT_BACKEND:-nccl}                 # non-naive checkpoint backend
 NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-1}
 PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}            # must equal ppo_mini_batch_size
@@ -66,36 +64,31 @@ fi
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
 
-if [ "$CKPT_BACKEND" = "auto" ]; then
-    CKPT_BACKEND=$(python3 - <<'PY'
-from verl.checkpoint_engine import CheckpointEngineRegistry
-
-preferred = ["nccl", "nixl", "mooncake", "hccl"]
-registered = CheckpointEngineRegistry._registry
-for backend in preferred:
-    if backend in registered:
-        print(backend)
-        break
-PY
-)
-    if [ -z "$CKPT_BACKEND" ]; then
-        echo "No non-naive checkpoint backend is registered for separate_async training."
-        echo "Install a supported backend dependency (e.g. cupy for nccl/nixl),"
-        echo "or set CKPT_BACKEND to one that is available in your environment."
-        exit 1
-    fi
-fi
-
-export CKPT_BACKEND
-python3 - <<'PY'
-import os
+# Pre-flight: verify the requested checkpoint backend is importable. The verl
+# package silently swallows ImportError when registering nccl/nixl/mooncake, so
+# we surface the real missing-dependency error here instead of failing later
+# with "Checkpoint engine <backend> not registered".
+python3 - <<PY
+import importlib
 import sys
-from verl.checkpoint_engine import CheckpointEngineRegistry
 
-backend = os.environ["CKPT_BACKEND"]
-if backend not in CheckpointEngineRegistry._registry:
-    print(f"Requested CKPT_BACKEND='{backend}' is not registered.")
-    print(f"Registered backends: {sorted(CheckpointEngineRegistry._registry.keys())}")
+backend = "$CKPT_BACKEND"
+module_map = {
+    "nccl": "verl.checkpoint_engine.nccl_checkpoint_engine",
+    "nixl": "verl.checkpoint_engine.nixl_checkpoint_engine",
+    "mooncake": "verl.checkpoint_engine.mooncake_checkpoint_engine",
+    "hccl": "verl.checkpoint_engine.hccl_checkpoint_engine",
+}
+mod = module_map.get(backend)
+if mod is None:
+    sys.exit(0)  # unknown/custom backend; skip pre-flight
+try:
+    importlib.import_module(mod)
+except Exception as e:
+    print(f"Checkpoint backend '{backend}' could not be imported: {e}", file=sys.stderr)
+    print(f"Install the required dependency. For 'nccl' that is typically:", file=sys.stderr)
+    print(f"  pip install cupy-cuda12x   # match your CUDA major version (11x/12x/13x)", file=sys.stderr)
+    print(f"  pip install pyzmq", file=sys.stderr)
     sys.exit(1)
 PY
 
