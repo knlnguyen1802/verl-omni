@@ -495,6 +495,66 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         # TODO (mike): implement this once DP is supported.
         pass
 
+    # -----------------------------------------------------------------------
+    # Abort: AsyncOmni has no `output_processor` (it routes through an
+    # Orchestrator process and tracks state in `AsyncOmni.request_states`),
+    # so the parent's AsyncLLM-specific implementation must be overridden.
+    # -----------------------------------------------------------------------
+
+    async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        """Abort all in-flight requests on the AsyncOmni engine.
+
+        Mirrors the parent's vLLM<0.12 path (abort in-flight + optional cache
+        reset, with no pause/resume dependency) so this can never leave the
+        engine in a paused state that would block generation. ``AsyncOmni``
+        tracks in-flight state in ``request_states`` (keyed by internal IDs,
+        each carrying the user-facing ``external_request_id``) and exposes
+        ``abort(request_ids)`` instead of ``output_processor.abort_requests``.
+        """
+        engine = self.engine
+        if getattr(engine, "output_processor", None) is not None:
+            return await super().abort_all_requests(reset_prefix_cache)
+
+        try:
+            request_ids: list[str] = []
+            seen: set[str] = set()
+            for state in engine.request_states.values():
+                ext = getattr(state, "external_request_id", None)
+                if ext is None or ext in seen:
+                    continue
+                seen.add(ext)
+                request_ids.append(ext)
+
+            if request_ids:
+                await engine.abort(request_ids)
+
+            if reset_prefix_cache:
+                await self.clear_kv_cache()
+                logger.info("Prefix cache reset after abort")
+
+            logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
+            return {"aborted_count": len(request_ids), "request_ids": request_ids}
+        except Exception as e:
+            logger.error(f"Error aborting requests: {e}")
+            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
+
+    async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        """Abort a single in-flight request on the AsyncOmni engine."""
+        engine = self.engine
+        if getattr(engine, "output_processor", None) is not None:
+            return await super().abort_request(request_id, reset_prefix_cache)
+
+        try:
+            await engine.abort(request_id)
+            if reset_prefix_cache:
+                await self.clear_kv_cache()
+                logger.info(f"Prefix cache reset after abort request {request_id}")
+            logger.info(f"Aborted request: {request_id}")
+            return {"aborted": True, "request_id": request_id}
+        except Exception as e:
+            logger.error(f"Error aborting request {request_id}: {e}")
+            return {"aborted": False, "request_id": request_id, "error": str(e)}
+
 
 class vLLMOmniReplica(vLLMReplica):
     def __init__(
