@@ -51,7 +51,9 @@ ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND:-TORCH_SDPA}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 
 # Separate-async specific knobs.
-CKPT_BACKEND=${CKPT_BACKEND:-nccl}                 # non-naive checkpoint backend
+# CKPT_BACKEND supports explicit backends ("nccl"/"nixl"/"mooncake"/"hccl") or
+# "auto" to select the first registered backend in that order.
+CKPT_BACKEND=${CKPT_BACKEND:-auto}
 NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-1}
 PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}            # must equal ppo_mini_batch_size
@@ -63,6 +65,39 @@ fi
 
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
+
+if [ "$CKPT_BACKEND" = "auto" ]; then
+    CKPT_BACKEND=$(python3 - <<'PY'
+from verl.checkpoint_engine import CheckpointEngineRegistry
+
+preferred = ["nccl", "nixl", "mooncake", "hccl"]
+registered = CheckpointEngineRegistry._registry
+for backend in preferred:
+    if backend in registered:
+        print(backend)
+        break
+PY
+)
+    if [ -z "$CKPT_BACKEND" ]; then
+        echo "No non-naive checkpoint backend is registered for separate_async training."
+        echo "Install a supported backend dependency (e.g. cupy for nccl/nixl),"
+        echo "or set CKPT_BACKEND to one that is available in your environment."
+        exit 1
+    fi
+fi
+
+export CKPT_BACKEND
+python3 - <<'PY'
+import os
+import sys
+from verl.checkpoint_engine import CheckpointEngineRegistry
+
+backend = os.environ["CKPT_BACKEND"]
+if backend not in CheckpointEngineRegistry._registry:
+    print(f"Requested CKPT_BACKEND='{backend}' is not registered.")
+    print(f"Registered backends: {sorted(CheckpointEngineRegistry._registry.keys())}")
+    sys.exit(1)
+PY
 
 python3 -m verl_omni.trainer.main_diffusion_v1 \
     data.train_files=$ocr_train_path \
