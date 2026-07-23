@@ -440,6 +440,25 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             )
 
         # diffusion
+        # Handle aborted requests: the engine may yield a terminal output with
+        # finish_reason="abort" and no images (e.g. when abort_all_requests
+        # synthesizes an abort OutputMessage to unblock the generate() coroutine).
+        # Return a DiffusionOutput with stop_reason="aborted" so the retry client
+        # can retry the whole sample.
+        if final_res is None or not final_res.images:
+            finish_reason = "abort"
+            if final_res is not None and final_res.request_output is not None:
+                finish_reason = getattr(final_res.request_output, "finish_reason", None) or "abort"
+            stop_reason = self._map_stop_reason(finish_reason)
+            logger.debug("diffusion rollout produced no image (finish_reason=%s); returning %s", finish_reason, stop_reason)
+            return DiffusionOutput(
+                diffusion_output=torch.empty(0),
+                log_probs=None,
+                stop_reason=stop_reason,
+                num_preempted=None,
+                extra_fields={"global_steps": self.global_steps},
+            )
+
         assert final_res is not None
         diffusion_output = final_res.images[0]
         if isinstance(diffusion_output, torch.Tensor):
@@ -510,23 +529,52 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         tracks in-flight state in ``request_states`` (keyed by internal IDs,
         each carrying the user-facing ``external_request_id``) and exposes
         ``abort(request_ids)`` instead of ``output_processor.abort_requests``.
+
+        Unlike the parent (which manually enqueues a ``FinishReason.ABORT``
+        ``RequestOutput`` into each per-request queue so the ``generate()``
+        generator can drain and return), ``AsyncOmni.generate()`` reads from a
+        per-request ``asyncio.Queue`` expecting ``OutputMessage`` / ``ErrorMessage``
+        objects. ``engine.abort()`` tells the Orchestrator to clean up
+        ``Orchestrator.request_states`` *before* the diffusion engine emits the
+        abort output, so the Orchestrator drops it ("Dropping output for unknown
+        req") and the ``generate()`` generator would hang forever.
+
+        To avoid that hang we snapshot the in-flight ``ClientRequestState``
+        objects *before* calling ``engine.abort()`` and then, after the abort,
+        synthesize a terminal ``OutputMessage`` (``finished=True``) for each
+        request and put it directly into the per-request queue. This unblocks
+        ``_process_orchestrator_results`` so ``generate()`` can yield a final
+        abort output and return, letting ``DiffusionWholeSampleRetryLLMServerClient``
+        see ``stop_reason="aborted"`` and retry the whole sample.
         """
         engine = self.engine
         if getattr(engine, "output_processor", None) is not None:
             return await super().abort_all_requests(reset_prefix_cache)
 
         try:
-            request_ids: list[str] = []
+            # Snapshot in-flight states (internal_id -> ClientRequestState) BEFORE
+            # engine.abort() pops them from AsyncOmni.request_states. We need the
+            # per-request asyncio.Queue references to unblock the generate() coroutines.
+            in_flight_states: list[tuple[str, Any]] = []
             seen: set[str] = set()
             for state in engine.request_states.values():
                 ext = getattr(state, "external_request_id", None)
                 if ext is None or ext in seen:
                     continue
                 seen.add(ext)
-                request_ids.append(ext)
+                in_flight_states.append((state.request_id, state))
+
+            request_ids = [s.external_request_id for _, s in in_flight_states]
 
             if request_ids:
                 await engine.abort(request_ids)
+
+            # Synthesize terminal abort OutputMessages and put them directly into
+            # each per-request queue so _process_orchestrator_results can drain
+            # and return. Without this, generate() hangs forever because the
+            # Orchestrator already dropped the real abort output.
+            for internal_id, state in in_flight_states:
+                self._enqueue_abort_output(internal_id, state)
 
             if reset_prefix_cache:
                 await self.clear_kv_cache()
@@ -538,6 +586,53 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             logger.error(f"Error aborting requests: {e}")
             return {"aborted_count": 0, "request_ids": [], "error": str(e)}
 
+    def _enqueue_abort_output(self, internal_id: str, req_state: Any) -> None:
+        """Synthesize a terminal abort OutputMessage and put it into a per-request queue.
+
+        ``_process_orchestrator_results`` reads from ``req_state.queue`` and
+        expects ``OutputMessage`` (or ``ErrorMessage``) objects. We build a
+        minimal ``OmniRequestOutput`` carrying a ``RequestOutput`` with
+        ``finish_reason="abort"`` so that ``_process_single_result`` yields it
+        and ``_process_output`` maps it to ``stop_reason="aborted"``.
+        """
+        from vllm.outputs import CompletionOutput, RequestOutput
+
+        from vllm_omni.engine.messages import OutputMessage
+        from vllm_omni.outputs import OmniRequestOutput
+
+        completion = CompletionOutput(
+            index=0,
+            text="",
+            token_ids=[],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason="abort",
+            stop_reason=None,
+        )
+        request_output = RequestOutput(
+            request_id=internal_id,
+            prompt=None,
+            prompt_token_ids=[],
+            prompt_logprobs=None,
+            outputs=[completion],
+            finished=True,
+        )
+        omni_output = OmniRequestOutput(
+            request_id=internal_id,
+            finished=True,
+            request_output=request_output,
+        )
+        # Use the final stage so _process_single_result's stage_meta.final_output
+        # check passes and the output is yielded (not silently dropped).
+        final_stage_id = max(0, getattr(self.engine, "num_stages", 1) - 1)
+        msg = OutputMessage(
+            request_id=internal_id,
+            stage_id=final_stage_id,
+            engine_outputs=omni_output,
+            finished=True,
+        )
+        req_state.queue.put_nowait(msg)
+
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a single in-flight request on the AsyncOmni engine."""
         engine = self.engine
@@ -545,7 +640,19 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             return await super().abort_request(request_id, reset_prefix_cache)
 
         try:
+            # Snapshot the in-flight state before engine.abort() pops it, so we
+            # can unblock the generate() coroutine with a synthetic abort output.
+            in_flight_state = None
+            for state in engine.request_states.values():
+                if getattr(state, "external_request_id", None) == request_id:
+                    in_flight_state = state
+                    break
+
             await engine.abort(request_id)
+
+            if in_flight_state is not None:
+                self._enqueue_abort_output(in_flight_state.request_id, in_flight_state)
+
             if reset_prefix_cache:
                 await self.clear_kv_cache()
                 logger.info(f"Prefix cache reset after abort request {request_id}")
