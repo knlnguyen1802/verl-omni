@@ -204,7 +204,7 @@ trainer:
   v1:
 
     # Trainer mode: "sync", "colocate_async", "separate_async".
-    # Only "sync" is implemented in this draft; the async modes raise NotImplementedError.
+    # "sync" and "separate_async" are implemented; "colocate_async" is not implemented yet.
     trainer_mode: sync
 
     # Synchronous diffusion trainer (colocated rollout, no partial rollout).
@@ -216,7 +216,9 @@ trainer:
       # Number of warmup batches to add before the training loop starts.
       num_warmup_batches: 1
 
-    # Asynchronous diffusion trainer with separate trainer and rollout (not implemented yet).
+    # Asynchronous diffusion trainer with separate trainer and rollout.
+    # Requires rollout.nnodes > 0 and a non-naive checkpoint_engine backend
+    # (nccl/nixl/mooncake/...) for trainer -> standalone rollout weight sync.
     separate_async:
 
       # Number of warmup batches to add before the training loop starts.

@@ -15,8 +15,8 @@
 
 Reuses upstream verl v1 infrastructure (ReplayBuffer, TransferQueue,
 LLMServerManager, CheckpointEngineManager) while keeping the diffusion
-``DataProto`` compute contract. Only the ``sync`` mode is implemented in this
-draft; ``colocate_async`` and ``separate_async`` are intentionally omitted.
+``DataProto`` compute contract. The ``sync`` and ``separate_async`` modes are
+implemented; ``colocate_async`` is intentionally omitted for now.
 """
 
 from verl_omni.trainer.diffusion.v1.trainer_base import (
@@ -24,6 +24,9 @@ from verl_omni.trainer.diffusion.v1.trainer_base import (
     PolicyGradientDiffusionTrainerV1,
     get_diffusion_trainer_cls,
     register_diffusion_trainer,
+)
+from verl_omni.trainer.diffusion.v1.trainer_separate_async import (
+    PolicyGradientDiffusionTrainerV1SeparateAsync,
 )
 from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionTrainerV1Sync
 from verl_omni.trainer.diffusion.v1.tq_utils import (
@@ -35,6 +38,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
 __all__ = [
     "DIFFUSION_TRAINER_REGISTRY",
     "PolicyGradientDiffusionTrainerV1",
+    "PolicyGradientDiffusionTrainerV1SeparateAsync",
     "PolicyGradientDiffusionTrainerV1Sync",
     "get_diffusion_trainer_cls",
     "register_diffusion_trainer",
