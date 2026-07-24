@@ -910,6 +910,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             input_ids = data.batch["prompts"]
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             output_images = data.batch["responses"]
+            # Distinguish real generations from aborted/empty ones so the
+            # trainer logs clearly whether validation produced real images.
+            num_real = int((output_images.numel() > 0 and output_images.shape[-1] > 0)) if isinstance(output_images, torch.Tensor) else 0
+            logger.info(
+                "Validation batch (step=%d): %d trajectories, responses shape=%s, real_images=%s",
+                self.global_steps,
+                len(data),
+                tuple(output_images.shape) if isinstance(output_images, torch.Tensor) else None,
+                num_real,
+            )
             sample_inputs.extend(input_texts)
             sample_outputs.append(output_images)
             uids = data.non_tensor_batch.get("uid")
