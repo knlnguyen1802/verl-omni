@@ -1112,6 +1112,23 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if "advantages" in data.batch
             else data.batch["sample_level_scores"].shape[0]
         )
+        # Per-step visibility that real diffusion images were produced and trained
+        # on. The "[Orchestrator] Dropping output for unknown req" warnings emitted
+        # by vllm-omni during weight-sync aborts are a benign race (the orchestrator
+        # clears its request_states before the diffusion engine emits its terminal
+        # abort outputs); they do NOT mean generation failed. This log line, plus
+        # perf/total_num_images in the step metrics, confirms real generation.
+        responses = data.batch.get("responses")
+        real_images = 0
+        if isinstance(responses, torch.Tensor) and responses.numel() > 0 and responses.dim() >= 4:
+            real_images = int(responses.shape[0])
+        logger.info(
+            "Train step=%d: %d trajectories, %d real images, responses shape=%s",
+            global_steps,
+            len(data),
+            real_images,
+            tuple(responses.shape) if isinstance(responses, torch.Tensor) else None,
+        )
         metrics.update(compute_timing_metrics_diffusion(timing_raw=timing_raw, num_images=num_images))
         metrics.update(compute_throughput_metrics_diffusion(batch=data, timing_raw=timing_raw, n_gpus=n_gpus))
         reward_extra_infos_dict = {}
