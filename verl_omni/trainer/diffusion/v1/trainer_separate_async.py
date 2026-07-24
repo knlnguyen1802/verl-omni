@@ -163,6 +163,10 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         # only join the standalone load balancer when ``switch_to_rollout`` is
         # called (currently gated by ``should_switch_to_rollout``).
         self.current_mode = HybridEngineMode.TRAINER
+        # Track whether colocated replicas have been slept via switch_to_trainer.
+        # wake_up can only be called on replicas that were previously slept;
+        # calling it on never-slept replicas triggers a CUDA cumem error.
+        self._colocated_slept = False
 
     # ------------------------------ client handles ------------------------------
 
@@ -186,9 +190,29 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
 
     def on_validate_begin(self):
-        if self.current_mode == HybridEngineMode.TRAINER:
+        if self.current_mode == HybridEngineMode.TRAINER and self._colocated_slept:
+            # Only wake up colocated replicas if they were actually slept (i.e.
+            # switch_to_trainer ran at least once during training). Calling
+            # wake_up on never-slept replicas triggers a CUDA error in the
+            # cumem allocator ("invalid argument" at create_and_map) because
+            # there are no offloaded handles to restore.
+            #
+            # When should_switch_to_rollout() returns False (the current
+            # default), colocated replicas are never slept during training, so
+            # validation should just use the standalone replicas — which are
+            # already serving and are the ones get_llm_client() routes to.
             logger.info("Switching hybrid engine to rollout mode for validation")
             self.switch_to_rollout()
+        else:
+            logger.info(
+                "Skipping colocated rollout switch for validation "
+                "(colocated replicas never slept; using standalone replicas only)"
+            )
+
+    def on_validate_end(self):
+        if self.current_mode == HybridEngineMode.ROLLOUT:
+            logger.info("Switching hybrid engine back to trainer mode after validation")
+            self.switch_to_trainer()
 
     def on_sample_begin(self):
         if self.current_mode == HybridEngineMode.TRAINER and self.should_switch_to_rollout():
@@ -212,6 +236,7 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         # Wake colocated replicas (their weights were offloaded by sleep),
         # sync fresh actor weights, and let them serve generation again.
         self.checkpoint_manager.wake_up_replicas()
+        self._colocated_slept = False
         self.checkpoint_manager.update_weights(self.global_steps)
         self.checkpoint_manager.resume_generation_replicas()
         self.add_replicas_to_balancer()
@@ -222,6 +247,7 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         self.remove_replicas_from_balancer()
         self.checkpoint_manager.abort_replicas()
         self.checkpoint_manager.sleep_replicas()
+        self._colocated_slept = True
         self.current_mode = HybridEngineMode.TRAINER
 
     def add_replicas_to_balancer(self):
