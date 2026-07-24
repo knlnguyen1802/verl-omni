@@ -125,6 +125,17 @@ def diffusion_tq_batch_to_dataproto(
     keys = list(batch_meta.keys)
     partition_id = batch_meta.partition_id
 
+    # Defensive guard: the replay buffer's off-policy sampler can drop every
+    # sampled trajectory (e.g. when all trajectories are stale), yielding an
+    # empty key list. TransferQueue rejects empty key lists, so return an empty
+    # DataProto instead of crashing the whole training/validation run.
+    if not keys:
+        logger.warning(
+            "diffusion_tq_batch_to_dataproto received an empty key list "
+            "(partition_id=%s); returning an empty DataProto.", partition_id
+        )
+        return DataProto(batch=TensorDict({}, batch_size=0), non_tensor_batch={})
+
     available = set(_DIFFUSION_TENSOR_FIELDS) | set(_DIFFUSION_NON_TENSOR_FIELDS)
     data = tq.kv_batch_get(
         keys=keys,

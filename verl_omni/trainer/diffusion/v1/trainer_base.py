@@ -891,6 +891,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
 
+            # Skip empty validation batches (e.g. all trajectories were dropped
+            # by the off-policy sampler) instead of crashing on downstream
+            # tensor indexing with batch_size=0.
+            if len(data) == 0:
+                logger.warning(
+                    "Validation produced no trajectories for this batch (step=%d); skipping.",
+                    self.global_steps,
+                )
+                tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+                continue
+
             if self.use_rm and self.reward_loop_manager.reward_loop_worker_handles is None:
                 self.checkpoint_manager.sleep_replicas()
                 data = self._compute_reward_colocate(data)
