@@ -785,7 +785,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if peft_model is None or not hasattr(peft_model, "peft_config"):
             return None
         peft_config = peft_model.peft_config.get("default", None)
-        return peft_config.to_dict() if peft_config is not None else None
+        result = peft_config.to_dict() if peft_config is not None else None
+        logger.debug("get_lora_peft_config role=%s -> %s", self.role, "LoRA" if result else "none")
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def copy_adapter(self, source: str = "default", target: str = "old"):
