@@ -60,7 +60,7 @@ NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-0}
 PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1}
 MAX_OFF_POLICY_THRESHOLD=${MAX_OFF_POLICY_THRESHOLD:-1}
 MAX_OFF_POLICY_STRATEGY=${MAX_OFF_POLICY_STRATEGY:-drop}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}            # must equal ppo_mini_batch_size
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}            # must equal ppo_mini_batch_size
 
 if [ "${FA3:-0}" = "1" ]; then
     ATTN_BACKEND="_flash_3_varlen_hub"
