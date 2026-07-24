@@ -14,6 +14,7 @@
 import argparse
 import logging
 import os
+import time
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -530,28 +531,76 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         each carrying the user-facing ``external_request_id``) and exposes
         ``abort(request_ids)`` instead of ``output_processor.abort_requests``.
 
-        Unlike the parent (which manually enqueues a ``FinishReason.ABORT``
-        ``RequestOutput`` into each per-request queue so the ``generate()``
-        generator can drain and return), ``AsyncOmni.generate()`` reads from a
-        per-request ``asyncio.Queue`` expecting ``OutputMessage`` / ``ErrorMessage``
-        objects. ``engine.abort()`` tells the Orchestrator to clean up
-        ``Orchestrator.request_states`` *before* the diffusion engine emits the
-        abort output, so the Orchestrator drops it ("Dropping output for unknown
-        req") and the ``generate()`` generator would hang forever.
+        Root cause of the ``[Orchestrator] Dropping output for unknown req``
+        warning: ``engine.abort()`` sends an ``AbortRequestMessage`` to the
+        Orchestrator, which synchronously clears ``Orchestrator.request_states``
+        in ``_cleanup_request_ids`` *before* forwarding the abort to the stage
+        pool. The diffusion engine only emits its real terminal abort outputs
+        *after* that, so they arrive at ``_handle_processed_outputs`` and find
+        ``request_states`` already empty -> dropped (``known reqs: []``).
 
-        To avoid that hang we snapshot the in-flight ``ClientRequestState``
-        objects *before* calling ``engine.abort()`` and then, after the abort,
-        synthesize a terminal ``OutputMessage`` (``finished=True``) for each
-        request and put it directly into the per-request queue. This unblocks
-        ``_process_orchestrator_results`` so ``generate()`` can yield a final
-        abort output and return, letting ``DiffusionWholeSampleRetryLLMServerClient``
-        see ``stop_reason="aborted"`` and retry the whole sample.
+        Fix (verl-omni only): the abort exists solely to stop in-flight
+        generation before a weight sync swaps weights under it. Instead of
+        aborting immediately (which creates the race above and forces
+        ``DiffusionWholeSampleRetryLLMServerClient`` to retry the whole
+        sample), first **drain** in-flight requests by letting them complete
+        naturally. ``AsyncOmni.request_states`` is popped in
+        ``_log_summary_and_cleanup`` once ``generate()`` returns, so polling it
+        until empty means every in-flight request finished cleanly — the
+        Orchestrator routed each final output *with* its state present, so
+        nothing is dropped. Only if the drain timeout expires do we fall back
+        to the abort path (snapshot + ``engine.abort()`` + synthetic abort
+        ``OutputMessage`` per request) to unblock the remainder.
+
+        During ``on_step_end`` no new prompts are fed (the feed happens in
+        ``step``/``_add_batch_to_generate``), so the in-flight set monotonically
+        drains and the drain terminates quickly in practice.
         """
         engine = self.engine
         if getattr(engine, "output_processor", None) is not None:
             return await super().abort_all_requests(reset_prefix_cache)
 
         try:
+            # ---- Phase 1: drain in-flight requests naturally ----------------
+            # Letting requests finish avoids the Orchestrator race that produces
+            # "Dropping output for unknown req" and avoids whole-sample retries.
+            drain_timeout_s = float(os.getenv("VERL_OMNI_ABORT_DRAIN_TIMEOUT_S", "120"))
+            drain_poll_interval_s = 0.1
+            drained = False
+            drain_start = time.monotonic()
+            last_count = -1
+            while True:
+                in_flight = len(engine.request_states)
+                if in_flight == 0:
+                    drained = True
+                    break
+                if time.monotonic() - drain_start >= drain_timeout_s:
+                    logger.warning(
+                        "abort_all_requests: drain timed out after %.1fs with %d request(s) still in-flight; "
+                        "falling back to hard abort (these may produce 'Dropping output' warnings)",
+                        drain_timeout_s,
+                        in_flight,
+                    )
+                    break
+                if in_flight != last_count:
+                    logger.info(
+                        "abort_all_requests: draining %d in-flight request(s) (%.1fs elapsed)",
+                        in_flight,
+                        time.monotonic() - drain_start,
+                    )
+                    last_count = in_flight
+                await asyncio.sleep(drain_poll_interval_s)
+
+            if drained:
+                if reset_prefix_cache:
+                    await self.clear_kv_cache()
+                logger.info(
+                    "abort_all_requests: drained all in-flight requests in %.2fs; no abort needed",
+                    time.monotonic() - drain_start,
+                )
+                return {"aborted_count": 0, "request_ids": [], "drained": True}
+
+            # ---- Phase 2: hard-abort the remainder (drain timed out) ---------
             # Snapshot in-flight states (internal_id -> ClientRequestState) BEFORE
             # engine.abort() pops them from AsyncOmni.request_states. We need the
             # per-request asyncio.Queue references to unblock the generate() coroutines.
