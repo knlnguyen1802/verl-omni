@@ -769,6 +769,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_lora_peft_config(self):
+        """Return the actor's LoRA ``peft_config`` dict, or ``None`` if not a LoRA run.
+
+        Collective-free: ``peft_config`` is adapter metadata (r/alpha/target_modules),
+        not a parameter, so it can be read without summoning FSDP params. Used by the
+        checkpoint engine manager to forward ``peft_config`` to the standalone rollout
+        so it applies LoRA deltas via ``add_lora`` instead of a full ``load_weights``.
+        """
+        if "actor" not in self.role:
+            return None
+        engine = getattr(self.actor, "engine", None)
+        module = getattr(engine, "module", None) if engine is not None else None
+        peft_model = getattr(module, "_fsdp_wrapped_module", module) if module is not None else None
+        if peft_model is None or not hasattr(peft_model, "peft_config"):
+            return None
+        peft_config = peft_model.peft_config.get("default", None)
+        return peft_config.to_dict() if peft_config is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def copy_adapter(self, source: str = "default", target: str = "old"):
         assert "actor" in self.role, "copy_adapter only supports actor role"
         self.actor.copy_adapter(source=source, target=target)
@@ -852,6 +871,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
+            # Detect LoRA without triggering the heavy param gather. The standalone
+            # rollout already holds the (frozen) base weights from load_format, so
+            # for LoRA training we only ship the adapter deltas. The matching
+            # ``peft_config`` is delivered to the rollout out-of-band by
+            # ``CheckpointEngineManager`` via the collective-free ``get_lora_peft_config``
+            # call, so the rollout applies them via ``add_lora`` instead of a full
+            # ``load_weights``.
+            actor_module = getattr(self.actor.engine, "module", None)
+            peft_module = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
+            actor_has_lora = peft_module is not None and hasattr(peft_module, "peft_config")
+
+            if actor_has_lora and not self.peft_merge:
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
+                    base_sync_done=True,
+                    adapter_name=self.config.rollout.rollout_adapter,
+                )
+                await self.checkpoint_engine.send_weights(per_tensor_param)
+                return
+
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
                 adapter_name=self.config.rollout.rollout_adapter
             )
