@@ -98,12 +98,14 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
 
         ``get_lora_peft_config`` is registered ``ONE_TO_ALL`` and reads the
         peft_model metadata without summoning FSDP params, so every actor rank
-        returns the same dict (non-actor ranks return ``None``). We take the
-        first non-``None`` result. Any failure is logged and treated as
-        "not a LoRA run" so the rollout falls back to the full-weight path.
+        returns the same dict (non-actor ranks return ``None``). The worker-group
+        proxy is blocking and has already called ``ray.get`` before returning,
+        so its result must not be resolved a second time. We take the first
+        non-``None`` result. Any failure is logged and treated as "not a LoRA
+        run" so the rollout falls back to the full-weight path.
         """
         try:
-            results = ray.get(self.actor_wg.get_lora_peft_config())
+            results = self.actor_wg.get_lora_peft_config()
         except Exception as e:  # noqa: BLE001 - tolerate backend/registration differences
             logger.warning("get_lora_peft_config failed (%s); assuming non-LoRA run", e)
             return None
