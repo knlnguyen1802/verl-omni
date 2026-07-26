@@ -49,6 +49,7 @@ from verl_omni.trainer.diffusion.v1.trainer_base import (
     PolicyGradientDiffusionTrainerV1,
     register_diffusion_trainer,
 )
+from verl_omni.workers.checkpoint_engine import OmniCheckpointEngineManager
 from verl_omni.workers.rollout.diffusion_llm_server import DiffusionWholeSampleRetryLLMServerClient
 
 logger = logging.getLogger(__name__)
@@ -150,8 +151,12 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         )
 
         # Non-naive checkpoint engine for trainer -> standalone rollout weight sync.
+        # Uses the verl-omni subclass so the actor's LoRA ``peft_config`` is
+        # delivered out-of-band to the standalone rollout workers (verl's
+        # ``CheckpointEngineWorker.update_weights`` does not forward it as a
+        # kwarg to ``update_weights_from_ipc``).
         standalone_ckpt_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.standalone_checkpoint_manager = CheckpointEngineManager(
+        self.standalone_checkpoint_manager = OmniCheckpointEngineManager(
             config=standalone_ckpt_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.standalone_server_manager.get_replicas(),
