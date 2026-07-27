@@ -779,6 +779,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """
         if "actor" not in self.role:
             return None
+        # ``merge=True`` means LoRA deltas are merged into base weights before
+        # sync, so the standalone rollout must use the full-weight path.
+        if self.peft_merge:
+            return None
         engine = getattr(self.actor, "engine", None)
         module = getattr(engine, "module", None) if engine is not None else None
         peft_model = getattr(module, "_fsdp_wrapped_module", module) if module is not None else None

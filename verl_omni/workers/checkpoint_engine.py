@@ -60,10 +60,15 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
         delivery.
         """
         if self.backend != "naive":
-            await self._push_lora_peft_config_to_replicas()
+            peft_config = self._fetch_actor_lora_peft_config()
+            # Keep the parent manager's per-run cache aligned with the current
+            # actor state. Without this, a transient startup miss can pin the
+            # parent path to full-weight mode for the whole run.
+            self._lora_peft_config = peft_config
+            await self._push_lora_peft_config_to_replicas(peft_config)
         await super().update_weights(global_steps=global_steps)
 
-    async def _push_lora_peft_config_to_replicas(self) -> None:
+    async def _push_lora_peft_config_to_replicas(self, peft_config: dict | None) -> None:
         """Fetch ``peft_config`` from the actor (collective-free) and stash it
         on every standalone rollout replica's worker extension.
 
@@ -71,10 +76,6 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
         ``None``), in which case the rollout takes the full-weight path as
         before.
         """
-        peft_config = self._fetch_actor_lora_peft_config()
-        if peft_config is None:
-            return
-
         # Stash on each replica's worker extension via collective_rpc. The
         # method name must match ``set_pending_lora_peft_config`` on
         # ``vLLMOmniColocateWorkerExtension`` (inherited by the NPU variant).
@@ -88,10 +89,10 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
         ]
         if futures:
             ray.get(futures)
-        logger.debug(
-            "pushed LoRA peft_config to %d standalone rollout replica(s)",
-            len(futures),
-        )
+        if peft_config is None:
+            logger.debug("cleared pending LoRA peft_config on %d standalone rollout replica(s)", len(futures))
+        else:
+            logger.debug("pushed LoRA peft_config to %d standalone rollout replica(s)", len(futures))
 
     def _fetch_actor_lora_peft_config(self):
         """Return the actor's LoRA ``peft_config`` dict, or ``None``.
