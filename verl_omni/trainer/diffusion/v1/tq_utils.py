@@ -162,7 +162,19 @@ def diffusion_tq_batch_to_dataproto(
         if isinstance(value, np.ndarray):
             non_tensor_batch[field] = value
         else:
-            items = list(value)
+            # Unwrap NonTensorData / NonTensorStack elements to their underlying
+            # Python values. TransferQueue returns non-tensor fields as
+            # NonTensorStack whose elements are NonTensorData wrappers; if stored
+            # as-is in the object array, downstream code that uses them as dict
+            # keys (e.g. GRPO advantage grouping by uid) crashes with
+            # ``TypeError: unhashable type: 'NonTensorData'``.
+            from tensordict import NonTensorData, NonTensorStack
+
+            if isinstance(value, NonTensorStack):
+                items = [elem.data if isinstance(elem, NonTensorData) else elem for elem in value]
+            else:
+                items = list(value)
+                items = [item.data if isinstance(item, NonTensorData) else item for item in items]
             arr = np.empty(len(items), dtype=object)
             arr[:] = items
             non_tensor_batch[field] = arr

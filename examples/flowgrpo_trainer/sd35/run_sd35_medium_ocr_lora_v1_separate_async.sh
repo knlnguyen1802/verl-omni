@@ -61,6 +61,12 @@ PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1}
 MAX_OFF_POLICY_THRESHOLD=${MAX_OFF_POLICY_THRESHOLD:-1}
 MAX_OFF_POLICY_STRATEGY=${MAX_OFF_POLICY_STRATEGY:-drop}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}            # must equal ppo_mini_batch_size
+# Pause the standalone rollout during actor training (abort + remove from
+# balancer on on_sample_end, resume after weight sync on on_step_end). With
+# the on-policy knobs above this makes separate_async algorithmically
+# identical to sync mode — just using dedicated rollout GPUs instead of
+# colocated replicas. Set to 0 to allow async generation overlap.
+SYNC_COMPATIBLE=${SYNC_COMPATIBLE:-1}
 
 if [ "${FA3:-0}" = "1" ]; then
     ATTN_BACKEND="_flash_3_varlen_hub"
@@ -179,5 +185,6 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     trainer.v1.trainer_mode=separate_async \
     trainer.v1.separate_async.num_warmup_batches=$NUM_WARMUP_BATCHES \
     trainer.v1.separate_async.parameter_sync_step=$PARAMETER_SYNC_STEP \
+    trainer.v1.separate_async.sync_compatible=$SYNC_COMPATIBLE \
     trainer.v1.sampler.max_off_policy_threshold=$MAX_OFF_POLICY_THRESHOLD \
     trainer.v1.sampler.max_off_policy_strategy=$MAX_OFF_POLICY_STRATEGY "$@"

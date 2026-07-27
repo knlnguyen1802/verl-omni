@@ -74,10 +74,13 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
     - ``on_sample_begin``: switch to rollout mode if training and the switch
       strategy says so.
     - ``on_sample_end``: switch to trainer mode (abort + sleep colocated
-      replicas, remove them from the standalone load balancer).
-    - ``on_step_end``: keep the colocated rollout in sync with the actor every
-      step (mirroring sync mode), and every ``parameter_sync_step`` also push
-      actor weights into the standalone rollout replicas.
+      replicas, remove them from the standalone load balancer). When
+      ``sync_compatible`` is True, also pause the standalone rollout.
+    - ``on_step_end``: every ``parameter_sync_step``, push actor weights into
+      the standalone rollout replicas. Colocated replicas stay slept during
+      training (they share GPUs with the actor) and are only synced at init
+      and when switching to rollout mode. When ``sync_compatible`` is True,
+      resume standalone generation after weight sync.
     """
 
     def __init__(self, config: DictConfig):
@@ -177,6 +180,19 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         # calling it on never-slept replicas triggers a CUDA cumem error.
         self._colocated_slept = False
 
+        # sync_compatible: when True, the standalone rollout stops generating
+        # during actor training (abort + remove from balancer on on_sample_end,
+        # resume after weight sync on on_step_end). This makes separate_async
+        # behave synchronously like sync mode — no off-policy data — but uses
+        # the standalone rollout on dedicated GPUs instead of colocated replicas.
+        self.sync_compatible = self.config.trainer.v1.separate_async.get("sync_compatible", False)
+        self._standalone_paused = False
+        if self.sync_compatible:
+            logger.warning(
+                "separate_async sync_compatible=True: standalone rollout will pause "
+                "generation during actor training (sync-mode parity)."
+            )
+
     # ------------------------------ client handles ------------------------------
 
     def get_llm_client(self):
@@ -224,6 +240,10 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
                 "Skipping colocated rollout switch for validation "
                 "(colocated replicas never slept; using standalone replicas only)"
             )
+        if self.sync_compatible and self._standalone_paused:
+            # Validation uses the standalone rollout via get_llm_client(), so
+            # make sure it is resumed if it was paused for actor training.
+            self._resume_standalone_generation()
 
     def on_validate_end(self):
         if self.current_mode == HybridEngineMode.ROLLOUT:
@@ -239,27 +259,43 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         if self.current_mode == HybridEngineMode.ROLLOUT:
             logger.info("Switching hybrid engine to trainer mode for training")
             self.switch_to_trainer()
+        if self.sync_compatible and not self._standalone_paused:
+            # Sync-compatible mode: stop the standalone rollout from generating
+            # during actor training so no off-policy data is produced. This
+            # mirrors sync mode where colocated replicas are slept before the
+            # actor update. The standalone replicas are on dedicated GPUs so we
+            # don't sleep them (no GPU memory to free for the actor), but we do
+            # abort in-flight requests and remove them from the load balancer so
+            # no new requests are routed while the actor is training.
+            self._pause_standalone_generation()
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
-            # Mirror sync mode exactly: keep the colocated rollout replicas in
-            # sync with the freshly-trained actor every step via the naive
-            # in-place backend. This is the same call sync mode makes in its
-            # ``on_step_end``. The colocated replicas stay slept (they are not
-            # used for generation while ``should_switch_to_rollout`` returns
-            # False), but keeping their weights fresh preserves sync-mode
-            # parity and ensures they are ready if a switch is ever triggered.
-            logger.warning(
-                "LORA_SYNC_PROOF separate_async on_step_end: sending weights to "
-                "COLOCATED (non-standalone) checkpoint manager (global_steps=%s)",
-                self.global_steps,
-            )
-            self._log_actor_lora_checksum(tag="before-colocated-step")
-            self.checkpoint_manager.update_weights(self.global_steps)
+            # Weight sync strategy for separate async to match sync mode's
+            # on-policy Flow-GRPO behavior:
+            #
+            #   - Sync mode cycle: generate -> sleep replicas (free GPU for
+            #     actor) -> train actor -> update_weights (wake + load fresh
+            #     weights) -> generate ... The colocated replicas are the
+            # rollout, so updating their weights every step keeps
+            #     generation on-policy.
+            #
+            #   - Separate async: the STANDALONE rollout (not colocated) serves
+            #     all generation traffic. The colocated replicas stay slept
+            #     during training to free GPU memory for the actor (they share
+            #     GPUs). Calling the naive ``checkpoint_manager.update_weights``
+            #     every step would WAKE UP the colocated replicas (the naive
+            #     path resumes rollout weight memory), causing GPU contention
+            #     with the actor on the next training step. So we do NOT sync
+            #     colocated every step — they are synced only at init and when
+            #     switching to rollout mode (see ``switch_to_rollout``).
+            #
+            #   - The standalone rollout is the one that must stay on-policy, so
+            #     we push fresh actor weights to it every ``parameter_sync_step``
+            #     (== 1 for sync-parity). Both managers pull from the same
+            #     ``actor_rollout_wg``, so the standalone receives the exact same
+            #     weight values that sync mode's colocated rollout would.
             if self.global_steps % self.config.trainer.v1.separate_async.parameter_sync_step == 0:
-                # Push freshly-trained actor weights into standalone rollout replicas.
-                # The standalone manager pulls from the same actor worker group as the
-                # colocated manager, so both receive identical weights each sync.
                 logger.warning(
                     "LORA_SYNC_PROOF separate_async on_step_end: sending weights to "
                     "STANDALONE checkpoint manager (global_steps=%s)",
@@ -267,6 +303,47 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
                 )
                 self._log_actor_lora_checksum(tag="before-standalone-step")
                 self.standalone_checkpoint_manager.update_weights(self.global_steps)
+            if self.sync_compatible and self._standalone_paused:
+                # Sync-compatible mode: resume standalone generation after the
+                # actor update + weight sync so the next generate phase uses
+                # fresh weights, exactly like sync mode waking colocated replicas.
+                self._resume_standalone_generation()
+
+    # ------------------------------ sync-compatible standalone control ------------------------------
+
+    def _pause_standalone_generation(self):
+        """Stop the standalone rollout from accepting/serving new requests.
+
+        Aborts in-flight requests and removes standalone servers from the global
+        load balancer so no new requests are routed while the actor is training.
+        Does NOT sleep the replicas (they are on dedicated GPUs, so freeing their
+        weight memory is not needed for the actor).
+        """
+        logger.info("sync_compatible: pausing standalone rollout generation for actor training")
+        self.standalone_checkpoint_manager.abort_replicas()
+        global_load_balancer = self.standalone_server_manager.global_load_balancer
+        ray.get(global_load_balancer.remove_servers.remote(self.standalone_server_manager.server_addresses))
+        self._standalone_paused = True
+
+    def _resume_standalone_generation(self):
+        """Resume standalone rollout generation after weight sync.
+
+        Re-adds standalone servers to the global load balancer and resumes
+        generation on all replicas (clears the abort state so new requests can
+        be served with the freshly-synced weights).
+        """
+        logger.info("sync_compatible: resuming standalone rollout generation after weight sync")
+        global_load_balancer = self.standalone_server_manager.global_load_balancer
+        servers = dict(
+            zip(
+                self.standalone_server_manager.server_addresses,
+                self.standalone_server_manager.server_handles,
+                strict=True,
+            )
+        )
+        ray.get(global_load_balancer.add_servers.remote(servers))
+        self.standalone_checkpoint_manager.resume_generation_replicas()
+        self._standalone_paused = False
 
     # ------------------------------ diagnostics ------------------------------
 
