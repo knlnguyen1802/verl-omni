@@ -37,11 +37,28 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _unwrap_non_tensor_item(item: Any) -> Any:
+    """Unwrap common non-tensor wrappers (e.g. NonTensorData) to raw values."""
+    value = item
+    # Some TransferQueue paths return wrapper objects with a ``data`` attribute.
+    # Unwrap a few levels defensively until reaching a plain python value.
+    for _ in range(4):
+        if isinstance(value, (str, bytes, bytearray, dict, list, tuple, np.ndarray, torch.Tensor)):
+            break
+        data_attr = getattr(value, "data", None)
+        if data_attr is None or data_attr is value:
+            break
+        value = data_attr
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _to_object_array(value: Any) -> np.ndarray:
     """Normalize non-tensor TransferQueue values to object ndarray."""
     if isinstance(value, np.ndarray) and value.dtype == object:
-        return value
-    if isinstance(value, np.ndarray):
+        items = value.tolist()
+    elif isinstance(value, np.ndarray):
         items = value.tolist()
     elif isinstance(value, (str, bytes, dict)):
         items = [value]
@@ -50,6 +67,7 @@ def _to_object_array(value: Any) -> np.ndarray:
             items = list(value)
         except TypeError:
             items = [value]
+    items = [_unwrap_non_tensor_item(item) for item in items]
     arr = np.empty(len(items), dtype=object)
     arr[:] = items
     return arr
