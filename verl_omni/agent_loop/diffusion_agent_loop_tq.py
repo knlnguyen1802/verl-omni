@@ -72,6 +72,10 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             validate = validate.data
         batch.pop("validate", None)
 
+        global_steps = batch.get("global_steps")
+        if isinstance(global_steps, NonTensorData):
+            global_steps = global_steps.data
+
         config = self.rollout_config
         sampling_params = {
             **_config_to_sampling_dict(config.pipeline),
@@ -86,9 +90,6 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             sampling_params["seed"] = config.val_kwargs.seed
             sampling_params["logprobs"] = False
         else:
-            global_steps = batch["global_steps"]
-            if isinstance(global_steps, NonTensorData):
-                global_steps = global_steps.data
             sampling_params["global_steps"] = global_steps
             rollout_seed_meta = batch.get("rollout_seed")
             if rollout_seed_meta is not None:
@@ -100,9 +101,10 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             batch["agent_name"] = NonTensorData(default_agent_loop)
 
         index = batch["index"] if "index" in batch else list(range(len(batch)))
-        trajectory_info = await get_trajectory_info(
-            sampling_params.get("global_steps", -1), index, bool(validate)
-        )
+        # Always pass trainer global_steps (including validation). Upstream
+        # AgentLoopWorkerTQ uses batch["global_steps"] directly; using -1 here
+        # tags validation trajectories as stale and ReplayBuffer drops them all.
+        trajectory_info = await get_trajectory_info(global_steps, index, bool(validate))
 
         for i in range(len(batch)):
             prompt = self._extract_prompt(batch, i)
