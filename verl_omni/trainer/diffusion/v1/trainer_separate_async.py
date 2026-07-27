@@ -38,7 +38,7 @@ import os
 from enum import Enum
 
 import ray
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig
 
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.utils.config import omega_conf_to_dataclass
@@ -75,8 +75,9 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
       strategy says so.
     - ``on_sample_end``: switch to trainer mode (abort + sleep colocated
       replicas, remove them from the standalone load balancer).
-    - ``on_step_end``: every ``parameter_sync_step``, push actor weights into
-      the standalone rollout replicas.
+    - ``on_step_end``: keep the colocated rollout in sync with the actor every
+      step (mirroring sync mode), and every ``parameter_sync_step`` also push
+      actor weights into the standalone rollout replicas.
     """
 
     def __init__(self, config: DictConfig):
@@ -98,11 +99,14 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
 
         super().__init__(config)
 
-        # Separate async runs the actor and the rollout on different model versions,
-        # so the rollout log-probs are the only on-policy anchor (2-policy bypass).
-        # This mirrors upstream PPOTrainerSeparateAsync forcing bypass_mode=True.
-        with open_dict(config):
-            config.algorithm.rollout_correction.bypass_mode = True
+        # Do NOT force ``bypass_mode=True`` here. Sync mode (the convergent
+        # reference) leaves ``bypass_mode`` at its config default (``False``),
+        # which recomputes ``old_log_probs`` with the current actor for a 3-policy
+        # PPO ratio (π_rollout, π_old, π_θ). Forcing ``bypass_mode=True`` would
+        # instead set ``old_log_probs := rollout_log_probs`` (2-policy) and
+        # silently change the algorithm regardless of the user's config. We
+        # respect the config so separate async can behave exactly like sync
+        # mode; users who want the 2-policy bypass can still set it explicitly.
 
     # ------------------------------ setup ------------------------------
 
@@ -230,9 +234,19 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
             self.switch_to_trainer()
 
     def on_step_end(self):
-        if self.global_steps % self.config.trainer.v1.separate_async.parameter_sync_step == 0:
-            with marked_timer("update_weights", self.timing_raw, color="red"):
+        with marked_timer("update_weights", self.timing_raw, color="red"):
+            # Mirror sync mode exactly: keep the colocated rollout replicas in
+            # sync with the freshly-trained actor every step via the naive
+            # in-place backend. This is the same call sync mode makes in its
+            # ``on_step_end``. The colocated replicas stay slept (they are not
+            # used for generation while ``should_switch_to_rollout`` returns
+            # False), but keeping their weights fresh preserves sync-mode
+            # parity and ensures they are ready if a switch is ever triggered.
+            self.checkpoint_manager.update_weights(self.global_steps)
+            if self.global_steps % self.config.trainer.v1.separate_async.parameter_sync_step == 0:
                 # Push freshly-trained actor weights into standalone rollout replicas.
+                # The standalone manager pulls from the same actor worker group as the
+                # colocated manager, so both receive identical weights each sync.
                 self.standalone_checkpoint_manager.update_weights(self.global_steps)
 
     # ------------------------------ mode switching ------------------------------
