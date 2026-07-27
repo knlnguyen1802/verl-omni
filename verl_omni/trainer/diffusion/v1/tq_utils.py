@@ -37,45 +37,22 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-# Fields written by the diffusion TQ worker that are tensors with a fixed
-# (per-batch) shape and therefore stackable directly from TransferQueue.
-# This also includes driver-computed fields (old_log_probs, advantages, returns,
-# sample_level_scores, sample_level_rewards) that are persisted back to TQ via
-# ``put_dataproto_fields_to_tq`` after the policy-gradient compute path, so that
-# ``diffusion_tq_batch_to_dataproto`` can reconstruct the full trajectory for
-# metrics/dumping.
-_DIFFUSION_TENSOR_FIELDS = [
-    "prompts",
-    "responses",
-    "rollout_log_probs",
-    "rm_scores",
-    "attention_mask",
-    "prompt_embeds",
-    "prompt_embeds_mask",
-    "negative_prompt_embeds",
-    "negative_prompt_embeds_mask",
-    "pooled_prompt_embeds",
-    "negative_pooled_prompt_embeds",
-    "all_latents",
-    "all_timesteps",
-    # Driver-computed fields written back to TQ after advantage/old-log-prob.
-    "old_log_probs",
-    "advantages",
-    "returns",
-    "sample_level_scores",
-    "sample_level_rewards",
-]
-
-# Non-tensor fields carried through TransferQueue as object arrays.
-_DIFFUSION_NON_TENSOR_FIELDS = [
-    "uid",
-    "reward_model",
-    "data_source",
-    "extra_info",
-    "raw_prompt",
-    "__num_turns__",
-    "extra_fields",
-]
+def _to_object_array(value: Any) -> np.ndarray:
+    """Normalize non-tensor TransferQueue values to object ndarray."""
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        return value
+    if isinstance(value, np.ndarray):
+        items = value.tolist()
+    elif isinstance(value, (str, bytes, dict)):
+        items = [value]
+    else:
+        try:
+            items = list(value)
+        except TypeError:
+            items = [value]
+    arr = np.empty(len(items), dtype=object)
+    arr[:] = items
+    return arr
 
 
 def _stack_field(value: Any, padding: float = 0.0) -> torch.Tensor | None:
@@ -125,36 +102,26 @@ def diffusion_tq_batch_to_dataproto(
     keys = list(batch_meta.keys)
     partition_id = batch_meta.partition_id
 
-    available = set(_DIFFUSION_TENSOR_FIELDS) | set(_DIFFUSION_NON_TENSOR_FIELDS)
     data = tq.kv_batch_get(
         keys=keys,
         partition_id=partition_id,
-        select_fields=list(available),
     )
 
     batch_dict: dict[str, torch.Tensor] = {}
-    for field in _DIFFUSION_TENSOR_FIELDS:
-        if field not in data:
-            continue
-        padding = float(pad_token_id) if field == "prompts" else 0.0
-        stacked = _stack_field(data[field], padding=padding)
-        if stacked is not None:
-            batch_dict[field] = stacked
-
     non_tensor_batch: dict[str, Any] = {}
-    for field in _DIFFUSION_NON_TENSOR_FIELDS:
-        if field not in data:
+    for field, value in data.items():
+        padding = float(pad_token_id) if field == "prompts" else 0.0
+        stacked = None
+        try:
+            stacked = _stack_field(value, padding=padding)
+        except (TypeError, ValueError, RuntimeError):
+            # Non-numeric/object fields are forwarded via non_tensor_batch.
+            stacked = None
+
+        if stacked is not None and isinstance(stacked, torch.Tensor):
+            batch_dict[field] = stacked
             continue
-        value = data[field]
-        # Normalize LinkedList / NonTensorStack / numpy object arrays to a plain
-        # list, then wrap as an object ndarray for DataProto compatibility.
-        if isinstance(value, np.ndarray):
-            non_tensor_batch[field] = value
-        else:
-            items = list(value)
-            arr = np.empty(len(items), dtype=object)
-            arr[:] = items
-            non_tensor_batch[field] = arr
+        non_tensor_batch[field] = _to_object_array(value)
 
     # Unpack extra_fields dict rows into top-level non_tensor_batch keys so the
     # diffusion compute path can read min/max_global_steps and reward_extra_info.
