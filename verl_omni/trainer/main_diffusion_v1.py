@@ -15,10 +15,10 @@
 
 Mirrors verl's ``verl.trainer.main_ppo.run_ppo`` / ``TaskRunnerV1`` but selects a
 ``PolicyGradientDiffusionTrainerV1`` subclass via ``trainer.v1.trainer_mode`` and
-wires a ``DiffusionAgentLoopManagerTQ``. TransferQueue is initialized and closed
-inside the Ray task runner. The trainer is self-contained (it resolves the
-model, tokenizer, processor, datasets, workers, rollout server, reward loop,
-and checkpoint engine in ``init``), so this runner stays thin.
+wires verl's ``AgentLoopManagerTQ`` (used directly) with ``DiffusionAgentLoopWorkerTQ``.
+TransferQueue is initialized and closed inside the Ray task runner. The trainer is
+self-contained (it resolves the model, tokenizer, processor, datasets, workers,
+rollout server, reward loop, and checkpoint engine in ``init``), so this runner stays thin.
 """
 
 import logging
@@ -94,7 +94,8 @@ class DiffusionTaskRunnerV1:
 
     The trainer owns all worker/dataset/rollout/reward/checkpoint setup; this
     runner only selects the trainer class, initializes TransferQueue, creates
-    the ``DiffusionAgentLoopManagerTQ``, and drives ``trainer.init``/``fit``.
+    the agent loop manager (verl's ``AgentLoopManagerTQ`` wired with
+    ``DiffusionAgentLoopWorkerTQ`` via a factory), and drives ``trainer.init``/``fit``.
     """
 
     def __init__(self):
@@ -106,24 +107,28 @@ class DiffusionTaskRunnerV1:
         """Initialize the diffusion agent loop manager.
 
         Users can plug a custom manager via
-        ``actor_rollout_ref.rollout.agent.agent_loop_manager_class``; otherwise the
-        default ``DiffusionAgentLoopManagerTQ`` is used. The only requirements are
+        ``actor_rollout_ref.rollout.agent.agent_loop_manager_class``; otherwise verl's
+        ``AgentLoopManagerTQ`` is used (directly, not subclassed) with
+        ``DiffusionAgentLoopWorkerTQ`` as the worker class. The only requirements are
         implementing ``generate_sequences`` and putting agent loop outputs into
         TransferQueue.
         """
-        from verl_omni.agent_loop import DiffusionAgentLoopManagerTQ
+        from verl_omni.agent_loop import create_diffusion_agent_loop_manager
 
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
             agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+            self.agent_loop_manager = agent_loop_manager_cls.create(
+                config=self.config,
+                llm_client=self.trainer.get_llm_client(),
+                reward_loop_worker_handles=self.trainer.get_reward_handles(),
+            )
         else:
-            agent_loop_manager_cls = DiffusionAgentLoopManagerTQ
-
-        self.agent_loop_manager = agent_loop_manager_cls.create(
-            config=self.config,
-            llm_client=self.trainer.get_llm_client(),
-            reward_loop_worker_handles=self.trainer.get_reward_handles(),
-        )
+            self.agent_loop_manager = create_diffusion_agent_loop_manager(
+                config=self.config,
+                llm_client=self.trainer.get_llm_client(),
+                reward_loop_worker_handles=self.trainer.get_reward_handles(),
+            )
 
     def run(self, config: DictConfig):
         """Run the v1 diffusion training process."""

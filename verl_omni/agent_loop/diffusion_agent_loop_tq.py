@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # TODO: move this file to verl_omni.experimental.agent_loop after V1 is stable
-"""TransferQueue adapter for DiffusionAgentLoopManager and DiffusionAgentLoopWorker.
+"""TransferQueue adapter for the diffusion agent loop worker.
 
-This mirrors verl's ``verl.trainer.ppo.v1.agent_loop_tq`` but reuses the existing
-diffusion agent loop instantiation and postprocess logic from
+This mirrors verl's ``verl.trainer.ppo.v1.agent_loop_tq`` worker but reuses the
+existing diffusion agent loop instantiation and postprocess logic from
 ``verl_omni.agent_loop.diffusion_agent_loop``. The worker is fire-and-forget:
 it dispatches background generation tasks and writes each finished diffusion
 trajectory into TransferQueue instead of returning a ``DataProto`` batch.
+
+The manager side is provided by verl's ``AgentLoopManagerTQ`` (used directly,
+not subclassed); see :func:`create_diffusion_agent_loop_manager`, which swaps in
+``DiffusionAgentLoopWorkerTQ`` as the worker class.
 """
 
 import asyncio
@@ -31,7 +35,7 @@ import torch
 import transfer_queue as tq
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
-from verl.experimental.agent_loop import AgentLoopManager, get_trajectory_info
+from verl.experimental.agent_loop import get_trajectory_info
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -272,32 +276,22 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         )
 
 
-class DiffusionAgentLoopManagerTQ(AgentLoopManager):
-    """TransferQueue-backed diffusion agent loop manager.
+@auto_await
+async def create_diffusion_agent_loop_manager(*args, **kwargs):
+    """Build verl's ``AgentLoopManagerTQ`` wired with ``DiffusionAgentLoopWorkerTQ``.
 
-    Dispatches prompt batches to ``DiffusionAgentLoopWorkerTQ`` actors without
-    waiting for generated trajectories. Trajectories are consumed through
-    TransferQueue by the trainer's replay buffer.
+    verl's ``AgentLoopManagerTQ.__init__`` hardcodes ``AgentLoopWorkerTQ`` as the
+    worker class and its ``create()`` runs construction and worker
+    initialization back-to-back, so the diffusion worker cannot be injected
+    through the constructor. Instead we construct the manager directly, override
+    ``agent_loop_workers_class`` before any worker is spawned, and run the async
+    worker initialization — mirroring what ``AgentLoopManagerTQ.create()`` does
+    internally. ``@auto_await`` lets this be called from sync code (like the
+    diffusion task runner) or awaited from async code.
     """
+    from verl.trainer.ppo.v1 import AgentLoopManagerTQ
 
-    def __init__(self, *args, **kwargs):
-        self.agent_loop_workers_class = DiffusionAgentLoopWorkerTQ
-        super().__init__(*args, **kwargs)
-
-    @classmethod
-    @auto_await
-    async def create(cls, *args, **kwargs):
-        """Create the diffusion agent loop manager."""
-        instance = cls(*args, **kwargs)
-        await instance._init_agent_loop_workers()
-        return instance
-
-    def generate_sequences(self, prompts: TensorDict) -> None:
-        """Dispatch input batch to diffusion agent loop workers without blocking."""
-        chunks = prompts.chunk(len(self.agent_loop_workers))
-        ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunks, strict=False)
-            ]
-        )
+    manager = AgentLoopManagerTQ(*args, **kwargs)
+    manager.agent_loop_workers_class = DiffusionAgentLoopWorkerTQ
+    await manager._init_agent_loop_workers()
+    return manager

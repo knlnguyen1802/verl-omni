@@ -14,8 +14,8 @@
 
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_agent_loop_tq import (
-    DiffusionAgentLoopManagerTQ,
     DiffusionAgentLoopWorkerTQ,
+    create_diffusion_agent_loop_manager,
 )
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
@@ -23,6 +23,6 @@ __all__ = [
     "DiffusionAgentLoopOutput",
     "DiffusionAgentLoopWorker",
     "DiffusionAgentLoopWorkerTQ",
-    "DiffusionAgentLoopManagerTQ",
+    "create_diffusion_agent_loop_manager",
     "DiffusionSingleTurnAgentLoop",
 ]

@@ -4,8 +4,9 @@
 # This is the v1 counterpart of run_sd35_medium_ocr_lora.sh. It uses the new
 # `verl_omni.trainer.main_diffusion_v1` entrypoint, which selects
 # `PolicyGradientDiffusionTrainerV1Sync` via `trainer.v1.trainer_mode=sync` and
-# wires a `DiffusionAgentLoopManagerTQ`. TransferQueue is force-enabled inside
-# the runner, so it does not need to be set on the CLI.
+# wires verl's `AgentLoopManagerTQ` with `DiffusionAgentLoopWorkerTQ`.
+# TransferQueue is force-enabled inside the runner, so it does not need to be
+# set on the CLI.
 #
 # Reference (legacy v0 script):
 # verl-omni/examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh
