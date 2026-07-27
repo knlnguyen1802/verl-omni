@@ -65,6 +65,12 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
             # actor state. Without this, a transient startup miss can pin the
             # parent path to full-weight mode for the whole run.
             self._lora_peft_config = peft_config
+            logger.warning(
+                "LORA_SYNC_PROOF manager route backend=%s global_steps=%s mode=%s",
+                self.backend,
+                global_steps,
+                "adapter_only" if peft_config is not None else "full_weight",
+            )
             await self._push_lora_peft_config_to_replicas(peft_config)
         await super().update_weights(global_steps=global_steps)
 
@@ -91,8 +97,18 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
             ray.get(futures)
         if peft_config is None:
             logger.debug("cleared pending LoRA peft_config on %d standalone rollout replica(s)", len(futures))
+            logger.warning(
+                "LORA_SYNC_PROOF manager push replicas=%d action=clear_pending_lora_config",
+                len(futures),
+            )
         else:
             logger.debug("pushed LoRA peft_config to %d standalone rollout replica(s)", len(futures))
+            logger.warning(
+                "LORA_SYNC_PROOF manager push replicas=%d action=set_pending_lora_config rank=%s target_modules=%s",
+                len(futures),
+                peft_config.get("r", "unknown"),
+                peft_config.get("target_modules", "unknown"),
+            )
 
     def _fetch_actor_lora_peft_config(self):
         """Return the actor's LoRA ``peft_config`` dict, or ``None``.

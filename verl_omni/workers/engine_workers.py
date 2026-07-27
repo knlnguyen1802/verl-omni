@@ -889,6 +889,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_has_lora = peft_module is not None and hasattr(peft_module, "peft_config")
 
             if actor_has_lora and not self.peft_merge:
+                logger.warning(
+                    "LORA_SYNC_PROOF actor send mode=adapter_only backend=%s global_steps=%s adapter=%s",
+                    effective_mode,
+                    global_steps,
+                    self.config.rollout.rollout_adapter,
+                )
                 per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
                     base_sync_done=True,
                     adapter_name=self.config.rollout.rollout_adapter,
@@ -896,6 +902,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 await self.checkpoint_engine.send_weights(per_tensor_param)
                 return
 
+            logger.warning(
+                "LORA_SYNC_PROOF actor send mode=full_weight backend=%s global_steps=%s actor_has_lora=%s peft_merge=%s",
+                effective_mode,
+                global_steps,
+                actor_has_lora,
+                self.peft_merge,
+            )
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
                 adapter_name=self.config.rollout.rollout_adapter
             )
