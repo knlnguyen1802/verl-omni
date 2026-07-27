@@ -189,7 +189,14 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
 
     def on_init_end(self):
         # Push actor weights into both standalone and colocated rollout replicas.
+        logger.warning(
+            "LORA_SYNC_PROOF separate_async on_init_end: sending weights to BOTH "
+            "standalone and colocated checkpoint managers (global_steps=%s)",
+            self.global_steps,
+        )
+        self._log_actor_lora_checksum(tag="before-standalone-init")
         self.standalone_checkpoint_manager.update_weights(self.global_steps)
+        self._log_actor_lora_checksum(tag="before-colocated-init")
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
@@ -242,12 +249,60 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
             # used for generation while ``should_switch_to_rollout`` returns
             # False), but keeping their weights fresh preserves sync-mode
             # parity and ensures they are ready if a switch is ever triggered.
+            logger.warning(
+                "LORA_SYNC_PROOF separate_async on_step_end: sending weights to "
+                "COLOCATED (non-standalone) checkpoint manager (global_steps=%s)",
+                self.global_steps,
+            )
+            self._log_actor_lora_checksum(tag="before-colocated-step")
             self.checkpoint_manager.update_weights(self.global_steps)
             if self.global_steps % self.config.trainer.v1.separate_async.parameter_sync_step == 0:
                 # Push freshly-trained actor weights into standalone rollout replicas.
                 # The standalone manager pulls from the same actor worker group as the
                 # colocated manager, so both receive identical weights each sync.
+                logger.warning(
+                    "LORA_SYNC_PROOF separate_async on_step_end: sending weights to "
+                    "STANDALONE checkpoint manager (global_steps=%s)",
+                    self.global_steps,
+                )
+                self._log_actor_lora_checksum(tag="before-standalone-step")
                 self.standalone_checkpoint_manager.update_weights(self.global_steps)
+
+    # ------------------------------ diagnostics ------------------------------
+
+    def _log_actor_lora_checksum(self, tag: str):
+        """Fetch and log a checksum of the actor's LoRA adapter weights.
+
+        Both the colocated and standalone checkpoint managers pull from the same
+        actor worker group, so the checksum logged before each call must match.
+        Mismatched checksums across the two calls would mean the actor weights
+        changed between the two syncs (which should not happen within a single
+        ``on_step_end`` / ``on_init_end``). Returns silently when the actor is not
+        running a LoRA adapter.
+        """
+        try:
+            results = self.actor_rollout_wg.get_lora_weight_checksum()
+        except Exception as e:
+            logger.warning("LORA_SYNC_PROOF [%s] get_lora_weight_checksum failed: %s", tag, e)
+            return
+        checksums = [r for r in (results or []) if r is not None]
+        if not checksums:
+            logger.warning("LORA_SYNC_PROOF [%s] actor reports no LoRA adapter (full-weight sync)", tag)
+            return
+        # All actor ranks share the same adapter metadata; the per-rank sum may
+        # differ under FSDP sharding, so log every rank's checksum for inspection.
+        for rank, ck in enumerate(checksums):
+            logger.warning(
+                "LORA_SYNC_PROOF [%s] rank=%s num_lora_tensors=%s sum=%.6f "
+                "first_lora_a=%s first_lora_b=%s last=%s",
+                tag,
+                rank,
+                ck.get("num_lora_tensors"),
+                ck.get("sum", 0.0),
+                ck.get("first_lora_a"),
+                ck.get("first_lora_b"),
+                ck.get("last_name"),
+            )
 
     # ------------------------------ mode switching ------------------------------
 
