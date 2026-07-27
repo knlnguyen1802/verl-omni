@@ -48,7 +48,6 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
-    replace_lora_wrapper,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys
@@ -741,8 +740,16 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                     adapter_name=adapter_name or "default",
                     layer_prefixes=self.model_config.fsdp_layer_prefixes,
                 )
-            if not base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            # NOTE: do NOT apply ``replace_lora_wrapper`` here. Unlike AR (standard
+            # vLLM) models, the diffusion rollout (vllm-omni) never installs LoRA
+            # wrappers on the base model — LoRA adapters are managed separately by
+            # ``DiffusionLoRAManager``. So the rollout's ``params_dict`` only has
+            # plain keys (e.g. ``to_qkv.weight``), never ``*.base_layer.weight``.
+            # ``collect_lora_params`` already stripped ``.base_layer`` and
+            # ``convert_weight_keys`` below handles the HF key remapping
+            # (e.g. ``to_q`` -> fused ``to_qkv``); re-adding ``.base_layer`` would
+            # produce keys like ``to_qkv.base_layer.weight`` that the rollout
+            # cannot resolve (KeyError).
         else:
             params = self.module.state_dict()
 
@@ -781,7 +788,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         *,
         timesteps_key: str,
     ) -> dict:
-        num_timesteps = data[timesteps_key].shape[1]
+        num_timesteps = int(data[timesteps_key].shape[1])
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         tu.assign_non_tensor(data, use_dynamic_bsz=False)
 

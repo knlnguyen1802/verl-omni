@@ -39,6 +39,17 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     2. NPU (Ascend) memory-pool, sleep, and wake_up — via NPUColocateWorkerMixin
     """
 
+    # Out-of-band LoRA peft_config stash for the separate-async NCCL weight-sync
+    # path. verl's ``CheckpointEngineWorker.update_weights`` does not forward
+    # ``peft_config``/``base_sync_done`` kwargs to ``update_weights_from_ipc``,
+    # so the trainer-side ``OmniCheckpointEngineManager`` pushes the actor's
+    # ``peft_config`` here via ``collective_rpc("set_pending_lora_peft_config")``
+    # before the NCCL broadcast. ``update_weights_from_ipc`` consumes it when
+    # the kwarg is missing, so LoRA deltas are routed through ``add_lora``
+    # instead of being misloaded as full weights (which would raise KeyError
+    # on ``*.lora_A.weight`` since the base model has no such params).
+    _pending_lora_peft_config: dict | None = None
+
     def __new__(cls, **kwargs):
         set_death_signal()
 
@@ -46,6 +57,18 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         VLLMOmniHijack.hijack()
 
         return super().__new__(cls)
+
+    def set_pending_lora_peft_config(self, peft_config: dict | None = None):
+        """Stash the actor's LoRA ``peft_config`` for the next
+        ``update_weights_from_ipc`` call (separate-async NCCL path only).
+
+        Called out-of-band via ``collective_rpc`` by
+        ``OmniCheckpointEngineManager`` before the NCCL weight broadcast.
+        ``update_weights_from_ipc`` consumes the stash when its ``peft_config``
+        kwarg is absent (the standalone rollout path), then clears it so a
+        later full-weight sync is not misrouted.
+        """
+        self._pending_lora_peft_config = peft_config
 
     def _get_standard_weight_model_and_config(self):
         """Return ``(model, model_config)`` for the standard (non-LoRA) AR weight path.
@@ -74,6 +97,21 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
+        # Separate-async NCCL path: verl's ``CheckpointEngineWorker.update_weights``
+        # does not forward ``peft_config``/``base_sync_done`` to this method, so the
+        # trainer-side ``OmniCheckpointEngineManager`` stashed the actor's
+        # ``peft_config`` out-of-band. Pick it up here and treat this as a LoRA
+        # update (``base_sync_done=True``: the standalone rollout holds the frozen
+        # base weights from ``load_format``, so only adapter deltas are shipped).
+        if peft_config is None and self._pending_lora_peft_config is not None:
+            peft_config = self._pending_lora_peft_config
+            base_sync_done = True
+            # Consume the stash so a subsequent full-weight sync isn't misrouted.
+            self._pending_lora_peft_config = None
+            logger.warning(
+                "LORA_SYNC_PROOF rollout receive route=consume_pending_peft_config mode=adapter_only"
+            )
+
         assert self.device is not None
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
@@ -95,11 +133,18 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             accumulated_weights: dict[str, torch.Tensor] = {}
             receiver.receive_weights(on_bucket_received=lambda weights: accumulated_weights.update(weights))
             t_recv_end = time.perf_counter()
+            lora_total_bytes = sum(t.element_size() * t.numel() for t in accumulated_weights.values())
             logger.debug(
                 "IPC receive took %.3f ms (%d params, %.2f MB)",
                 (t_recv_end - t_recv_start) * 1000,
                 len(accumulated_weights),
-                sum(t.element_size() * t.numel() for t in accumulated_weights.values()) / (1024 * 1024),
+                lora_total_bytes / (1024 * 1024),
+            )
+            logger.warning(
+                "LORA_SYNC_PROOF rollout receive mode=adapter_only tensors=%d mb=%.3f rank=%s",
+                len(accumulated_weights),
+                lora_total_bytes / (1024 * 1024),
+                peft_config.get("r", "unknown") if isinstance(peft_config, dict) else "unknown",
             )
 
             # AR (standard vLLM) workers go through verl's base VLLMHijack, which
@@ -138,6 +183,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         else:
             # Full-weight path: stream bucket-by-bucket to bound GPU memory.
             logger.info("Loading standard weights (async)")
+            logger.warning("LORA_SYNC_PROOF rollout receive mode=full_weight")
             standard = self._get_standard_weight_model_and_config()
             if standard is not None:
                 # AR (standard vLLM) model: load each bucket via the low-level
