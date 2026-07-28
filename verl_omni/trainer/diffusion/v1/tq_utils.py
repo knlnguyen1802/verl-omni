@@ -34,7 +34,7 @@ def _unwrap_non_tensor_item(item: Any) -> Any:
     # Some TransferQueue paths return wrapper objects with a ``data`` attribute.
     # Unwrap a few levels defensively until reaching a plain python value.
     for _ in range(4):
-        if isinstance(value, (str, bytes, bytearray, dict, list, tuple, np.ndarray, torch.Tensor)):
+        if isinstance(value, str | bytes | bytearray | dict | list | tuple | np.ndarray | torch.Tensor):
             break
         data_attr = getattr(value, "data", None)
         if data_attr is None or data_attr is value:
@@ -51,7 +51,7 @@ def _to_object_array(value: Any) -> np.ndarray:
         items = value.tolist()
     elif isinstance(value, np.ndarray):
         items = value.tolist()
-    elif isinstance(value, (str, bytes, dict)):
+    elif isinstance(value, str | bytes | dict):
         items = [value]
     else:
         try:
@@ -80,7 +80,7 @@ def _stack_field(value: Any, padding: float = 0.0) -> torch.Tensor | None:
         return value
     if hasattr(value, "to_padded_tensor"):
         return value.to_padded_tensor(padding=padding)
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         tensors = [v if isinstance(v, torch.Tensor) else torch.as_tensor(v) for v in value]
         if not tensors:
             return None

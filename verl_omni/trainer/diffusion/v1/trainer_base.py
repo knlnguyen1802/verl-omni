@@ -704,7 +704,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             info = self.actor_rollout_wg._query_dispatch_info("actor")
             if isinstance(info, dict):
                 dp_size = max(info.values()) + 1 if info else 1
-            elif isinstance(info, (list, tuple, set)):
+            elif isinstance(info, list | tuple | set):
                 dp_size = max(info) + 1 if info else 1
             else:
                 # ONE_TO_ALL dispatch may return a scalar dp rank per worker.
