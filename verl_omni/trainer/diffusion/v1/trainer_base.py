@@ -136,7 +136,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             sampler_kwargs=sampler_config.sampler_kwargs,
         )
 
-
     def init(self):
         """Initialize workers, rollout server, reward loop, checkpoint engine."""
         self._setup()
@@ -325,7 +324,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         )
         return batch_meta
 
-
     def on_init_end(self):
         """Called after initialization ends."""
         return
@@ -364,7 +362,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Called after sampling a batch from the replay buffer."""
         return
 
-
     def release_rollout_cache_for_weight_sync(self) -> None:
         """No-op for pure diffusion models (no KV cache)."""
         return
@@ -372,7 +369,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def resume_rollout_cache_after_weight_sync(self) -> None:
         """No-op for pure diffusion models (no KV cache)."""
         return
-
 
     def _setup(self):
         self._init_tokenizer()
@@ -621,7 +617,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             replicas=self.llm_server_manager.get_replicas(),
         )
 
-
     def get_llm_client(self):
         return self.llm_server_manager.get_client()
 
@@ -629,7 +624,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if self.enable_agent_reward_loop:
             return self.reward_loop_manager.reward_loop_workers
         return None
-
 
     def _fetch_one_gen_batch(self):
         if self.train_dataloader_it is None:
@@ -684,7 +678,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def _add_batch_to_generate(self):
         batch = self._next_train_batch()
         self._submit_batch_to_rollout(batch)
-
 
     def _compute_reward_colocate(self, data: DataProto) -> DataProto:
         """Compute reward score with a colocated reward model on a DataProto batch."""
@@ -797,7 +790,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
             actor_output["perf/mfu/actor"] = actor_mfu
         return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
-
 
     def _validate(self) -> dict:
         """Validation via TransferQueue: dispatch, sample, convert, reward, dump images."""
@@ -1025,7 +1017,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
         return metric_dict
 
-
     def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
@@ -1070,7 +1061,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     "training/off_policy/trajectory_staleness_worst/min": staleness_worst.min(),
                 }
             )
-
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

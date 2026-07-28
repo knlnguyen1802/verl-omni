@@ -148,6 +148,14 @@ def put_dataproto_fields_to_tq(
     data: DataProto,
     fields: list[str],
 ) -> None:
+    """Write selected ``DataProto`` batch fields back to TransferQueue.
+
+    Args:
+        batch_meta: ``KVBatchMeta`` whose ``keys`` and ``partition_id`` target
+            the rows to update.
+        data: ``DataProto`` containing the computed tensor fields.
+        fields: Batch field names to persist; missing fields are skipped.
+    """
     output: dict[str, Any] = {}
     for field in fields:
         if field not in data.batch:
@@ -163,6 +171,14 @@ def put_dataproto_fields_to_tq(
 
 
 def sort_diffusion_tq_keys(keys: list[str]) -> list[int]:
+    """Return indices that sort TransferQueue keys in rollout order.
+
+    Args:
+        keys: TransferQueue row keys from ``KVBatchMeta.keys``.
+
+    Returns:
+        Permutation indices that reorder ``keys`` by ``(uid, rollout, output)``.
+    """
     sort_keys = []
     for key in keys:
         parts = key.rsplit("_", 2)
