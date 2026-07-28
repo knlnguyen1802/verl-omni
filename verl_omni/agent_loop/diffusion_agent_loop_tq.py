@@ -203,17 +203,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             field["rm_scores"] = torch.tensor([internal.reward_score], dtype=torch.float32)
 
         extra = internal.extra_fields
-        for tensor_key in [
-            "attention_mask",
-            "prompt_embeds",
-            "prompt_embeds_mask",
-            "negative_prompt_embeds",
-            "negative_prompt_embeds_mask",
-            "pooled_prompt_embeds",
-            "negative_pooled_prompt_embeds",
-            "all_latents",
-            "all_timesteps",
-        ]:
+        for tensor_key in extra.keys():
             value = extra.get(tensor_key)
             if isinstance(value, torch.Tensor):
                 field[tensor_key] = value.squeeze(0) if value.dim() >= 1 and value.shape[0] == 1 else value
