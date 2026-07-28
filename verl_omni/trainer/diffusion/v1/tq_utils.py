@@ -11,14 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TransferQueue <-> diffusion DataProto conversion helpers.
-
-These helpers bridge the TransferQueue row format produced by
-``DiffusionAgentLoopWorkerTQ`` and the diffusion ``DataProto`` layout consumed
-by the existing policy-gradient compute path (reward, old/ref log-prob,
-advantage, actor update). They centralize object-array handling for non-tensor
-fields and key sorting for validation/rollout dumping.
-"""
 
 import logging
 import os
@@ -83,11 +75,6 @@ def _stack_field(value: Any, padding: float = 0.0) -> torch.Tensor | None:
     """
     if value is None:
         return None
-    # Nested/jagged tensors returned by some TransferQueue backends must be
-    # converted to dense padded tensors BEFORE the generic torch.Tensor check
-    # below, since nested tensors are also instances of torch.Tensor. Leaving
-    # them nested would expose symbolic ``NestedIntNode`` shapes downstream
-    # (e.g. ``range(tensor.shape[1])`` raises ``AttributeError``).
     if isinstance(value, torch.Tensor) and value.is_nested:
         return value.to_padded_tensor(padding=padding)
     if isinstance(value, torch.Tensor):
@@ -162,12 +149,6 @@ def put_dataproto_fields_to_tq(
     data: DataProto,
     fields: list[str],
 ) -> None:
-    """Write selected diffusion ``DataProto`` fields back to TransferQueue.
-
-    Used after the trainer computes old_log_probs / ref_log_prob / advantages /
-    returns on the driver and needs to persist them so the actor update worker
-    can read them by key.
-    """
     output: dict[str, Any] = {}
     for field in fields:
         if field not in data.batch:
@@ -183,11 +164,6 @@ def put_dataproto_fields_to_tq(
 
 
 def sort_diffusion_tq_keys(keys: list[str]) -> list[int]:
-    """Return sort indices that order keys by ``(uid, session_id, index)``.
-
-    Keys have the format ``{uid}_{session_id}_{index}``. Sorting by this tuple
-    keeps generations from the same rollout group together for dumping.
-    """
     sort_keys = []
     for key in keys:
         parts = key.rsplit("_", 2)

@@ -11,17 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""V1 policy-gradient diffusion trainer base.
-
-This is the verl-omni counterpart of upstream ``verl.trainer.ppo.v1.trainer_base``.
-It reuses upstream verl v1 infrastructure (ReplayBuffer, LLMServerManager,
-CheckpointEngineManager, RewardLoopManager, hook lifecycle) but keeps the
-diffusion ``DataProto`` compute contract (image/video responses, dense SDE-step
-log-probs, image-level rewards, Flow-GRPO advantages) instead of the token PPO
-compute path. It must NOT be subclassed from upstream ``PPOTrainer`` because the
-token-level assumptions (response_mask, token rewards, critic values) do not hold
-for diffusion.
-"""
 
 import json
 import logging
@@ -138,8 +127,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         self.checkpoint_manager = None
         self.global_steps = 0
-
-    # ------------------------------ replay buffer ------------------------------
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -461,15 +448,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.processor = hf_processor(processor_path, trust_remote_code=trust_remote_code, use_fast=True)
 
     def _normalize_dynamic_bsz_config(self) -> None:
-        """Backfill dynamic-batch-size compatibility keys for upstream engine workers.
-
-        Diffusion models don't support packed attention, so ``use_dynamic_bsz`` and
-        ``ppo_max_token_len_per_gpu`` are intentionally NOT defined on
-        ``DiffusionActorConfig``. We only backfill the rollout-side log-prob keys
-        (which carry their own dataclass fields) so engine_workers.init_model()
-        always sees consistent values. Actor/ref configs are left untouched to
-        avoid injecting keys that ``omega_conf_to_dataclass`` would reject.
-        """
         actor_cfg = OmegaConf.select(self.config, "actor_rollout_ref.actor")
         rollout_cfg = OmegaConf.select(self.config, "actor_rollout_ref.rollout")
         if actor_cfg is None or rollout_cfg is None:
@@ -554,15 +532,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self._dump_executor.shutdown(wait=True)
 
     def _shutdown_dataloaders(self):
-        """Gracefully join dataloader worker processes before vLLM/Ray teardown.
-
-        If the StatefulDataLoader workers are still alive when ``__del__`` runs
-        during interpreter shutdown, PyTorch's DataLoader watchdog can raise a
-        spurious ``RuntimeError: DataLoader worker ... is killed by signal`` once
-        the colocated vLLM DiffusionWorker subprocesses are torn down. Joining
-        the workers explicitly here (while the rollout stack is still alive)
-        avoids that benign-but-noisy shutdown race.
-        """
         for attr in ("train_dataloader", "val_dataloader"):
             loader = getattr(self, attr, None)
             if loader is None:
@@ -732,16 +701,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return self.reward_loop_manager.compute_rm_score(data)
 
     def _balance_batch(self, data: DataProto, metrics: dict) -> DataProto:
-        """Ensure the DataProto is divisible by the actor dp group size.
-
-        Diffusion has no critic, so the only divisibility constraint comes from
-        the actor update. The sampled trajectory count is
-        ``sample_batch_size * rollout.n``; users must configure
-        ``train_batch_size`` so that this is divisible by the actor dp size
-        (same assumption as the legacy diffusion trainer). When padding is
-        unavoidable, pad rows are appended at the end so the original keys stay
-        aligned with the first ``len(batch_meta)`` rows for TQ write-back.
-        """
         dp_size = 1
         if hasattr(self.actor_rollout_wg, "_query_dispatch_info"):
             info = self.actor_rollout_wg._query_dispatch_info("actor")
@@ -1175,11 +1134,3 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self.train_dataloader.load_state_dict(torch.load(dataloader_path, weights_only=False))
         else:
             logger.warning(f"No dataloader state at {dataloader_path}, starting from scratch")
-
-
-
-
-
-
-
-

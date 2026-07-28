@@ -11,13 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""verl-omni diffusion v1 trainer package.
-
-Reuses upstream verl v1 infrastructure (ReplayBuffer, TransferQueue,
-LLMServerManager, CheckpointEngineManager) while keeping the diffusion
-``DataProto`` compute contract. Only the ``sync`` mode is implemented in this
-draft; ``colocate_async`` and ``separate_async`` are intentionally omitted.
-"""
 
 from verl_omni.trainer.diffusion.v1.trainer_base import (
     DIFFUSION_TRAINER_REGISTRY,

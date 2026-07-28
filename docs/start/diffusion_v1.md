@@ -90,16 +90,6 @@ python3 -m verl_omni.trainer.main_diffusion_v1
 trainer.use_v1=true
 trainer.v1.trainer_mode=sync
 ```
-
-It also uses `vllm_omni` for rollout, FSDP2 for actor training, and
-`Qwen/Qwen2.5-VL-3B-Instruct` for OCR reward scoring. Model weights are
-downloaded from Hugging Face on the first run unless the model paths in the
-script are changed to local directories.
-
-TransferQueue is force-enabled by the V1 task runner, so
-`transfer_queue.enable=true` does not need to be passed on the command line.
-The default `SimpleStorage` backend works without an external service.
-
 Hydra settings can be appended to the command. For example, to run fewer steps
 and disable W&B:
 
@@ -140,8 +130,3 @@ Ray workers cannot import `transfer_queue`
 : Stop the existing Ray cluster with `ray stop`, activate the environment where
   TransferQueue is installed, and launch the recipe again.
 
-Out-of-memory errors
-: Reduce `actor_rollout_ref.rollout.n`, the rollout image height and width, or
-  the actor and log-prob micro-batch sizes. See the
-  {doc}`FlowGRPO quickstart <flowgrpo_quickstart>` for additional tuning
-  suggestions.

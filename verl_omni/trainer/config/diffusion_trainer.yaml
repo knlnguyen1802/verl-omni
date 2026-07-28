@@ -203,8 +203,7 @@ trainer:
   # V1 trainer mode configs (mirrors verl/trainer/config/ppo_trainer.yaml `trainer.v1`).
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async".
-    # Only "sync" is implemented in this draft; the async modes raise NotImplementedError.
+    # Trainer mode: "sync"
     trainer_mode: sync
 
     # Synchronous diffusion trainer (colocated rollout, no partial rollout).

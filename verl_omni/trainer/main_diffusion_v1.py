@@ -11,15 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""V1 entrypoint for diffusion model RL training.
-
-Mirrors verl's ``verl.trainer.main_ppo.run_ppo`` / ``TaskRunnerV1`` but selects a
-``PolicyGradientDiffusionTrainerV1`` subclass via ``trainer.v1.trainer_mode`` and
-wires verl's ``AgentLoopManagerTQ`` (used directly) with ``DiffusionAgentLoopWorkerTQ``.
-TransferQueue is initialized and closed inside the Ray task runner. The trainer is
-self-contained (it resolves the model, tokenizer, processor, datasets, workers,
-rollout server, reward loop, and checkpoint engine in ``init``), so this runner stays thin.
-"""
 
 import logging
 import os
@@ -90,29 +81,12 @@ def run_diffusion_v1(config, task_runner_class=None) -> None:
 
 @ray.remote
 class DiffusionTaskRunnerV1:
-    """V1 TaskRunner for diffusion policy-gradient training.
-
-    The trainer owns all worker/dataset/rollout/reward/checkpoint setup; this
-    runner only selects the trainer class, initializes TransferQueue, creates
-    the agent loop manager (verl's ``AgentLoopManagerTQ`` wired with
-    ``DiffusionAgentLoopWorkerTQ`` via a factory), and drives ``trainer.init``/``fit``.
-    """
-
     def __init__(self):
         self.config = None
         self.trainer = None
         self.agent_loop_manager = None
 
     def init_agent_loop_manager(self):
-        """Initialize the diffusion agent loop manager.
-
-        Users can plug a custom manager via
-        ``actor_rollout_ref.rollout.agent.agent_loop_manager_class``; otherwise verl's
-        ``AgentLoopManagerTQ`` is used (directly, not subclassed) with
-        ``DiffusionAgentLoopWorkerTQ`` as the worker class. The only requirements are
-        implementing ``generate_sequences`` and putting agent loop outputs into
-        TransferQueue.
-        """
         from verl_omni.agent_loop import create_diffusion_agent_loop_manager
 
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
