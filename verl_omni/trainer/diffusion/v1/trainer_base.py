@@ -21,7 +21,6 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
-from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -32,11 +31,10 @@ from PIL import Image
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import KVBatchMeta
-
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
     RayWorkerGroup,
@@ -46,6 +44,7 @@ from verl.single_controller.ray import (
 from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, need_reference_policy, need_reward_model
+from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
@@ -54,7 +53,6 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.rollout.llm_server import LLMServerManager
 
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
@@ -69,11 +67,11 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     apply_rollout_correction_to_diffusion_batch,
     rollout_correction_enabled,
 )
-from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
     sort_diffusion_tq_keys,
 )
+from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 logger = logging.getLogger(__name__)
@@ -548,7 +546,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     logger.debug(f"Ignoring error shutting down {attr} workers: {e}")
             # Drop references so the implicit __del__ during teardown is a no-op
             try:
-                setattr(loader, "_iterator", None)
+                loader._iterator = None
             except Exception:
                 pass
         self.train_dataloader_it = None
@@ -829,8 +827,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
             tags = [
-                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps}
-                for _ in range(len(batch))
+                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
             ]
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
@@ -983,11 +980,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
             inputs = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
             outputs = data.batch["responses"]
-            scores = data.batch["sample_level_scores"].sum(-1).cpu().tolist() if "sample_level_scores" in data.batch else (
-                data.batch["rm_scores"].sum(-1).cpu().tolist() if "rm_scores" in data.batch else [0.0] * len(data)
+            scores = (
+                data.batch["sample_level_scores"].sum(-1).cpu().tolist()
+                if "sample_level_scores" in data.batch
+                else (
+                    data.batch["rm_scores"].sum(-1).cpu().tolist() if "rm_scores" in data.batch else [0.0] * len(data)
+                )
             )
             rm_meta = data.non_tensor_batch.get("reward_model")
-            gts = [item.get("ground_truth", None) for item in rm_meta.tolist()] if rm_meta is not None else [None] * len(data)
+            gts = (
+                [item.get("ground_truth", None) for item in rm_meta.tolist()]
+                if rm_meta is not None
+                else [None] * len(data)
+            )
 
             sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
             inputs = [inputs[i] for i in sort_idx]

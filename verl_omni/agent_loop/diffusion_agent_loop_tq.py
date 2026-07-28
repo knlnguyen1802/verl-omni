@@ -21,15 +21,14 @@ import ray
 import torch
 import transfer_queue as tq
 from tensordict import NonTensorData, NonTensorStack, TensorDict
-
 from verl.experimental.agent_loop import get_trajectory_info
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 from verl_omni.agent_loop.diffusion_agent_loop import (
     DiffusionAgentLoopWorker,
-    _InternalDiffusionAgentLoopOutput,
     _config_to_sampling_dict,
+    _InternalDiffusionAgentLoopOutput,
 )
 from verl_omni.agent_loop.utils import _derive_rollout_seed
 
@@ -39,8 +38,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 @ray.remote
 class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
-    """TransferQueue-backed diffusion agent loop worker.
-    """
+    """TransferQueue-backed diffusion agent loop worker."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -75,7 +73,9 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             sampling_params["global_steps"] = global_steps
             rollout_seed_meta = batch.get("rollout_seed")
             if rollout_seed_meta is not None:
-                rollout_base_seed = int(rollout_seed_meta.data if isinstance(rollout_seed_meta, NonTensorData) else rollout_seed_meta)
+                rollout_base_seed = int(
+                    rollout_seed_meta.data if isinstance(rollout_seed_meta, NonTensorData) else rollout_seed_meta
+                )
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch:
@@ -163,9 +163,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             sampling_params, agent_name=agent_name, **kwargs
         )
         uid = kwargs["uid"]
-        non_conflicting_kwargs = {
-            k: v for k, v in kwargs.items() if k not in {"uid", "global_steps"}
-        }
+        non_conflicting_kwargs = {k: v for k, v in kwargs.items() if k not in {"uid", "global_steps"}}
         await self._write_trajectory_to_tq(
             internal,
             uid=uid,
@@ -259,8 +257,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
 
 @auto_await
 async def create_diffusion_agent_loop_manager(*args, **kwargs):
-    """Build verl's ``AgentLoopManagerTQ`` wired with ``DiffusionAgentLoopWorkerTQ``.
-    """
+    """Build verl's ``AgentLoopManagerTQ`` wired with ``DiffusionAgentLoopWorkerTQ``."""
     from verl.trainer.ppo.v1 import AgentLoopManagerTQ
 
     manager = AgentLoopManagerTQ(*args, **kwargs)

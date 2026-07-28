@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from verl_omni.trainer.diffusion.v1.tq_utils import (
+    diffusion_tq_batch_to_dataproto,
+    put_dataproto_fields_to_tq,
+    sort_diffusion_tq_keys,
+)
 from verl_omni.trainer.diffusion.v1.trainer_base import (
     DIFFUSION_TRAINER_REGISTRY,
     PolicyGradientDiffusionTrainerV1,
@@ -19,11 +24,6 @@ from verl_omni.trainer.diffusion.v1.trainer_base import (
     register_diffusion_trainer,
 )
 from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionTrainerV1Sync
-from verl_omni.trainer.diffusion.v1.tq_utils import (
-    diffusion_tq_batch_to_dataproto,
-    put_dataproto_fields_to_tq,
-    sort_diffusion_tq_keys,
-)
 
 __all__ = [
     "DIFFUSION_TRAINER_REGISTRY",

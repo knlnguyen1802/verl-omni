@@ -21,7 +21,6 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 from transfer_queue import KVBatchMeta
-
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 
