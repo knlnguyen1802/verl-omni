@@ -29,7 +29,6 @@ See {doc}`start/models` for the full model catalogue and which algorithms run on
 start/install.md
 start/models.md
 start/flowgrpo_quickstart.md
-start/diffusion_v1.md
 start/multi_node_training.md
 start/metrics.md
 ```
@@ -43,6 +42,7 @@ algo/rollout_correction.md
 start/rollout_batching.md
 start/http_scorer.md
 start/sd35_drm_flow_grpo.md
+start/diffusion_v1.md
 ```
 
 ```{toctree}

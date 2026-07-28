@@ -24,21 +24,6 @@ The OCR reward also requires Levenshtein:
 uv pip install -e ".[ocr]"
 ```
 
-## Install TransferQueue
-
-TransferQueue is required by the V1 trainer and should be installed explicitly.
-Install the version validated with this recipe:
-
-```bash
-uv pip install TransferQueue==0.1.8
-```
-
-If the environment was created with `pip` instead of `uv`, use:
-
-```bash
-pip install TransferQueue==0.1.8
-```
-
 Verify that TransferQueue and the V1 entrypoint can be imported:
 
 ```bash
