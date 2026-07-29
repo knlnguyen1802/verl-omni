@@ -64,11 +64,28 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         }
 
         rollout_base_seed = None
+        # global_steps must be set for BOTH training and validation. It flows
+        # into get_trajectory_info() -> trajectory["step"] -> the trajectory's
+        # TQ tag ("global_steps"). The replay buffer's off-policy sampler drops
+        # trajectories whose staleness (sample_step - traj_step + 1) exceeds the
+        # threshold. Without this, validation trajectories record step=-1 and
+        # are all dropped (staleness = (step - (-1) + 1) >> threshold), leaving
+        # diffusion_tq_batch_to_dataproto with an empty key list.
+        global_steps = batch["global_steps"] if "global_steps" in batch else None
+        if isinstance(global_steps, NonTensorData):
+            global_steps = global_steps.data
+        if global_steps is not None:
+            sampling_params["global_steps"] = global_steps
+
         if validate:
             sampling_params.update(_config_to_sampling_dict(config.val_kwargs.pipeline))
             sampling_params.update(_config_to_sampling_dict(config.val_kwargs.algo))
             sampling_params["seed"] = config.val_kwargs.seed
             sampling_params["logprobs"] = False
+            # Re-assert global_steps in case the val_kwargs update above is ever
+            # extended to carry a "global_steps" key in the future.
+            if global_steps is not None:
+                sampling_params["global_steps"] = global_steps
         else:
             sampling_params["global_steps"] = global_steps
             rollout_seed_meta = batch.get("rollout_seed")
