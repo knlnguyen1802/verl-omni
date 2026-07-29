@@ -14,6 +14,7 @@
 
 import logging
 import os
+import uuid
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,7 @@ from tensordict import TensorDict
 from transfer_queue import KVBatchMeta
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
+from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -91,12 +93,15 @@ def _stack_field(value: Any, padding: float = 0.0) -> torch.Tensor | None:
 def diffusion_tq_batch_to_dataproto(
     batch_meta: KVBatchMeta,
     pad_token_id: int = 0,
+    select_fields: list[str] | None = None,
 ) -> DataProto:
     """Read selected TQ rows and assemble a diffusion ``DataProto``.
 
     Args:
         batch_meta: ``KVBatchMeta`` returned by ``ReplayBuffer.sample``.
         pad_token_id: Padding token id for variable-length prompt token tensors.
+        select_fields: Optional list of fields to fetch (``kv_batch_get`` select_fields).
+            When ``None`` all fields are fetched.
 
     Returns:
         ``DataProto`` whose ``batch`` carries diffusion tensors (prompts,
@@ -106,10 +111,10 @@ def diffusion_tq_batch_to_dataproto(
     keys = list(batch_meta.keys)
     partition_id = batch_meta.partition_id
 
-    data = tq.kv_batch_get(
-        keys=keys,
-        partition_id=partition_id,
-    )
+    get_kwargs: dict = {"keys": keys, "partition_id": partition_id}
+    if select_fields is not None:
+        get_kwargs["select_fields"] = select_fields
+    data = tq.kv_batch_get(**get_kwargs)
 
     batch_dict: dict[str, torch.Tensor] = {}
     non_tensor_batch: dict[str, Any] = {}
@@ -187,3 +192,89 @@ def sort_diffusion_tq_keys(keys: list[str]) -> list[int]:
         else:
             sort_keys.append((key, 0, 0))
     return sorted(range(len(keys)), key=lambda i: sort_keys[i])
+
+
+def put_dataproto_to_tq(batch_meta: KVBatchMeta, data: DataProto) -> None:
+    """Write ALL fields of a ``DataProto`` (batch tensors + non_tensor_batch) back to TQ.
+
+    Unlike ``put_dataproto_fields_to_tq`` (which only persists selected tensor
+    fields), this round-trips the full row including non-tensor fields such as
+    ``uid``/``reward_model``/``data_source``. It is used to duplicate real rows
+    into TransferQueue as padding samples.
+    """
+    n = len(batch_meta.keys)
+    if n == 0:
+        return
+    fields_list: list[dict[str, Any]] = []
+    for i in range(n):
+        row: dict[str, Any] = {}
+        for k, v in data.batch.items():
+            row[k] = v[i]
+        for k, arr in data.non_tensor_batch.items():
+            row[k] = arr[i]
+        fields_list.append(row)
+    fields_td = list_of_dict_to_tensordict(fields_list)
+    tq.kv_batch_put(
+        keys=list(batch_meta.keys),
+        partition_id=batch_meta.partition_id,
+        fields=fields_td,
+    )
+
+
+def upsample_diffusion_batch_to_divisible_size(
+    batch_meta: KVBatchMeta,
+    batch_multiple: int,
+) -> KVBatchMeta:
+    """Append duplicate real rows as padding so ``len(batch)`` divides ``batch_multiple``.
+
+    Mirrors the legacy ``pad_dataproto_divisor`` semantics used by the diffusion
+    DataProto path: padding rows are copies of real rows cycling through the
+    batch, so each pad row keeps the original ``uid`` and is absorbed into the
+    same Flow-GRPO group. This preserves the exact pad-row numerics the recipe was
+    tuned with. Pad rows are tagged ``is_padding=True`` so metrics can filter
+    them out (the legacy path excluded them by slicing to the original key count).
+
+    In the common case where ``len(batch)`` already divides ``batch_multiple``,
+    this is a no-op and performs no TransferQueue I/O.
+    """
+    remainder = len(batch_meta) % batch_multiple
+    if remainder == 0:
+        return batch_meta
+
+    n = len(batch_meta)
+    pad_size = batch_multiple - remainder
+    source_indices = [i % n for i in range(pad_size)]
+
+    # Fetch the real rows we will duplicate (small fetch: only pad_size rows).
+    source_meta = KVBatchMeta(
+        keys=[batch_meta.keys[i] for i in source_indices],
+        tags=[batch_meta.tags[i] for i in source_indices],
+        partition_id=batch_meta.partition_id,
+    )
+    pad_data = diffusion_tq_batch_to_dataproto(source_meta, pad_token_id=0)
+
+    # Write the duplicates back under fresh pad keys, preserving every field
+    # (tensors + non-tensor uid/reward_model/...) so GRPO grouping is identical.
+    pad_keys = [f"pad_{uuid.uuid4().hex}_{i}_0" for i in range(pad_size)]
+    pad_tags = [dict(batch_meta.tags[source_indices[i]], is_padding=True) for i in range(pad_size)]
+    pad_meta = KVBatchMeta(
+        keys=pad_keys,
+        tags=pad_tags,
+        partition_id=batch_meta.partition_id,
+    )
+    put_dataproto_to_tq(pad_meta, pad_data)
+
+    logger.info(
+        "Upsampled diffusion batch from %d to %d with %d duplicate padding rows (multiple=%d)",
+        n,
+        n + pad_size,
+        pad_size,
+        batch_multiple,
+    )
+    return KVBatchMeta(
+        keys=batch_meta.keys + pad_keys,
+        tags=batch_meta.tags + pad_tags,
+        partition_id=batch_meta.partition_id,
+        fields=batch_meta.fields,
+        extra_info=batch_meta.extra_info,
+    )

@@ -122,7 +122,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         sample_index: int,
         rollout_base_seed: int | None = None,
     ) -> None:
-        """Spawn ``rollout.n`` sessions per prompt and write trajectories to TQ."""
+        """Spawn ``rollout.n`` sessions per prompt and write trajectories to TQ.
+
+        All sessions of a prompt are gathered and persisted in a single batched
+        ``kv_batch_put`` to amortize the per-key RPC overhead against the
+        TransferQueue controller/storage.
+        """
         uid = prompt["uid"]
         partition_id = "val" if trajectory["validate"] else "train"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
@@ -143,7 +148,14 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
+            session_outputs = await asyncio.gather(*tasks)
+            await self._write_trajectories_to_tq(
+                session_outputs,
+                uid=uid,
+                trajectory=trajectory,
+                validate=trajectory["validate"],
+                global_steps=sampling_params.get("global_steps"),
+            )
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
         except Exception as e:
             logger.exception(f"Error in _run_prompt for uid={uid}: {e}")
@@ -157,88 +169,79 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         session_id: int = 0,
         trajectory: dict | None = None,
         **kwargs,
-    ) -> None:
-        """Run one diffusion agent loop session and write its output to TransferQueue."""
+    ) -> tuple[_InternalDiffusionAgentLoopOutput, dict]:
+        """Run one diffusion agent loop session and return its output for batched write."""
         internal: _InternalDiffusionAgentLoopOutput = await super()._run_agent_loop(
             sampling_params, agent_name=agent_name, **kwargs
         )
-        uid = kwargs["uid"]
         non_conflicting_kwargs = {k: v for k, v in kwargs.items() if k not in {"uid", "global_steps"}}
-        await self._write_trajectory_to_tq(
-            internal,
-            uid=uid,
-            session_id=session_id,
-            trajectory=trajectory,
-            validate=trajectory["validate"] if trajectory else False,
-            global_steps=sampling_params.get("global_steps"),
-            **non_conflicting_kwargs,
-        )
+        return internal, non_conflicting_kwargs
 
-    async def _write_trajectory_to_tq(
+    async def _write_trajectories_to_tq(
         self,
-        internal: _InternalDiffusionAgentLoopOutput,
+        session_outputs: list[tuple[_InternalDiffusionAgentLoopOutput, dict]],
         *,
         uid: str,
-        session_id: int,
         trajectory: dict | None,
         validate: bool,
         global_steps: int | None = None,
-        **kwargs,
     ) -> None:
-        """Convert a padded diffusion agent loop output into a TransferQueue row."""
-        # Diffusion single-turn agent loops produce one output per session.
-        index = 0
-        key = f"{uid}_{session_id}_{index}"
+        """Persist all sessions of a prompt into TransferQueue in one batched put."""
         partition_id = "val" if validate else "train"
+        step = trajectory["step"] if trajectory is not None else global_steps
 
-        field: dict[str, Any] = {
-            "prompts": internal.prompt_ids.squeeze(0),
-            "responses": internal.response_diffusion_output.squeeze(0),
-            "__num_turns__": internal.num_turns,
-            "uid": uid,
-        }
-        if internal.response_logprobs is not None:
-            field["rollout_log_probs"] = internal.response_logprobs.squeeze(0)
-        if internal.reward_score is not None:
-            field["rm_scores"] = torch.tensor([internal.reward_score], dtype=torch.float32)
-
-        extra = internal.extra_fields
-        for tensor_key in extra.keys():
-            value = extra.get(tensor_key)
-            if isinstance(value, torch.Tensor):
-                field[tensor_key] = value.squeeze(0) if value.dim() >= 1 and value.shape[0] == 1 else value
-
-        # Non-tensor dataset fields forwarded as-is.
-        for non_tensor_key in ["reward_model", "data_source", "extra_info", "raw_prompt"]:
-            if non_tensor_key in kwargs:
-                field[non_tensor_key] = kwargs[non_tensor_key]
-
-        reward_extra_info = extra.get("reward_extra_info")
-        extra_fields_out: dict[str, Any] = {}
-        if reward_extra_info is not None:
-            extra_fields_out["reward_extra_info"] = reward_extra_info
-        # Track the rollout model version this trajectory was generated against.
-        step = trajectory["step"] if trajectory else global_steps
-        extra_fields_out["min_global_steps"] = step
-        extra_fields_out["max_global_steps"] = step
-        field["extra_fields"] = extra_fields_out
-
-        fields_td = list_of_dict_to_tensordict([field])
-
-        prompt_len = int(internal.prompt_ids.shape[-1])
-        tags = [
-            {
-                "status": "success",
-                "prompt_len": prompt_len,
-                "response_len": 1,
-                "seq_len": prompt_len + 1,
-                "global_steps": step,
-                "min_global_steps": step,
-                "max_global_steps": step,
+        fields_list: list[dict[str, Any]] = []
+        keys: list[str] = []
+        tags: list[dict] = []
+        for session_id, (internal, non_conflicting_kwargs) in enumerate(session_outputs):
+            key = f"{uid}_{session_id}_0"
+            field: dict[str, Any] = {
+                "prompts": internal.prompt_ids.squeeze(0),
+                "responses": internal.response_diffusion_output.squeeze(0),
+                "__num_turns__": internal.num_turns,
+                "uid": uid,
             }
-        ]
+            if internal.response_logprobs is not None:
+                field["rollout_log_probs"] = internal.response_logprobs.squeeze(0)
+            if internal.reward_score is not None:
+                field["rm_scores"] = torch.tensor([internal.reward_score], dtype=torch.float32)
+
+            extra = internal.extra_fields
+            for tensor_key in extra.keys():
+                value = extra.get(tensor_key)
+                if isinstance(value, torch.Tensor):
+                    field[tensor_key] = value.squeeze(0) if value.dim() >= 1 and value.shape[0] == 1 else value
+
+            for non_tensor_key in ["reward_model", "data_source", "extra_info", "raw_prompt"]:
+                if non_tensor_key in non_conflicting_kwargs:
+                    field[non_tensor_key] = non_conflicting_kwargs[non_tensor_key]
+
+            reward_extra_info = extra.get("reward_extra_info")
+            extra_fields_out: dict[str, Any] = {}
+            if reward_extra_info is not None:
+                extra_fields_out["reward_extra_info"] = reward_extra_info
+            extra_fields_out["min_global_steps"] = step
+            extra_fields_out["max_global_steps"] = step
+            field["extra_fields"] = extra_fields_out
+
+            prompt_len = int(internal.prompt_ids.shape[-1])
+            fields_list.append(field)
+            keys.append(key)
+            tags.append(
+                {
+                    "status": "success",
+                    "prompt_len": prompt_len,
+                    "response_len": 1,
+                    "seq_len": prompt_len + 1,
+                    "global_steps": step,
+                    "min_global_steps": step,
+                    "max_global_steps": step,
+                }
+            )
+
+        fields_td = list_of_dict_to_tensordict(fields_list)
         await tq.async_kv_batch_put(
-            keys=[key],
+            keys=keys,
             fields=fields_td,
             tags=tags,
             partition_id=partition_id,

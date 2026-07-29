@@ -66,6 +66,7 @@ from verl_omni.workers.config import (
     OmniModelConfig,
 )
 from verl_omni.workers.utils.losses import diffusion_loss
+from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -746,10 +747,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
 
+    @staticmethod
+    def _maybe_unpad_embeds(data: TensorDict) -> TensorDict:
+        """Convert dense prompt embeds to nested only when they are dense.
+
+        When data arrives via TransferQueue (``tqbridge`` materializes a
+        ``KVBatchMeta`` on the worker), embeds come back dense/padded. The legacy
+        driver path already ran ``embeds_padding_2_no_padding`` before dispatch, so
+        workers historically received nested embeds. To let workers fetch from TQ
+        directly we must perform that same conversion here. It is a no-op when the
+        embeds are already nested (legacy TensorDict path) or absent.
+        """
+        prompt_embeds = data.get("prompt_embeds", None)
+        if isinstance(prompt_embeds, torch.Tensor) and not prompt_embeds.is_nested:
+            return embeds_padding_2_no_padding(data)
+        return data
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="infer_ref_batch")
     @_with_routing_replay_flag(enabled=False)
     def infer_ref_batch(self, data: TensorDict) -> TensorDict:
+        data = self._maybe_unpad_embeds(data)
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -757,6 +775,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="infer_actor_batch")
     @_with_routing_replay_flag(enabled=True)
     def infer_actor_batch(self, data: TensorDict) -> TensorDict:
+        data = self._maybe_unpad_embeds(data)
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -765,6 +784,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        data = self._maybe_unpad_embeds(data)
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 

@@ -69,7 +69,9 @@ from verl_omni.trainer.diffusion.rollout_correction import (
 )
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
+    put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
+    upsample_diffusion_batch_to_divisible_size,
 )
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
@@ -253,7 +255,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
-        """Sample one mini-batch from the replay buffer and run the diffusion PG pipeline."""
+        """Sample one mini-batch and run the diffusion PG pipeline on KVBatchMeta.
+
+        The driver only ever holds the sampled ``KVBatchMeta`` (keys + tags). Heavy
+        tensors (latents, prompt embeds, images) are fetched on the workers via the
+        ``tqbridge`` wrapper when ``infer_actor_batch``/``infer_ref_batch``/
+        ``update_actor`` are called with the ``KVBatchMeta``. Driver-side stages
+        (reward, advantage) use targeted ``kv_batch_get(select_fields=[...])``.
+        """
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
             batch_meta, off_policy_metrics = self.replay_buffer.sample(
@@ -264,64 +273,41 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             metrics.update(off_policy_metrics)
             self.on_sample_end()
 
-        # Convert TQ rows to diffusion DataProto; from here on the driver owns the
-        # DataProto compute contract (no KVBatchMeta passed to diffusion workers).
-        data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
-
-        # [OPTIONAL] colocated reward model
+        # [OPTIONAL] colocated reward model (driver-side, targeted fetch + put)
         if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
             with marked_timer("reward", timing_raw, color="yellow"):
                 self.checkpoint_manager.sleep_replicas()
-                data = self._compute_reward_colocate(data)
+                batch_meta = self._compute_reward_colocate_tq(batch_meta)
                 self.checkpoint_manager.update_weights(self.global_steps)
 
-        data = self._balance_batch(data, metrics=metrics)
+        batch_meta = self._balance_batch_tq(batch_meta)
 
-        # Bypass mode: skip old_log_prob recompute (2 policies).
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
         if bypass_recomputing_logprobs:
-            apply_bypass_mode_to_diffusion_batch(data)
+            # 2-policy bypass: old_log_probs := rollout_log_probs (no recompute)
+            self._set_old_log_probs_from_rollout_tq(batch_meta)
         else:
             with marked_timer("old_log_prob", timing_raw, color="blue"):
-                old_log_prob = self._compute_old_log_prob(data)
-                data = data.union(old_log_prob)
-
-        assert "old_log_probs" in data.batch, f'"old_log_probs" not in {data.batch.keys()}'
+                batch_meta = self._compute_old_log_prob_tq(batch_meta)
 
         if not bypass_recomputing_logprobs and rollout_correction_enabled(rollout_corr_config):
+            # Rollout correction is driver-side and mutates the batch in complex
+            # ways; fall back to a localized materialize/apply/put round-trip so the
+            # existing logic is reused unchanged. This path is off by default.
             with marked_timer("rollout_corr", timing_raw, color="cyan"):
-                data, rollout_corr_metrics = apply_rollout_correction_to_diffusion_batch(data, rollout_corr_config)
-                metrics.update(rollout_corr_metrics)
+                batch_meta = self._apply_rollout_correction_tq(batch_meta, rollout_corr_config, metrics)
 
         if self.use_reference_policy:
             with marked_timer("ref", timing_raw, color="olive"):
-                ref_log_prob = self._compute_ref_log_prob(data)
-                data = data.union(ref_log_prob)
+                batch_meta = self._compute_ref_log_prob_tq(batch_meta)
 
         with marked_timer("adv", timing_raw, color="brown"):
-            data = self._compute_advantage(data)
+            batch_meta = self._compute_advantage_tq(batch_meta, metrics)
 
         with marked_timer("update_actor", timing_raw, color="red"):
-            actor_output = self._update_actor(data)
-            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-            metrics.update(actor_metrics)
+            batch_meta = self._update_actor_tq(batch_meta, metrics)
 
-        # Persist computed fields back to TransferQueue so the sampled keys carry
-        # the full trajectory for metrics/dumping (keys are cleared after step).
-        # Slice to the original key count in case ``_balance_batch`` appended pad rows.
-        from verl_omni.trainer.diffusion.v1.tq_utils import put_dataproto_fields_to_tq
-
-        n_keys = len(batch_meta.keys)
-        if len(data) > n_keys:
-            data_for_tq = data.select_idxs(list(range(n_keys)))
-        else:
-            data_for_tq = data
-        put_dataproto_fields_to_tq(
-            batch_meta,
-            data_for_tq,
-            fields=["old_log_probs", "advantages", "returns", "sample_level_scores", "sample_level_rewards"],
-        )
         return batch_meta
 
     def on_init_end(self):
@@ -702,6 +688,179 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             data, _ = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
         return data
 
+    def _balance_batch_tq(self, batch_meta: KVBatchMeta) -> KVBatchMeta:
+        """KVBatchMeta counterpart of ``_balance_batch`` for the TQ-direct path.
+
+        Computes the same ``batch_multiple = lcm(dp_size, ppo_mini_batch_size * n)``
+        and pads the batch to that divisor by duplicating real rows into TQ
+        (see ``upsample_diffusion_batch_to_divisible_size``), preserving the
+        legacy pad-row numerics. No reordering is applied, matching the legacy
+        diffusion ``_balance_batch`` which only pads (no seqlen balancing).
+        """
+        dp_size = 1
+        if hasattr(self.actor_rollout_wg, "_query_dispatch_info"):
+            info = self.actor_rollout_wg._query_dispatch_info("actor")
+            if isinstance(info, dict):
+                dp_size = max(info.values()) + 1 if info else 1
+            elif isinstance(info, list | tuple | set):
+                dp_size = max(info) + 1 if info else 1
+            else:
+                dp_size = int(info) + 1 if info is not None else 1
+        actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+        batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
+        return upsample_diffusion_batch_to_divisible_size(batch_meta, batch_multiple)
+
+    # ------------------------------------------------------------------
+    # KVBatchMeta compute stages (TQ-direct: workers fetch heavy tensors
+    # via tqbridge; driver only moves keys + targeted select_fields gets).
+    # ------------------------------------------------------------------
+
+    def _diffusion_model_meta(self) -> dict:
+        return {
+            "height": self.config.actor_rollout_ref.model.pipeline.height,
+            "width": self.config.actor_rollout_ref.model.pipeline.width,
+            "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+        }
+
+    def _compute_reward_colocate_tq(self, batch_meta: KVBatchMeta) -> KVBatchMeta:
+        """Colocated reward: materialize on driver, compute rm score, put rm_scores back."""
+        data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+        data = self._compute_reward_colocate(data)
+        put_dataproto_fields_to_tq(batch_meta, data, fields=["rm_scores"])
+        return batch_meta
+
+    def _set_old_log_probs_from_rollout_tq(self, batch_meta: KVBatchMeta) -> None:
+        """Bypass mode: old_log_probs := rollout_log_probs via TQ rename."""
+        data = tq.kv_batch_get(
+            keys=batch_meta.keys,
+            partition_id=batch_meta.partition_id,
+            select_fields=["rollout_log_probs"],
+        )
+        if "rollout_log_probs" in data:
+            tq.kv_batch_put(
+                keys=batch_meta.keys,
+                partition_id=batch_meta.partition_id,
+                fields=tu.get_tensordict({"old_log_probs": data["rollout_log_probs"].float()}),
+            )
+
+    def _compute_old_log_prob_tq(self, batch_meta: KVBatchMeta) -> KVBatchMeta:
+        """Old log-prob: workers fetch latents/embeds via tqbridge and write log_probs back;
+        driver renames log_probs -> old_log_probs and persists."""
+        batch_meta.extra_info.update({"compute_loss": False, **self._diffusion_model_meta()})
+        self.actor_rollout_wg.infer_actor_batch(batch_meta)
+        data = tq.kv_batch_get(
+            keys=batch_meta.keys,
+            partition_id=batch_meta.partition_id,
+            select_fields=["log_probs", "prev_sample_mean"],
+        )
+        out: dict[str, torch.Tensor] = {}
+        if "log_probs" in data:
+            out["old_log_probs"] = data["log_probs"].float()
+        if "prev_sample_mean" in data:
+            out["old_prev_sample_mean"] = data["prev_sample_mean"].float()
+        if out:
+            tq.kv_batch_put(
+                keys=batch_meta.keys,
+                partition_id=batch_meta.partition_id,
+                fields=tu.get_tensordict(out),
+            )
+        return batch_meta
+
+    def _compute_ref_log_prob_tq(self, batch_meta: KVBatchMeta) -> KVBatchMeta:
+        """Reference log-prob: workers fetch via tqbridge; driver renames to ref_log_prob."""
+        metadata = {"compute_loss": False, **self._diffusion_model_meta()}
+        if self.ref_in_actor:
+            metadata["no_lora_adapter"] = True
+        batch_meta.extra_info.update(metadata)
+        if self.ref_in_actor:
+            self.actor_rollout_wg.infer_actor_batch(batch_meta)
+        else:
+            self.ref_policy_wg.infer_ref_batch(batch_meta)
+        data = tq.kv_batch_get(
+            keys=batch_meta.keys,
+            partition_id=batch_meta.partition_id,
+            select_fields=["log_probs", "prev_sample_mean"],
+        )
+        out: dict[str, torch.Tensor] = {}
+        if "log_probs" in data:
+            out["ref_log_prob"] = data["log_probs"].float()
+        if "prev_sample_mean" in data:
+            out["ref_prev_sample_mean"] = data["prev_sample_mean"].float()
+        if out:
+            tq.kv_batch_put(
+                keys=batch_meta.keys,
+                partition_id=batch_meta.partition_id,
+                fields=tu.get_tensordict(out),
+            )
+        return batch_meta
+
+    def _apply_rollout_correction_tq(self, batch_meta, rollout_corr_config, metrics) -> KVBatchMeta:
+        """Rollout correction (experimental, driver-side): materialize, apply, put back."""
+        data = diffusion_tq_batch_to_dataproto(
+            batch_meta,
+            pad_token_id=self.tokenizer.pad_token_id or 0,
+            select_fields=["old_log_probs", "rollout_log_probs"],
+        )
+        data, rollout_corr_metrics = apply_rollout_correction_to_diffusion_batch(data, rollout_corr_config)
+        metrics.update(rollout_corr_metrics)
+        if "rollout_is_weights" in data.batch:
+            put_dataproto_fields_to_tq(batch_meta, data, fields=["rollout_is_weights"])
+        return batch_meta
+
+    def _compute_advantage_tq(self, batch_meta: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Flow-GRPO advantage on the driver: targeted fetch, compute, put back."""
+        data = diffusion_tq_batch_to_dataproto(
+            batch_meta,
+            pad_token_id=self.tokenizer.pad_token_id or 0,
+            select_fields=["old_log_probs", "rm_scores", "uid", "reward_model", "reward_baselines"],
+        )
+        reward_tensor, reward_extra_infos_dict = extract_reward(data)
+        data.batch["sample_level_scores"] = reward_tensor
+        if reward_extra_infos_dict:
+            data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+        num_timesteps = data.batch["old_log_probs"].shape[1]
+        data.batch["sample_level_rewards"] = data.batch["sample_level_scores"].expand(-1, num_timesteps)
+
+        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+        data = compute_advantage(
+            data,
+            adv_estimator=self.config.algorithm.adv_estimator,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            global_std=self.config.algorithm.global_std,
+            config=self.config.algorithm,
+        )
+        put_dataproto_fields_to_tq(
+            batch_meta,
+            data,
+            fields=["advantages", "returns", "sample_level_scores", "sample_level_rewards"],
+        )
+        return batch_meta
+
+    def _update_actor_tq(self, batch_meta: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Actor update: workers fetch the full batch via tqbridge and train; metrics return as-is."""
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        batch_meta.extra_info.update(
+            {
+                "global_batch_size": ppo_mini_batch_size,
+                "mini_batch_size": ppo_mini_batch_size,
+                "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
+                "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
+                "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
+                **self._diffusion_model_meta(),
+            }
+        )
+        output = self.actor_rollout_wg.update_actor(batch_meta)
+        actor_output = tu.get(output, "metrics")
+        actor_output = rename_dict(actor_output, "actor/")
+        if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
+            actor_output["perf/mfu/actor"] = actor_mfu
+        actor_metrics = reduce_metrics(actor_output)
+        metrics.update(actor_metrics)
+        return batch_meta
+
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
         """Recompute old log-probs over diffusion latents with the actor engine."""
         batch_td = data.to_tensordict()
@@ -958,10 +1117,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
         print(f"Dumped diffusion generations to {filename}")
 
-    def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
-        """Fetch rollout rows from TQ and dump sorted by uid."""
+    def _log_rollout_data(
+        self,
+        batch_meta: KVBatchMeta,
+        timing_raw: dict,
+        rollout_data_dir: str,
+    ):
+        """Dump rollout generations sorted by uid, fetched from TQ via select_fields."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+            data = diffusion_tq_batch_to_dataproto(
+                batch_meta,
+                pad_token_id=self.tokenizer.pad_token_id or 0,
+                select_fields=["prompts", "responses", "sample_level_scores", "rm_scores", "uid", "reward_model"],
+            )
             inputs = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
             outputs = data.batch["responses"]
             scores = (
@@ -1017,8 +1185,33 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
         return metric_dict
 
-    def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
-        data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+    def _compute_metrics(
+        self,
+        batch_meta: KVBatchMeta,
+        metrics,
+        timing_raw,
+        global_steps,
+        epoch,
+    ):
+        # Targeted fetch of only the fields metrics needs (driver no longer holds the batch).
+        data = diffusion_tq_batch_to_dataproto(
+            batch_meta,
+            pad_token_id=self.tokenizer.pad_token_id or 0,
+            select_fields=[
+                "prompts",
+                "responses",
+                "advantages",
+                "returns",
+                "sample_level_scores",
+                "sample_level_rewards",
+                "rm_scores",
+                "uid",
+                "reward_model",
+                "data_source",
+                "extra_fields",
+                "__num_turns__",
+            ],
+        )
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics_diffusion(batch=data))
         n_gpus = self.resource_pool_manager.get_n_gpus()
