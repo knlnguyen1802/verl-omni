@@ -575,7 +575,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             if final_res is not None and final_res.request_output is not None:
                 finish_reason = getattr(final_res.request_output, "finish_reason", None) or "abort"
             stop_reason = self._map_stop_reason(finish_reason)
-            logger.debug("diffusion rollout produced no image (finish_reason=%s); returning %s", finish_reason, stop_reason)
+            logger.debug(
+                "diffusion rollout produced no image (finish_reason=%s); returning %s", finish_reason, stop_reason
+            )
             return DiffusionOutput(
                 diffusion_output=torch.empty(0),
                 log_probs=None,
@@ -647,34 +649,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all in-flight requests on the AsyncOmni engine.
-
-        Mirrors the parent's vLLM<0.12 path (abort in-flight + optional cache
-        reset, with no pause/resume dependency) so this can never leave the
-        engine in a paused state that would block generation. ``AsyncOmni``
-        tracks in-flight state in ``request_states`` (keyed by internal IDs,
-        each carrying the user-facing ``external_request_id``) and exposes
-        ``abort(request_ids)`` instead of ``output_processor.abort_requests``.
-
-        Root cause of the ``[Orchestrator] Dropping output for unknown req``
-        warning: ``engine.abort()`` sends an ``AbortRequestMessage`` to the
-        Orchestrator, which synchronously clears ``Orchestrator.request_states``
-        in ``_cleanup_request_ids`` *before* forwarding the abort to the stage
-        pool. The diffusion engine only emits its real terminal abort outputs
-        *after* that, so they arrive at ``_handle_processed_outputs`` and find
-        ``request_states`` already empty -> dropped (``known reqs: []``).
-
-        Fix (verl-omni only): the abort exists solely to stop in-flight
-        generation before a weight sync swaps weights under it. Instead of
-        aborting immediately (which creates the race above and forces
-        ``DiffusionWholeSampleRetryLLMServerClient`` to retry the whole
-        sample), first **drain** in-flight requests by letting them complete
-        naturally. ``AsyncOmni.request_states`` is popped in
-        ``_log_summary_and_cleanup`` once ``generate()`` returns, so polling it
-        until empty means every in-flight request finished cleanly — the
-        Orchestrator routed each final output *with* its state present, so
-        nothing is dropped. Only if the drain timeout expires do we fall back
-        to the abort path (snapshot + ``engine.abort()`` + synthetic abort
-        ``OutputMessage`` per request) to unblock the remainder.
 
         During ``on_step_end`` no new prompts are fed (the feed happens in
         ``step``/``_add_batch_to_generate``), so the in-flight set monotonically
@@ -769,7 +743,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         and ``_process_output`` maps it to ``stop_reason="aborted"``.
         """
         from vllm.outputs import CompletionOutput, RequestOutput
-
         from vllm_omni.engine.messages import OutputMessage
         from vllm_omni.outputs import OmniRequestOutput
 

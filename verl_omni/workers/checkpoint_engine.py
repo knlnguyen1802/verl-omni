@@ -11,23 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""verl-omni extensions to verl's ``CheckpointEngineManager``.
-
-The standalone (non-naive) weight-sync path in verl goes through
-``CheckpointEngineWorker.update_weights`` -> ``ServerAdapter.update_weights``
--> ``update_weights_from_ipc``, and unlike the colocated path it does not
-forward ``peft_config``/``base_sync_done`` kwargs. When the actor trains a
-(non-merged) LoRA adapter it ships only the adapter deltas, so the rollout
-must apply them via ``add_lora``; without ``peft_config`` the rollout falls
-back to ``load_weights`` and raises ``KeyError`` on ``*.lora_A.weight``.
-
-``OmniCheckpointEngineManager`` closes that gap by delivering the actor's
-``peft_config`` out-of-band: it fetches it (collective-free) from the actor
-worker group and stashes it on each rollout worker extension via
-``collective_rpc("set_pending_lora_peft_config")`` before the NCCL broadcast.
-``update_weights_from_ipc`` consumes the stash when its ``peft_config`` kwarg
-is absent.
-"""
 import logging
 import os
 

@@ -107,10 +107,6 @@ def compute_advantage(
         "config": config,
     }
     if "uid" in data.non_tensor_batch:
-        # Normalize uid to plain Python strings. TransferQueue may return
-        # NonTensorData wrappers inside the object array; those are unhashable
-        # and would crash GRPO's ``id2score[index[i]]`` grouping. ``str()``
-        # also handles numpy.str_ scalars that some TQ backends produce.
         raw_uid = data.non_tensor_batch["uid"]
         adv_kwargs["index"] = np.array(
             [str(item.data) if hasattr(item, "data") and not isinstance(item, str) else str(item) for item in raw_uid],

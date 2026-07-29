@@ -842,7 +842,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             output_images = data.batch["responses"]
             # Distinguish real generations from aborted/empty ones so the
             # trainer logs clearly whether validation produced real images.
-            num_real = int((output_images.numel() > 0 and output_images.shape[-1] > 0)) if isinstance(output_images, torch.Tensor) else 0
+            num_real = (
+                int(output_images.numel() > 0 and output_images.shape[-1] > 0)
+                if isinstance(output_images, torch.Tensor)
+                else 0
+            )
             logger.info(
                 "Validation batch (step=%d): %d trajectories, responses shape=%s, real_images=%s",
                 self.global_steps,
@@ -1048,12 +1052,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if "advantages" in data.batch
             else data.batch["sample_level_scores"].shape[0]
         )
-        # Per-step visibility that real diffusion images were produced and trained
-        # on. The "[Orchestrator] Dropping output for unknown req" warnings emitted
-        # by vllm-omni during weight-sync aborts are a benign race (the orchestrator
-        # clears its request_states before the diffusion engine emits its terminal
-        # abort outputs); they do NOT mean generation failed. This log line, plus
-        # perf/total_num_images in the step metrics, confirms real generation.
         responses = data.batch.get("responses")
         real_images = 0
         if isinstance(responses, torch.Tensor) and responses.numel() > 0 and responses.dim() >= 4:

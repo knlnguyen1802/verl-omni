@@ -929,13 +929,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            # Detect LoRA without triggering the heavy param gather. The standalone
-            # rollout already holds the (frozen) base weights from load_format, so
-            # for LoRA training we only ship the adapter deltas. The matching
-            # ``peft_config`` is delivered to the rollout out-of-band by
-            # ``CheckpointEngineManager`` via the collective-free ``get_lora_peft_config``
-            # call, so the rollout applies them via ``add_lora`` instead of a full
-            # ``load_weights``.
             actor_module = getattr(self.actor.engine, "module", None)
             peft_module = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
             actor_has_lora = peft_module is not None and hasattr(peft_module, "peft_config")
@@ -954,13 +947,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 await self.checkpoint_engine.send_weights(per_tensor_param)
                 return
 
-            logger.warning(
-                "LORA_SYNC_PROOF actor send mode=full_weight backend=%s global_steps=%s actor_has_lora=%s peft_merge=%s",
-                effective_mode,
-                global_steps,
-                actor_has_lora,
-                self.peft_merge,
-            )
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
                 adapter_name=self.config.rollout.rollout_adapter
             )

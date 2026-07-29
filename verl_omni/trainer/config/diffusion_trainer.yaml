@@ -226,14 +226,6 @@ trainer:
       # Frequency of parameter synchronization between trainer and rollout.
       parameter_sync_step: 4
 
-      # When True, the standalone rollout stops generating during actor training
-      # (abort in-flight requests + remove from load balancer on ``on_sample_end``,
-      # resume after weight sync on ``on_step_end``). This makes separate_async
-      # behave synchronously: generate -> stop -> train -> update weights ->
-      # resume generate, exactly like sync mode but using the standalone rollout
-      # on dedicated GPUs instead of colocated replicas. No off-policy data is
-      # produced. Set to False for true async overlap (generation continues
-      # during training). Diffusion-only for now; optimize later.
       sync_compatible: false
 
     # Replay buffer sampling strategy.
