@@ -226,6 +226,7 @@ trainer:
       # Frequency of parameter synchronization between trainer and rollout.
       parameter_sync_step: 4
 
+      # Pause standalone rollout during actor update, resume after weight sync.
       sync_compatible: false
 
     # Replay buffer sampling strategy.
