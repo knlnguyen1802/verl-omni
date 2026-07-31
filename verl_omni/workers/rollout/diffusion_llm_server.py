@@ -11,18 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion-specific LLM server client with whole-sample retry on abort.
-
-Upstream ``FullyAsyncLLMServerClient`` resumes aborted rollouts by appending the
-already-generated ``token_ids`` and shrinking ``max_tokens``. That contract does
-not hold for diffusion: the rollout output is a full image/video tensor and a
-partial denoising state cannot be safely continued. Instead, when a diffusion
-request is aborted (e.g. by the separate-async trainer switching replicas to
-trainer mode), we retry the *whole* original prompt after a short wait, while
-preserving the earliest ``min_global_steps`` / latest ``max_global_steps`` across
-attempts so the replay buffer can still track trajectory staleness.
-"""
-
 import asyncio
 import logging
 import os
