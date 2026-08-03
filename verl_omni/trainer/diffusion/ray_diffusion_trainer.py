@@ -68,7 +68,7 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import NoOpCheckpointMa
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
     apply_rollout_correction_to_diffusion_batch,
-    compute_rollout_corr_metrics_from_logprobs,
+    compute_rollout_corr_metrics_from_batch,
     rollout_correction_enabled,
 )
 from verl_omni.utils.reward_score.reward_utils import video_tensor_to_pil_frames
@@ -629,6 +629,8 @@ class BaseRayDiffusionTrainer(ABC):
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.trainer, "ray_master_port_range") is not None:
+            wg_kwargs["master_port_range"] = OmegaConf.to_container(self.config.trainer.ray_master_port_range)
         # Forward profiling steps and (when nsys is selected) per-worker Nsight options to the
         # Ray worker group so that workers can be launched under nsys with the right capture range.
         if OmegaConf.select(self.config, "global_profiler.steps") is not None:
@@ -1071,18 +1073,14 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                                 metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
                             batch = batch.union(old_log_prob)
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
 
-                    # Consistency monitoring (needs calculate_log_probs=true); in bypass
-                    # mode old == rollout so there is nothing to compare.
-                    if not bypass_recomputing_logprobs and "rollout_log_probs" in batch.batch:
-                        metrics.update(
-                            compute_rollout_corr_metrics_from_logprobs(
-                                batch.batch["old_log_probs"],
-                                batch.batch["rollout_log_probs"],
-                                timesteps=batch.batch.get("all_timesteps", None),
-                            )
+                    metrics.update(
+                        compute_rollout_corr_metrics_from_batch(
+                            batch,
+                            bypass_mode=bool(bypass_recomputing_logprobs),
                         )
+                    )
 
                     # Decoupled-mode rollout correction (old vs rollout).
                     # In bypass mode old == rollout, so correction runs per-step in ``diffusion_loss``.
