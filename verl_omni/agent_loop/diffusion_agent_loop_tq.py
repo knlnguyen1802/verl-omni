@@ -35,6 +35,17 @@ from verl_omni.agent_loop.utils import _derive_rollout_seed
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+# Fields that are identical across the ``rollout.n`` sessions of a prompt (frozen
+# text-encoder embeddings/masks). They are stored once per uid in a dedicated
+# ``{partition_id}_prompt_shared`` partition instead of being duplicated in every
+# trajectory row, cutting TransferQueue traffic by n-fold for these tensors.
+_SHARED_PROMPT_FIELDS = (
+    "prompt_embeds",
+    "negative_prompt_embeds",
+    "prompt_embeds_mask",
+    "negative_prompt_embeds_mask",
+)
+
 
 @ray.remote
 class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
@@ -143,11 +154,55 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
+            # Write session-invariant fields (text-encoder embeds) once per prompt.
+            # Done before marking the prompt "finished" so the trainer can rely on
+            # them being present once it samples this GRPO group.
+            first_success = next((r for r in results if r is not None), None)
+            if first_success is not None:
+                await self._write_prompt_shared_to_tq(
+                    first_success,
+                    uid=uid,
+                    partition_id=partition_id,
+                )
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
         except Exception as e:
             logger.exception(f"Error in _run_prompt for uid={uid}: {e}")
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+
+    async def _write_prompt_shared_to_tq(
+        self,
+        internal: _InternalDiffusionAgentLoopOutput,
+        *,
+        uid: str,
+        partition_id: str,
+    ) -> None:
+        """Write session-invariant diffusion fields once per uid.
+
+        The text-encoder embeddings/masks are deterministic given the prompt and
+        identical across all ``rollout.n`` sessions, so they are stored once under
+        the uid key in a dedicated ``{partition_id}_prompt_shared`` partition and
+        expanded back onto every trajectory row at read time.
+        """
+        extra = internal.extra_fields
+        shared: dict[str, Any] = {}
+        for key in _SHARED_PROMPT_FIELDS:
+            value = extra.get(key)
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                shared[key] = value.squeeze(0) if value.dim() >= 1 and value.shape[0] == 1 else value
+            else:
+                shared[key] = value
+        if not shared:
+            return
+        fields_td = list_of_dict_to_tensordict([shared])
+        await tq.async_kv_batch_put(
+            keys=[uid],
+            fields=fields_td,
+            tags=[{"status": "success"}],
+            partition_id=f"{partition_id}_prompt_shared",
+        )
 
     async def _run_agent_loop(
         self,
@@ -157,7 +212,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         session_id: int = 0,
         trajectory: dict | None = None,
         **kwargs,
-    ) -> None:
+    ) -> _InternalDiffusionAgentLoopOutput:
         """Run one diffusion agent loop session and write its output to TransferQueue."""
         internal: _InternalDiffusionAgentLoopOutput = await super()._run_agent_loop(
             sampling_params, agent_name=agent_name, **kwargs
@@ -173,6 +228,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             global_steps=sampling_params.get("global_steps"),
             **non_conflicting_kwargs,
         )
+        return internal
 
     async def _write_trajectory_to_tq(
         self,
@@ -204,6 +260,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
 
         extra = internal.extra_fields
         for tensor_key in extra.keys():
+            # Text-encoder embeddings and masks are session-invariant (frozen text
+            # encoder), so they are written once per prompt by
+            # ``_write_prompt_shared_to_tq`` instead of being duplicated in every
+            # trajectory row.
+            if tensor_key in _SHARED_PROMPT_FIELDS:
+                continue
             value = extra.get(tensor_key)
             if isinstance(value, torch.Tensor):
                 field[tensor_key] = value.squeeze(0) if value.dim() >= 1 and value.shape[0] == 1 else value

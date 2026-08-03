@@ -248,6 +248,12 @@ trainer:
       # drop: drop the trajectory; wait: dropless, wait for trajectories that reach the threshold.
       max_off_policy_strategy: drop
 
+      # Poll interval (seconds) used by the ReplayBuffer to check whether a
+      # generated batch is ready in TransferQueue. Lower values remove the idle
+      # time after generation finishes (upstream default is 2.0s); 0.1s is a good
+      # balance between responsiveness and metadata-sync overhead.
+      poll_interval: 0.1
+
       # Custom sampler config.
       custom_sampler:
 

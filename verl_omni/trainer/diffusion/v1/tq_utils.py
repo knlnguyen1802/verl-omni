@@ -88,6 +88,57 @@ def _stack_field(value: Any, padding: float = 0.0) -> torch.Tensor | None:
     return torch.as_tensor(value)
 
 
+_SHARED_PROMPT_FIELDS = (
+    "prompt_embeds",
+    "negative_prompt_embeds",
+    "prompt_embeds_mask",
+    "negative_prompt_embeds_mask",
+)
+
+
+def _merge_prompt_shared_fields(
+    data: dict[str, Any],
+    keys: list[str],
+    partition_id: str,
+) -> dict[str, Any]:
+    """Expand per-uid shared fields stored in ``{partition_id}_prompt_shared`` onto every row.
+
+    The agent loop worker writes session-invariant tensors (frozen text-encoder
+    embeddings/masks) once per prompt uid in a dedicated partition. This merges
+    them back so each trajectory row carries the same embeds, without having
+    serialized ``rollout.n`` copies through TransferQueue.
+    """
+    uids = [key.rsplit("_", 2)[0] for key in keys]
+    unique_uids: list[str] = []
+    uid_to_row: dict[str, int] = {}
+    for uid in uids:
+        if uid not in uid_to_row:
+            uid_to_row[uid] = len(unique_uids)
+            unique_uids.append(uid)
+    if not unique_uids:
+        return data
+
+    shared_partition_id = f"{partition_id}_prompt_shared"
+    try:
+        shared = tq.kv_batch_get(keys=unique_uids, partition_id=shared_partition_id)
+    except Exception as e:
+        logger.warning(f"Failed to fetch shared prompt fields from {shared_partition_id}: {e}")
+        return data
+    if not shared:
+        return data
+
+    row_to_uid = [uid_to_row[uid] for uid in uids]
+    for field in _SHARED_PROMPT_FIELDS:
+        if field not in shared or shared[field] is None:
+            continue
+        value = shared[field]
+        if isinstance(value, torch.Tensor):
+            data[field] = value[row_to_uid]
+        else:
+            data[field] = [value[i] for i in row_to_uid]
+    return data
+
+
 def diffusion_tq_batch_to_dataproto(
     batch_meta: KVBatchMeta,
     pad_token_id: int = 0,
@@ -106,10 +157,14 @@ def diffusion_tq_batch_to_dataproto(
     keys = list(batch_meta.keys)
     partition_id = batch_meta.partition_id
 
-    data = tq.kv_batch_get(
-        keys=keys,
-        partition_id=partition_id,
+    data = dict(
+        tq.kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+        )
     )
+    # Expand per-prompt shared fields (text-encoder embeds) onto every row.
+    data = _merge_prompt_shared_fields(data, keys, partition_id)
 
     batch_dict: dict[str, torch.Tensor] = {}
     non_tensor_batch: dict[str, Any] = {}

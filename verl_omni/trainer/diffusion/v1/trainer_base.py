@@ -135,6 +135,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             max_off_policy_threshold=sampler_config.max_off_policy_threshold,
             max_off_policy_strategy=sampler_config.max_off_policy_strategy,
             sampler_kwargs=sampler_config.sampler_kwargs,
+            # Lower than the upstream 2.0s default so the trainer notices finished
+            # generation almost immediately instead of idling up to ~2s per step.
+            poll_interval=float(sampler_config.get("poll_interval", 0.1)),
         )
 
     def init(self):
@@ -185,7 +188,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self.timing_raw: dict = {}
             with marked_timer("step", self.timing_raw):
                 self.on_step_begin()
-                batch = self.step(metrics, self.timing_raw)
+                batch, data = self.step(metrics, self.timing_raw)
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
@@ -204,13 +207,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
 
-            self._compute_metrics(batch, metrics, self.timing_raw, self.global_steps, current_epoch)
+            self._compute_metrics(batch, data, metrics, self.timing_raw, self.global_steps, current_epoch)
 
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
                 self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
 
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+            # Clear the per-prompt shared (embed) rows stored once per uid.
+            shared_uids = list(dict.fromkeys(key.rsplit("_", 2)[0] for key in batch.keys))
+            tq.kv_clear(keys=shared_uids, partition_id=f"{batch.partition_id}_prompt_shared")
 
             self.logger.log(data=metrics, step=self.global_steps)
             progress_bar.update(1)
@@ -228,8 +234,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self._shutdown_dump_executor()
         self._shutdown_dataloaders()
 
-    def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
-        """Feed one train batch and run ``parameter_sync_step`` local updates."""
+    def step(self, metrics: dict, timing_raw: dict) -> tuple[KVBatchMeta, DataProto]:
+        """Feed one train batch and run ``parameter_sync_step`` local updates.
+
+        Returns:
+            Tuple of the sampled ``KVBatchMeta`` (keys/tags for cleanup and dump)
+            and the in-memory ``DataProto`` produced by ``_step_once`` so metrics
+            can be computed without re-reading the batch from TransferQueue.
+        """
         train_batch_size = self.config.data.train_batch_size
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
@@ -243,18 +255,30 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         combined_keys: list = []
         combined_tags: list = []
         combined_partition_id = "train"
+        combined_data: list[DataProto] = []
         for _ in range(self.parameter_sync_step):
             iter_metrics: dict = {}
-            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            batch, data = self._step_once(iter_metrics, timing_raw, sample_batch_size)
             metrics.update(iter_metrics)
             combined_keys.extend(batch.keys)
             combined_tags.extend(batch.tags)
             combined_partition_id = batch.partition_id
+            combined_data.append(data)
 
-        return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
+        combined_meta = KVBatchMeta(
+            partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags
+        )
+        if len(combined_data) == 1:
+            return combined_meta, combined_data[0]
+        return combined_meta, DataProto.concat(combined_data)
 
-    def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
-        """Sample one mini-batch from the replay buffer and run the diffusion PG pipeline."""
+    def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> tuple[KVBatchMeta, DataProto]:
+        """Sample one mini-batch from the replay buffer and run the diffusion PG pipeline.
+
+        Returns:
+            Tuple of the sampled ``KVBatchMeta`` and the in-memory ``DataProto``
+            (sliced back to the original key count, padding excluded).
+        """
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
             batch_meta, off_policy_metrics = self.replay_buffer.sample(
@@ -315,22 +339,27 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_metrics)
 
-        # Persist computed fields back to TransferQueue so the sampled keys carry
-        # the full trajectory for metrics/dumping (keys are cleared after step).
         # Slice to the original key count in case ``_balance_batch`` appended pad rows.
-        from verl_omni.trainer.diffusion.v1.tq_utils import put_dataproto_fields_to_tq
-
         n_keys = len(batch_meta.keys)
         if len(data) > n_keys:
             data_for_tq = data.select_idxs(list(range(n_keys)))
         else:
             data_for_tq = data
-        put_dataproto_fields_to_tq(
-            batch_meta,
-            data_for_tq,
-            fields=["old_log_probs", "advantages", "returns", "sample_level_scores", "sample_level_rewards"],
-        )
-        return batch_meta
+
+        # Persist computed fields back to TransferQueue only when rollout data
+        # dumping is enabled (``_log_rollout_data`` re-reads rows from TQ). The
+        # metrics path consumes the in-memory ``data_for_tq`` directly, so the
+        # write-back (and the later re-fetch in ``_compute_metrics``) is pure
+        # overhead otherwise.
+        if self.config.trainer.get("rollout_data_dir", None):
+            from verl_omni.trainer.diffusion.v1.tq_utils import put_dataproto_fields_to_tq
+
+            put_dataproto_fields_to_tq(
+                batch_meta,
+                data_for_tq,
+                fields=["old_log_probs", "advantages", "returns", "sample_level_scores", "sample_level_rewards"],
+            )
+        return batch_meta, data_for_tq
 
     def on_init_end(self):
         """Called after initialization ends."""
@@ -863,6 +892,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 sample_gts.extend([None] * len(data))
 
             tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+            # Clear the per-prompt shared (embed) rows stored once per uid.
+            val_shared_uids = list(dict.fromkeys(key.rsplit("_", 2)[0] for key in batch_meta.keys))
+            tq.kv_clear(keys=val_shared_uids, partition_id=f"{batch_meta.partition_id}_prompt_shared")
 
         sample_outputs = torch.cat(sample_outputs, dim=0) if sample_outputs else torch.empty(0)
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
@@ -1025,8 +1057,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
         return metric_dict
 
-    def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
-        data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+    def _compute_metrics(
+        self,
+        batch_meta: KVBatchMeta,
+        data: DataProto,
+        metrics,
+        timing_raw,
+        global_steps,
+        epoch,
+    ):
+        """Compute training metrics from the in-memory step output (no TQ re-fetch)."""
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics_diffusion(batch=data))
         n_gpus = self.resource_pool_manager.get_n_gpus()
