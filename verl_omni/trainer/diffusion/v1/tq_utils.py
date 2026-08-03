@@ -139,7 +139,7 @@ def _merge_prompt_shared_fields(
         # Nested tensors don't support advanced indexing; pad first (embeds are
         # fixed-shape so this is a no-op in practice, matching ``_stack_field``).
         if isinstance(value, torch.Tensor) and value.is_nested:
-            value = value.to_padded_tensor()
+            value = value.to_padded_tensor(padding=0.0)
         if isinstance(value, torch.Tensor):
             data[field] = value[row_to_uid]
         else:
