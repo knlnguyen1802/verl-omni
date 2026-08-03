@@ -68,6 +68,7 @@ from verl_omni.pipelines.utils import (
 )
 from verl_omni.utils.fsdp_utils import collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
+from verl_omni.workers.utils.padding import densify_nested_trajectory_tensors
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
 logger = logging.getLogger(__file__)
@@ -781,6 +782,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         *,
         timesteps_key: str,
     ) -> dict:
+        # TransferQueue may deliver jagged nested trajectories; densify before
+        # reading shape[1] / indexing [:, step] (NestedIntNode is not int()-able).
+        densify_nested_trajectory_tensors(data)
         num_timesteps = int(data[timesteps_key].shape[1])
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         tu.assign_non_tensor(data, use_dynamic_bsz=False)

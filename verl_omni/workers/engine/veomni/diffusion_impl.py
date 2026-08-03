@@ -46,6 +46,7 @@ from verl_omni.workers.config import (
     VeOmniDiffusionEngineConfig,
     VeOmniDiffusionOptimizerConfig,
 )
+from verl_omni.workers.utils.padding import densify_nested_trajectory_tensors
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -439,6 +440,9 @@ class VeOmniDiffusionEngine(BaseEngine):
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
+        # TransferQueue may deliver jagged nested trajectories; densify before
+        # reading shape[1] / indexing [:, step] (NestedIntNode is not int()-able).
+        densify_nested_trajectory_tensors(data)
         num_timesteps = int(data["all_timesteps"].shape[1])
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         tu.assign_non_tensor(data, use_dynamic_bsz=False)

@@ -66,7 +66,7 @@ from verl_omni.workers.config import (
     OmniModelConfig,
 )
 from verl_omni.workers.utils.losses import diffusion_loss
-from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
+from verl_omni.workers.utils.padding import densify_nested_trajectory_tensors, embeds_padding_2_no_padding
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -749,15 +749,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @staticmethod
     def _maybe_unpad_embeds(data: TensorDict) -> TensorDict:
-        """Convert dense prompt embeds to nested only when they are dense.
+        """Normalize TQ-fetched diffusion batches for the training engine.
 
         When data arrives via TransferQueue (``tqbridge`` materializes a
-        ``KVBatchMeta`` on the worker), embeds come back dense/padded. The legacy
-        driver path already ran ``embeds_padding_2_no_padding`` before dispatch, so
-        workers historically received nested embeds. To let workers fetch from TQ
-        directly we must perform that same conversion here. It is a no-op when the
-        embeds are already nested (legacy TensorDict path) or absent.
+        ``KVBatchMeta`` on the worker):
+
+        1. Trajectory fields such as ``all_timesteps`` / ``all_latents`` may be
+           jagged nested tensors. Densify them so the engine can index
+           ``[:, step]`` and read ``int(shape[1])``.
+        2. Prompt embeds come back dense/padded. Convert them to nested via
+           ``embeds_padding_2_no_padding`` to match the legacy driver path.
+           This is a no-op when embeds are already nested or absent.
         """
+        data = densify_nested_trajectory_tensors(data)
         prompt_embeds = data.get("prompt_embeds", None)
         if isinstance(prompt_embeds, torch.Tensor) and not prompt_embeds.is_nested:
             return embeds_padding_2_no_padding(data)

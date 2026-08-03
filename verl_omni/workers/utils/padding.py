@@ -16,6 +16,34 @@
 import torch
 from tensordict import TensorDict
 
+# Prompt embeds intentionally stay nested for the remove-padding training path.
+_NESTED_EMBED_KEYS = frozenset(
+    {
+        "prompt_embeds",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds",
+        "negative_prompt_embeds_mask",
+    }
+)
+
+
+def densify_nested_trajectory_tensors(data: TensorDict) -> TensorDict:
+    """Pad nested trajectory tensors from TransferQueue into dense batch tensors.
+
+    TransferQueue / ``list_of_dict_to_tensordict`` may resurface jagged nested
+    tensors for per-sample fields such as ``all_timesteps`` / ``all_latents``.
+    The diffusion engine indexes these as dense ``[:, step]``, and
+    ``int(tensor.shape[1])`` fails on nested ragged dims (``NestedIntNode``).
+    Prompt-embed fields are left nested for ``embeds_padding_2_no_padding``.
+    """
+    for key in list(data.keys()):
+        if key in _NESTED_EMBED_KEYS:
+            continue
+        value = data.get(key, None)
+        if isinstance(value, torch.Tensor) and value.is_nested:
+            data[key] = value.to_padded_tensor(padding=0.0)
+    return data
+
 
 def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
     """
