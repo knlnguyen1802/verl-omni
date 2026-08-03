@@ -120,7 +120,11 @@ def _merge_prompt_shared_fields(
 
     shared_partition_id = f"{partition_id}_prompt_shared"
     try:
-        shared = tq.kv_batch_get(keys=unique_uids, partition_id=shared_partition_id)
+        # kv_batch_get returns a TensorDict; normalize to a plain dict so the
+        # emptiness check and key/field access below are well-defined.
+        shared = dict(
+            tq.kv_batch_get(keys=unique_uids, partition_id=shared_partition_id)
+        )
     except Exception as e:
         logger.warning(f"Failed to fetch shared prompt fields from {shared_partition_id}: {e}")
         return data
@@ -132,6 +136,10 @@ def _merge_prompt_shared_fields(
         if field not in shared or shared[field] is None:
             continue
         value = shared[field]
+        # Nested tensors don't support advanced indexing; pad first (embeds are
+        # fixed-shape so this is a no-op in practice, matching ``_stack_field``).
+        if isinstance(value, torch.Tensor) and value.is_nested:
+            value = value.to_padded_tensor()
         if isinstance(value, torch.Tensor):
             data[field] = value[row_to_uid]
         else:
