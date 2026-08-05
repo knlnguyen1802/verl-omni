@@ -454,9 +454,16 @@ class VeOmniDiffusionEngine(BaseEngine):
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
 
+        # On-policy distillation: per-call CFG scale override (one scalar per batch; each
+        # MOPD teacher pass targets a single task). Re-assign onto every micro-batch so the
+        # pipeline adapter can read it from ``scheduler_inputs``.
+        guidance_scale = tu.get_non_tensor_data(data, "guidance_scale", default=None)
+
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             tu.assign_non_tensor(micro_batch, gradient_accumulation_steps=gradient_accumulation_steps)
+            if guidance_scale is not None:
+                tu.assign_non_tensor(micro_batch, guidance_scale=guidance_scale)
             meta_info_lst = {"model_output": [], "loss": [], "metrics": []}
             with ctx:
                 for step in range(num_timesteps):

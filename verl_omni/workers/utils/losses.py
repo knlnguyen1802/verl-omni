@@ -77,26 +77,32 @@ def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict,
     loss_mode = config.diffusion_loss.get("loss_mode", "flow_grpo")
     loss_func = get_diffusion_loss_fn(loss_mode)
 
-    # Rollout Correction bypass mode only applies to log-prob policy-gradient losses.
-    if "log_probs" in loss_func.required_model_output_keys:
-        log_prob = model_output["log_probs"]
-        old_log_prob = data["old_log_probs"]
-        rc_cfg = config.rollout_correction
-        # Rollout Correction bypass mode: compute IS/RS weights per-step and
-        # stash ``rollout_is_weights`` into ``data`` before loss dispatch.
-        if rc_cfg.bypass_mode:
-            _apply_bypass_rc(log_prob, old_log_prob, rc_cfg, data, metrics)
+    # On-policy distillation (OPD) only mode: the batch carries no reward / old-log-prob /
+    # advantage tensors, so the policy-gradient primary loss cannot be computed. Skip it and
+    # let the ``use_distill_loss`` term below be the sole training signal (paper Alg. 1).
+    if getattr(config, "opd_only", False):
+        loss_value = torch.zeros((), device=model_output["prev_sample_mean"].device)
+    else:
+        # Rollout Correction bypass mode only applies to log-prob policy-gradient losses.
+        if "log_probs" in loss_func.required_model_output_keys:
+            log_prob = model_output["log_probs"]
+            old_log_prob = data["old_log_probs"]
+            rc_cfg = config.rollout_correction
+            # Rollout Correction bypass mode: compute IS/RS weights per-step and
+            # stash ``rollout_is_weights`` into ``data`` before loss dispatch.
+            if rc_cfg.bypass_mode:
+                _apply_bypass_rc(log_prob, old_log_prob, rc_cfg, data, metrics)
 
-    loss_func.validate_inputs(loss_name=loss_mode, model_output=model_output, data=data)
-    loss_result = loss_func(config=config, model_output=model_output, data=data)
-    loss_value = loss_result.loss
-    metrics_values = loss_result.metrics
+        loss_func.validate_inputs(loss_name=loss_mode, model_output=model_output, data=data)
+        loss_result = loss_func(config=config, model_output=model_output, data=data)
+        loss_value = loss_result.loss
+        metrics_values = loss_result.metrics
 
-    metrics_values = Metric.from_dict(metrics_values, aggregation=AggregationType.MEAN)
+        metrics_values = Metric.from_dict(metrics_values, aggregation=AggregationType.MEAN)
 
-    metrics.update(metrics_values)
-    if loss_result.add_loss_metric:
-        metrics["actor/loss"] = Metric(value=loss_value, aggregation=AggregationType.MEAN)
+        metrics.update(metrics_values)
+        if loss_result.add_loss_metric:
+            metrics["actor/loss"] = Metric(value=loss_value, aggregation=AggregationType.MEAN)
 
     if config.use_kl_loss:
         loss_func = get_diffusion_loss_fn("kl")

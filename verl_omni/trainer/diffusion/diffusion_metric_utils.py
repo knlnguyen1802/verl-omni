@@ -43,7 +43,11 @@ def compute_data_metrics_diffusion(batch: DataProto) -> dict[str, Any]:
             - critic/advantages/mean, max, min: Element-wise advantage statistics over B*T, when available
             - critic/returns/mean, max, min: Element-wise return statistics over B*T, when available
     """
-    sample_level_rewards = batch.batch["sample_level_rewards"]
+    sample_level_rewards = batch.batch.get("sample_level_rewards", None)
+    if sample_level_rewards is None:
+        # OPD-only batches carry no rewards; report only the reward-free statistics below.
+        return {}
+
     if sample_level_rewards.ndim > 1:
         sequence_reward = sample_level_rewards.mean(dim=1)  # [B]
     else:
@@ -156,8 +160,11 @@ def compute_throughput_metrics_diffusion(batch: DataProto, timing_raw: dict[str,
     """
     if "advantages" in batch.batch:
         batch_size = batch.batch["advantages"].shape[0]
-    else:
+    elif "sample_level_rewards" in batch.batch:
         batch_size = batch.batch["sample_level_rewards"].shape[0]
+    else:
+        # OPD-only batches carry neither advantages nor rewards; use the row count.
+        batch_size = len(batch)
     time = timing_raw["step"]
     return {
         "perf/total_num_images": batch_size,

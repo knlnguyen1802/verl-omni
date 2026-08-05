@@ -102,6 +102,23 @@ class DiffusionModelConfig(BaseConfig):
     # Named LoRA policy states required by the algorithm. "reference" uses disabled adapters.
     policy_state_adapters: tuple[str, ...] = ("default",)
 
+    # On-policy distillation (OPD): path to a frozen teacher LoRA adapter that is loaded
+    # onto the actor's own backbone (single-backbone multi-LoRA). During teacher inference
+    # the adapter is temporarily activated via ``use_adapter``; it is never trained.
+    teacher_adapter_path: Optional[str] = None
+
+    # Name of the teacher PEFT adapter used by OPD teacher inference. Must differ from
+    # ``"default"`` and ``"reference"``.
+    teacher_adapter_name: str = "teacher"
+
+    # Multi-task on-policy distillation (DiffusionOPD, arXiv:2605.15055): a list of frozen
+    # teacher LoRA adapters, one per task. Each entry is a dict with keys
+    # ``{"name": str, "path": str, "guidance_scale": float}``. Every teacher is loaded as a
+    # frozen ``teacher_<name>`` PEFT adapter on the shared backbone, and teacher inference
+    # selects the adapter (and guidance scale) matching the batch's ``task_id``. When set,
+    # ``teacher_adapter_path`` / ``teacher_adapter_name`` are ignored (MOPD path).
+    teacher_adapters: list[dict[str, Any]] = field(default_factory=list)
+
     # dtype to convert LoRA parameters to (e.g., "fp32", "bf16"). Default None means no conversion.
     lora_dtype: Optional[str] = None
 

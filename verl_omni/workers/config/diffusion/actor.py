@@ -149,6 +149,18 @@ class DiffusionActorConfig(BaseConfig):
     use_distill_loss: bool = False
     distill_loss_mode: str = "distill_kl"
     distill_loss_coef: float = 1.0
+
+    # On-policy distillation (OPD) only mode: skip the policy-gradient primary loss and the
+    # reward / old-log-prob / advantage phases, training the student purely against the frozen
+    # teacher's per-step transition mean via the distillation term. Requires use_distill_loss=True.
+    opd_only: bool = False
+
+    # Multi-task OPD (DiffusionOPD) mode: round-robin over task-specific datasets (one batch
+    # per task per round) with per-task teacher distillation, accumulating gradients over a
+    # full task cycle before a single optimizer step. Requires opd_only=True and at least two
+    # ``model.teacher_adapters``.
+    mopd: bool = False
+
     ppo_epochs: int = 1
     shuffle: bool = False
     data_loader_seed: int = 42
@@ -178,6 +190,10 @@ class DiffusionActorConfig(BaseConfig):
             raise ValueError(
                 f"Invalid distill_loss_mode: {self.distill_loss_mode}. Must be one of {valid_distill_modes}"
             )
+        if self.opd_only and not self.use_distill_loss:
+            raise ValueError("opd_only=True requires use_distill_loss=True (OPD trains via the distillation term).")
+        if self.mopd and not self.opd_only:
+            raise ValueError("mopd=True requires opd_only=True (DiffusionOPD distills via the distillation term).")
 
 
 @dataclass

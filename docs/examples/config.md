@@ -95,6 +95,8 @@ actor_rollout_ref:
     exclude_modules: null
     lora_adapter_path: null
     policy_state_adapters: ["default"]
+    teacher_adapter_path: null
+    teacher_adapter_name: teacher
     lora_dtype: null
     fsdp_layer_prefixes: ["transformer_blocks."]
     # pipeline / algo mirror rollout (see below)
@@ -115,6 +117,9 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.exclude_modules`: Modules excluded from LoRA.
 - `actor_rollout_ref.model.lora_adapter_path`: Pre-trained LoRA adapter for continued training.
 - `actor_rollout_ref.model.policy_state_adapters`: Named LoRA policy states required by the algorithm. `"reference"` disables adapters.
+- `actor_rollout_ref.model.teacher_adapter_path`: Path to a frozen teacher LoRA adapter for on-policy distillation (OPD). When set, the adapter is loaded onto the actor's own backbone (single-backbone multi-LoRA) and queried at the student's rollout states; it never receives gradients.
+- `actor_rollout_ref.model.teacher_adapter_name`: Name of the teacher PEFT adapter (default `teacher`); must differ from `default` / `reference`.
+- `actor_rollout_ref.model.teacher_adapters`: Multi-task OPD (DiffusionOPD) teacher list — one frozen teacher LoRA per task, e.g. `[{name: aes, path: ..., guidance_scale: 4.5}, {name: ocr, path: ..., guidance_scale: 4.5}, {name: geneval, path: ..., guidance_scale: 1.0}]`. Each teacher is loaded as a frozen `teacher_<name>` PEFT adapter; teacher inference selects the adapter (and CFG `guidance_scale`) matching the batch's `task_id`. Overrides `teacher_adapter_path` when set.
 - `actor_rollout_ref.model.lora_dtype`: Convert LoRA params to a dtype (e.g. `fp32`, `bf16`); `null` = no conversion.
 - `actor_rollout_ref.model.fsdp_layer_prefixes`: FSDP layer name prefixes for LoRA layered summon (default `["transformer_blocks."]`).
 - `actor_rollout_ref.model.pipeline` / `algo`: Mirrored from `actor_rollout_ref.rollout.pipeline` / `algo` via `oc.select`; prefer overriding the rollout copies.
@@ -143,6 +148,8 @@ actor_rollout_ref:
     use_distill_loss: false
     distill_loss_mode: distill_kl
     distill_loss_coef: 1.0
+    opd_only: false
+    mopd: false
 ```
 
 #### `diffusion_loss` — `DiffusionLossConfig`
@@ -164,6 +171,8 @@ actor_rollout_ref:
 - `actor_rollout_ref.actor.use_distill_loss`: Enable teacher-anchored online policy distillation.
 - `actor_rollout_ref.actor.distill_loss_mode`: `distill_kl` or `distill_fm_mse`.
 - `actor_rollout_ref.actor.distill_loss_coef`: Distillation loss coefficient.
+- `actor_rollout_ref.actor.opd_only`: On-policy distillation only mode (DiffusionOPD). When `true`, the trainer skips the reward / old-log-prob / reference / advantage phases and trains the student purely against the frozen teacher's per-step transition mean via `distill_kl` (paper Alg. 1). Requires `use_distill_loss=true` and `actor_rollout_ref.model.teacher_adapter_path` (or `teacher_adapters`) set. Under the default ODE sampler (`noise_level=0`) the closed-form KL specializes to the squared-L2 surrogate `0.5*||mu_student - mu_teacher||^2` (paper Eq. 12).
+- `actor_rollout_ref.actor.mopd`: Multi-task OPD (DiffusionOPD) mode. Requires `opd_only=true` and at least two `model.teacher_adapters`. Combined with `data.task_train_files` (one list of files per task), the trainer builds a multi-task round-robin dataset: each dataloader batch is one full task cycle (`batch_size_per_task` samples per task), and each task's rows are distilled against that task's teacher (with its own CFG `guidance_scale`). Set `data.mopd_batch_size_per_task` (default `gen_batch_size // num_tasks`) and keep `ppo_mini_batch_size = data.gen_batch_size` with `ppo_epochs=1` so one optimizer step covers the whole round-robin cycle (gradient accumulation G = M).
 - `actor_rollout_ref.actor.rollout_correction.*`: Per-actor mirror of `algorithm.rollout_correction` (used when `bypass_mode=True` for per-step RS inside `diffusion_loss`).
 
 Shared PPO / FSDP / optim fields (`ppo_mini_batch_size`, `ppo_epochs`, `optim.lr`, `fsdp_config`, …) follow upstream verl — see the [verl Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html).

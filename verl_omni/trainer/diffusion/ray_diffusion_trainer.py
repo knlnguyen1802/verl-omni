@@ -199,6 +199,69 @@ class BaseRayDiffusionTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
+        # On-policy distillation (OPD) flags.
+        self.opd_only = bool(config.actor_rollout_ref.actor.get("opd_only", False))
+        self.mopd = bool(config.actor_rollout_ref.actor.get("mopd", False))
+
+        # Teacher adapter configs. Multi-task OPD (DiffusionOPD) uses a list of
+        # ``{name, path, guidance_scale}`` dicts (``model.teacher_adapters``); single-teacher
+        # OPD keeps the ``teacher_adapter_path`` / ``teacher_adapter_name`` pair.
+        teacher_adapters = config.actor_rollout_ref.model.get("teacher_adapters", None) or []
+        if teacher_adapters:
+            self._teacher_configs = [
+                {
+                    "name": str(t.get("name", f"teacher_{i}")),
+                    "path": t.get("path"),
+                    "guidance_scale": float(t["guidance_scale"]) if t.get("guidance_scale") is not None else None,
+                }
+                for i, t in enumerate(teacher_adapters)
+            ]
+        else:
+            teacher_path = config.actor_rollout_ref.model.get("teacher_adapter_path", None)
+            self._teacher_configs = (
+                [
+                    {
+                        "name": config.actor_rollout_ref.model.get("teacher_adapter_name", "teacher"),
+                        "path": teacher_path,
+                        "guidance_scale": None,
+                    }
+                ]
+                if teacher_path is not None
+                else []
+            )
+        self.use_teacher = len(self._teacher_configs) > 0
+        self._teacher_name_to_guidance = {t["name"]: t["guidance_scale"] for t in self._teacher_configs}
+        if self.opd_only:
+            if not self.use_teacher:
+                raise ValueError(
+                    "opd_only=True requires at least one frozen teacher: set "
+                    "actor_rollout_ref.model.teacher_adapters (MOPD) or "
+                    "actor_rollout_ref.model.teacher_adapter_path (SOPD)."
+                )
+            if not bool(config.actor_rollout_ref.actor.get("use_distill_loss", False)):
+                raise ValueError("opd_only=True requires actor_rollout_ref.actor.use_distill_loss=true.")
+            if lora_rank <= 0:
+                raise ValueError(
+                    "opd_only=True currently requires LoRA training (actor_rollout_ref.model.lora_rank>0) "
+                    "so the teacher can be loaded as a frozen PEFT adapter on the actor's backbone."
+                )
+            if self.mopd:
+                if len(self._teacher_configs) < 2:
+                    raise ValueError(
+                        "mopd=True requires at least two model.teacher_adapters (one per task)."
+                    )
+                task_train_files = config.data.get("task_train_files", None)
+                if not task_train_files:
+                    raise ValueError(
+                        "mopd=True requires data.task_train_files "
+                        "(one list of data files per task, aligned with model.teacher_adapters)."
+                    )
+                if len(task_train_files) != len(self._teacher_configs):
+                    raise ValueError(
+                        f"mopd=True requires len(data.task_train_files) == len(model.teacher_adapters), "
+                        f"got {len(task_train_files)} task datasets and {len(self._teacher_configs)} teachers."
+                    )
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
@@ -209,6 +272,46 @@ class BaseRayDiffusionTrainer(ABC):
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl_omni.utils.dataset.rl_dataset import create_rl_dataset, create_rl_sampler, get_collate_fn
+
+        # Multi-task OPD (DiffusionOPD): build one RL dataset per task plus a round-robin
+        # sampler so each dataloader batch (one MOPD round) contains ``batch_size_per_task``
+        # samples from every task, tagged with ``task_id`` / ``teacher_name``.
+        if train_dataset is None and self.config.data.get("task_train_files", None):
+            from verl_omni.utils.dataset.multi_task_dataset import (
+                RoundRobinBatchSampler,
+                create_multi_task_rl_datasets,
+            )
+
+            teacher_names = [t["name"] for t in self._teacher_configs]
+            train_dataset = create_multi_task_rl_datasets(
+                task_files=self.config.data.get("task_train_files"),
+                data_config=self.config.data,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                task_names=teacher_names,
+                max_samples=self.config.data.get("train_max_samples", -1),
+            )
+            if self.config.data.get("task_val_files", None):
+                val_dataset = create_multi_task_rl_datasets(
+                    task_files=self.config.data.get("task_val_files"),
+                    data_config=self.config.data,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    task_names=teacher_names,
+                    max_samples=self.config.data.get("val_max_samples", -1),
+                    is_train=False,
+                )
+            gen_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+            batch_size_per_task = self.config.data.get("mopd_batch_size_per_task", None)
+            if batch_size_per_task is None:
+                batch_size_per_task = max(1, int(gen_batch_size) // len(teacher_names))
+            self._mopd_batch_size = int(batch_size_per_task) * len(teacher_names)
+            if train_sampler is None:
+                train_sampler = RoundRobinBatchSampler(
+                    train_dataset,
+                    batch_size_per_task=batch_size_per_task,
+                    seed=self.config.data.get("seed", 42),
+                )
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
@@ -235,9 +338,15 @@ class BaseRayDiffusionTrainer(ABC):
 
         num_workers = self.config.data["dataloader_num_workers"]
 
+        # Multi-task OPD: the dataloader batch size is exactly one MOPD round
+        # (M tasks x batch_size_per_task), matching the round-robin sampler.
+        dataloader_batch_size = getattr(self, "_mopd_batch_size", None)
+        if dataloader_batch_size is None:
+            dataloader_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=dataloader_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
@@ -934,6 +1043,112 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
         old_log_prob_mfu = tu.get(output, "metrics").get("mfu")
         return DataProto.from_tensordict(old_log_prob), old_log_prob_mfu
 
+    def _compute_teacher_log_prob(self, batch: DataProto) -> DataProto:
+        """Run the frozen OPD teacher(s) at the student's visited rollout states.
+
+        SOPD (single teacher): activates the teacher PEFT adapter
+        (``actor_rollout_ref.model.teacher_adapter_name``) on the actor's own backbone over
+        the whole batch, mirroring ``_compute_ref_log_prob``.
+
+        MOPD (DiffusionOPD): every row carries a ``task_id`` / ``teacher_name`` tag (set by
+        the multi-task round-robin dataset). Rows are grouped per task and each task's
+        teacher adapter (with its own CFG ``guidance_scale``) is evaluated at those rows;
+        the per-task ``prev_sample_mean`` are reassembled into a full
+        ``teacher_prev_sample_mean`` consumed by the ``distill_kl`` loss.
+        """
+        if self.mopd:
+            return self._compute_mopd_teacher_log_prob(batch)
+
+        batch_td = batch.to_tensordict()
+        batch_td = embeds_padding_2_no_padding(batch_td)
+        teacher_adapter_name = self.config.actor_rollout_ref.model.get("teacher_adapter_name", "teacher")
+        metadata = {
+            "compute_loss": False,
+            "height": self.config.actor_rollout_ref.model.pipeline.height,
+            "width": self.config.actor_rollout_ref.model.pipeline.width,
+            "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+            "use_lora_adapter": teacher_adapter_name,
+        }
+        # Optional single-teacher CFG scale override (falls back to pipeline.guidance_scale).
+        teacher_gs = self._teacher_name_to_guidance.get(teacher_adapter_name)
+        if teacher_gs is not None:
+            metadata["guidance_scale"] = teacher_gs
+        tu.assign_non_tensor(batch_td, **metadata)
+        output = self.actor_rollout_wg.infer_actor_batch(batch_td)
+        prev_sample_mean = tu.get(output, "prev_sample_mean")
+        if prev_sample_mean is None:
+            raise RuntimeError(
+                "OPD teacher inference did not return `prev_sample_mean`. Ensure the rollout batch "
+                "carries `all_latents`/`all_timesteps` and the SD3 training adapter is registered."
+            )
+        teacher_td = tu.get_tensordict({"teacher_prev_sample_mean": prev_sample_mean.float()})
+        return DataProto.from_tensordict(teacher_td)
+
+    def _compute_mopd_teacher_log_prob(self, batch: DataProto) -> DataProto:
+        """Multi-task OPD teacher inference: one forward pass per task over its own rows.
+
+        Each row of ``batch`` is tagged with ``task_id`` (aligned with
+        ``model.teacher_adapters``); rows are grouped per task and evaluated with that
+        task's frozen teacher adapter and CFG ``guidance_scale``. The per-task
+        ``prev_sample_mean`` are scattered back into the original row order so the rest of
+        the OPD pipeline (``distill_kl``) sees a single ``(B, T, ...)`` tensor.
+        """
+        if "task_id" not in batch.non_tensor_batch:
+            raise RuntimeError(
+                "MOPD teacher inference requires `task_id` per sample. Use the multi-task "
+                "round-robin dataset (data.task_train_files) with mopd=True."
+            )
+        task_ids = np.asarray(batch.non_tensor_batch["task_id"], dtype=np.int64)
+        if task_ids.ndim != 1 or task_ids.shape[0] != len(batch):
+            raise RuntimeError(
+                f"MOPD `task_id` must be 1-D of length {len(batch)}, got shape {task_ids.shape}."
+            )
+        task_ids = task_ids.flatten()
+
+        height = self.config.actor_rollout_ref.model.pipeline.height
+        width = self.config.actor_rollout_ref.model.pipeline.width
+        vae_scale_factor = self.config.actor_rollout_ref.model.get("vae_scale_factor", 8)
+
+        per_task = {}
+        for task_id in np.unique(task_ids):
+            teacher_cfg = self._teacher_configs[int(task_id)]
+            teacher_adapter_name = f"teacher_{teacher_cfg['name']}"
+            mask = task_ids == task_id
+            sub_batch = batch[mask]
+            sub_td = sub_batch.to_tensordict()
+            sub_td = embeds_padding_2_no_padding(sub_td)
+            metadata = {
+                "compute_loss": False,
+                "height": height,
+                "width": width,
+                "vae_scale_factor": vae_scale_factor,
+                "use_lora_adapter": teacher_adapter_name,
+            }
+            if teacher_cfg["guidance_scale"] is not None:
+                metadata["guidance_scale"] = teacher_cfg["guidance_scale"]
+            tu.assign_non_tensor(sub_td, **metadata)
+            output = self.actor_rollout_wg.infer_actor_batch(sub_td)
+            prev_sample_mean = tu.get(output, "prev_sample_mean")
+            if prev_sample_mean is None:
+                raise RuntimeError(
+                    f"MOPD teacher inference (task {teacher_cfg['name']!r}, adapter "
+                    f"{teacher_adapter_name!r}) did not return `prev_sample_mean`."
+                )
+            per_task[int(task_id)] = (mask, prev_sample_mean.float())
+
+        # Reassemble the full tensor in original row order.
+        _, first_mean = next(iter(per_task.values()))
+        full_mean = torch.zeros(
+            (len(batch),) + tuple(first_mean.shape[1:]),
+            dtype=first_mean.dtype,
+            device=first_mean.device,
+        )
+        for task_id, (mask, prev_sample_mean) in per_task.items():
+            full_mean[torch.from_numpy(mask)] = prev_sample_mean
+
+        teacher_td = tu.get_tensordict({"teacher_prev_sample_mean": full_mean})
+        return DataProto.from_tensordict(teacher_td)
+
     def fit(self):
         """
         The training loop of FlowGRPO.
@@ -1047,81 +1262,95 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if curr_step_profile:
-                                self.reward_loop_manager.start_profile()
-                            batch_reward = self._compute_reward_colocate(batch)
-                            if curr_step_profile:
-                                self.reward_loop_manager.stop_profile()
-                            batch = batch.union(batch_reward)
+                    if self.opd_only:
+                        # On-policy distillation (OPD) only: skip the reward / old-log-prob /
+                        # reference / advantage phases and train the student purely against the
+                        # frozen teacher's per-step transition mean. ``diffusion_loss`` will
+                        # short-circuit the primary loss when ``opd_only`` is set, so only the
+                        # ``distill_kl`` term contributes.
+                        with marked_timer("teacher_log_prob", timing_raw, color="olive"):
+                            teacher_log_prob = self._compute_teacher_log_prob(batch)
+                            batch = batch.union(teacher_log_prob)
+                    else:
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if curr_step_profile:
+                                    self.reward_loop_manager.start_profile()
+                                batch_reward = self._compute_reward_colocate(batch)
+                                if curr_step_profile:
+                                    self.reward_loop_manager.stop_profile()
+                                batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                            # extract reward_tensor and reward_extra_infos_dict for training
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
-                    # Bypass mode: skip old_log_prob recompute (2 policies).
-                    # Decoupled mode: recompute old_log_probs as proximal anchor (3 policies).
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        apply_bypass_mode_to_diffusion_batch(batch)
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            if old_log_prob_mfu is not None:
-                                metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
-                            batch = batch.union(old_log_prob)
-
-                    assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
-
-                    metrics.update(
-                        compute_rollout_corr_metrics_from_batch(
-                            batch,
-                            bypass_mode=bool(bypass_recomputing_logprobs),
+                        # Bypass mode: skip old_log_prob recompute (2 policies).
+                        # Decoupled mode: recompute old_log_probs as proximal anchor (3 policies).
+                        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                        bypass_recomputing_logprobs = (
+                            rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                         )
-                    )
+                        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                            apply_bypass_mode_to_diffusion_batch(batch)
+                        else:  # Recompute old_log_probs
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                if old_log_prob_mfu is not None:
+                                    metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
+                                batch = batch.union(old_log_prob)
 
-                    # Decoupled-mode rollout correction (old vs rollout).
-                    # In bypass mode old == rollout, so correction runs per-step in ``diffusion_loss``.
-                    if not bypass_recomputing_logprobs and rollout_correction_enabled(rollout_corr_config):
-                        with marked_timer("rollout_corr", timing_raw, color="cyan"):
-                            batch, rollout_corr_metrics = apply_rollout_correction_to_diffusion_batch(
-                                batch, rollout_corr_config
+                        assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
+
+                        metrics.update(
+                            compute_rollout_corr_metrics_from_batch(
+                                batch,
+                                bypass_mode=bool(bypass_recomputing_logprobs),
                             )
-                            metrics.update(rollout_corr_metrics)
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            ref_log_prob = self._compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        batch.batch["sample_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        num_timesteps = batch.batch["old_log_probs"].shape[1]
-                        batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"].expand(
-                            -1, num_timesteps
                         )
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        # Decoupled-mode rollout correction (old vs rollout).
+                        # In bypass mode old == rollout, so correction runs per-step in ``diffusion_loss``.
+                        if not bypass_recomputing_logprobs and rollout_correction_enabled(rollout_corr_config):
+                            with marked_timer("rollout_corr", timing_raw, color="cyan"):
+                                batch, rollout_corr_metrics = apply_rollout_correction_to_diffusion_batch(
+                                    batch, rollout_corr_config
+                                )
+                                metrics.update(rollout_corr_metrics)
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            global_std=self.config.algorithm.global_std,
-                            config=self.config.algorithm,
-                        )
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                ref_log_prob = self._compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+
+                        with marked_timer("adv", timing_raw, color="brown"):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            batch.batch["sample_level_scores"] = reward_tensor
+
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update(
+                                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                                )
+
+                            num_timesteps = batch.batch["old_log_probs"].shape[1]
+                            batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"].expand(
+                                -1, num_timesteps
+                            )
+
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                global_std=self.config.algorithm.global_std,
+                                config=self.config.algorithm,
+                            )
 
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
@@ -1199,7 +1428,9 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                 # collect metrics
                 metrics.update(compute_data_metrics_diffusion(batch=batch))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
-                num_images = batch.batch["advantages"].shape[0]
+                # OPD-only batches carry no ``advantages`` / ``sample_level_rewards``; fall back
+                # to the number of rows (prompts x rollout.n) for throughput accounting.
+                num_images = len(batch)
                 metrics.update(compute_timing_metrics_diffusion(timing_raw=timing_raw, num_images=num_images))
                 metrics.update(compute_throughput_metrics_diffusion(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos_dict))

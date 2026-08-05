@@ -1053,7 +1053,18 @@ class KLLoss(DiffusionLossFn):
 
 @register_diffusion_loss("distill_kl")
 class DistillKLLoss(DiffusionLossFn):
-    """KL divergence between student and teacher reverse-SDE means (online policy distillation)."""
+    """KL divergence between student and teacher reverse-SDE means (online policy distillation).
+
+    Stochastic (SDE) regime: the per-step transition variance ``std_dev_t`` is shared by the
+    student and teacher Gaussians, so the reverse KL has the closed form
+    ``||mu_student - mu_teacher||^2 / (2 * std_dev_t^2)`` (paper Eq. 11/14).
+
+    Deterministic (ODE) regime: when ``std_dev_t == 0`` the kernels degenerate to point masses,
+    distribution matching reduces to direct transition matching, and the objective becomes the
+    squared-L2 surrogate ``0.5 * ||mu_student - mu_teacher||^2`` (paper Eq. 12). Without this
+    branch the SDE formula would divide by zero whenever the rollout uses ``noise_level=0``
+    (the default SD3.5-M OPD config), producing NaNs.
+    """
 
     required_model_output_keys = ("prev_sample_mean", "std_dev_t")
     required_data_keys = ("teacher_prev_sample_mean",)
@@ -1069,13 +1080,24 @@ class DistillKLLoss(DiffusionLossFn):
         """Compute KL divergence given student and teacher previous sample means.
 
         Args:
-            prev_sample_mean: (torch.Tensor) shape is (bs, s, c)
-            teacher_prev_sample_mean: (torch.Tensor) shape is (bs, s, c)
+            prev_sample_mean: (torch.Tensor) shape is (bs, s, c) for images (or (bs, s, c, t) video)
+            teacher_prev_sample_mean: (torch.Tensor) shape is (bs, s, c) for images (or (bs, s, c, t) video)
             std_dev_t: (torch.Tensor) shape is (bs, 1, 1)
         """
-        kl_loss = ((prev_sample_mean - teacher_prev_sample_mean) ** 2).mean(dim=(1, 2), keepdim=True) / (
-            2 * std_dev_t**2
-        )
+        delta_sq = (prev_sample_mean - teacher_prev_sample_mean) ** 2
+        # Average over the non-batch leading dims (matches the convention used by ``KLLoss``).
+        delta_sq_mean = delta_sq.mean(dim=tuple(range(1, delta_sq.ndim)), keepdim=True)
+        sigma_sq = std_dev_t ** 2
+
+        # SDE closed-form: ||mu_s - mu_t||^2 / (2 sigma^2).
+        sde_kl = delta_sq_mean / (2 * sigma_sq.clamp(min=1e-12))
+        # ODE surrogate: 0.5 * ||mu_s - mu_t||^2.
+        ode_l2 = 0.5 * delta_sq_mean
+
+        # Use the squared-L2 surrogate wherever the transition variance is (effectively) zero.
+        ode_mask = sigma_sq <= 1e-12
+        kl_loss = torch.where(ode_mask, ode_l2, sde_kl)
+
         metrics = {"actor/distill_kl_loss": kl_loss.mean().detach().item()}
         return kl_loss.mean(), metrics
 

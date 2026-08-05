@@ -69,6 +69,20 @@ lora_adapter_path: null
 # Named LoRA policy states required by the algorithm. "reference" disables adapters.
 policy_state_adapters: ["default"]
 
+# Path to a frozen teacher LoRA adapter for on-policy distillation (OPD).
+# When set, the adapter is loaded onto the actor's own backbone and frozen; teacher
+# inference is triggered by the trainer via the ``use_lora_adapter`` metadata.
+teacher_adapter_path: null
+
+# Name of the teacher PEFT adapter used by OPD teacher inference.
+teacher_adapter_name: teacher
+
+# Multi-task OPD (DiffusionOPD): list of frozen teacher LoRA adapters, one per task.
+# Each entry: {name, path, guidance_scale}. When set, each teacher is loaded as a frozen
+# `teacher_<name>` PEFT adapter and teacher inference selects the adapter matching the
+# batch's task_id (overrides the single `teacher_adapter_path`).
+teacher_adapters: []
+
 # Convert LoRA parameters to a target dtype for numerical stability (e.g., "fp32", "bf16").
 # Default null means no conversion.
 lora_dtype: null

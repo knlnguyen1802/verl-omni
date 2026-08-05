@@ -58,6 +58,56 @@ class LoRAAdapterMixin:
         if "default" in policy_state_adapters and hasattr(module, "set_adapter"):
             module.set_adapter("default")
 
+        # On-policy distillation (OPD): load frozen teacher LoRA adapter(s) onto the same
+        # backbone. Teachers are activated only transiently during teacher inference
+        # (see ``use_adapter``); their parameters never receive gradients.
+        #
+        # Multi-task OPD (DiffusionOPD, arXiv:2605.15055): ``teacher_adapters`` is a list of
+        # ``{"name", "path", "guidance_scale"}`` dicts; each teacher is loaded as a frozen
+        # ``teacher_<name>`` PEFT adapter. The single-teacher ``teacher_adapter_path`` /
+        # ``teacher_adapter_name`` pair remains supported for backward compatibility (SOPD).
+        teacher_adapters = getattr(self.model_config, "teacher_adapters", None) or []
+        if teacher_adapters:
+            teacher_adapters = list(teacher_adapters)
+        elif getattr(self.model_config, "teacher_adapter_path", None) is not None:
+            teacher_adapters = [
+                {
+                    "name": getattr(self.model_config, "teacher_adapter_name", "teacher"),
+                    "path": self.model_config.teacher_adapter_path,
+                    "guidance_scale": None,
+                }
+            ]
+
+        if teacher_adapters:
+            from verl.utils.fs import copy_to_local
+
+            if not hasattr(module, "load_adapter"):
+                raise AttributeError("Module does not support PEFT load_adapter; cannot load teacher LoRA.")
+            teacher_names = [t.get("name", "teacher") for t in teacher_adapters]
+            if len(set(teacher_names)) != len(teacher_names):
+                raise ValueError(f"Teacher adapter names must be unique, got {teacher_names}.")
+            for teacher in teacher_adapters:
+                teacher_adapter_name = teacher.get("name", "teacher")
+                if teacher_adapter_name in ("default", "reference"):
+                    raise ValueError(
+                        f"teacher_adapter_name {teacher_adapter_name!r} collides with reserved names; "
+                        "use a distinct name (e.g. 'teacher')."
+                    )
+                teacher_adapter_path = teacher.get("path")
+                local_teacher_path = copy_to_local(teacher_adapter_path, use_shm=self.model_config.use_shm)
+                module.load_adapter(local_teacher_path, adapter_name=teacher_adapter_name)
+                # Freeze the teacher adapter parameters in-place.
+                for n, p in module.named_parameters():
+                    if teacher_adapter_name in n.split("."):
+                        p.requires_grad_(False)
+                logger.info(
+                    "OPD: loaded frozen teacher LoRA adapter %r from %s (adapter_name=%r)",
+                    teacher_adapter_name, teacher_adapter_path, teacher_adapter_name,
+                )
+            # Restore the student ("default") adapter as active.
+            if hasattr(module, "set_adapter"):
+                module.set_adapter("default")
+
         lora_dtype = getattr(self.model_config, "lora_dtype", None)
         if lora_dtype is not None:
             from peft.tuners.tuners_utils import BaseTunerLayer

@@ -468,6 +468,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         compute_loss = tu.get(data, key="compute_loss", default=True)
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
+        use_lora_adapter = tu.pop(data, key="use_lora_adapter", default=None)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
         diffusion_flops_meta = collect_diffusion_flops_meta(
             self.flops_counter,
@@ -490,13 +491,31 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # for sft training, we need to compute loss in eval
         loss_function = self.loss_fn if compute_loss else None
 
+        # Select the active PEFT adapter for this inference pass. ``use_lora_adapter`` (a
+        # named adapter, e.g. the OPD "teacher") takes precedence over ``no_lora_adapter``
+        # (which disables all adapters, used by the reference policy).
+        adapter_ctx = nullcontext()
+        if use_lora_adapter is not None:
+            if not hasattr(self.engine, "use_adapter"):
+                raise RuntimeError(
+                    f"Engine {type(self.engine).__name__} has no use_adapter(); cannot apply "
+                    f"use_lora_adapter={use_lora_adapter!r}."
+                )
+            adapter_ctx = self.engine.use_adapter(use_lora_adapter)
+        elif no_lora_adapter:
+            if not hasattr(self.engine, "disable_adapter"):
+                raise RuntimeError(
+                    f"Engine {type(self.engine).__name__} has no disable_adapter(); cannot "
+                    "apply no_lora_adapter=True."
+                )
+            adapter_ctx = self.engine.disable_adapter()
+
         with (
             self.engine.eval_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="eval_batch", logger=None) as timer,
+            adapter_ctx,
         ):
-            adapter_ctx = self.engine.disable_adapter() if no_lora_adapter else nullcontext()
-            with adapter_ctx:
-                output = self.engine.infer_batch(data, loss_function=loss_function)
+            output = self.engine.infer_batch(data, loss_function=loss_function)
         delta_time = timer.last
 
         if self.engine.is_mp_src_rank_with_outputs():

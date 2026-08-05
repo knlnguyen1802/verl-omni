@@ -102,6 +102,16 @@ distill_loss_mode: distill_kl
 # Distillation loss coefficient
 distill_loss_coef: 1.0
 
+# On-policy distillation (OPD) only mode: train the student purely against the frozen
+# teacher's per-step transition mean, skipping the policy-gradient primary loss and the
+# reward / old-log-prob / advantage phases. Requires use_distill_loss=true.
+opd_only: false
+
+# Multi-task OPD (DiffusionOPD) mode: round-robin over task datasets with per-task teacher
+# distillation, accumulating gradients over a full task cycle before one optimizer step.
+# Requires opd_only=true and >=2 model.teacher_adapters.
+mopd: false
+
 # Number of PPO epochs per batch
 ppo_epochs: 1
 

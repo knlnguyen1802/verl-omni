@@ -20,6 +20,7 @@ import torch
 from diffusers import ModelMixin
 from tensordict import TensorDict
 from verl.utils.device import get_device_name
+from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -126,7 +127,12 @@ class StableDiffusion3FlowGRPO(DiffusionModelBase):
             pooled_prompt_embeds=micro_batch["pooled_prompt_embeds"],
         )
 
-        guidance_scale = model_config.pipeline.guidance_scale
+        # On-policy distillation: a per-call ``guidance_scale`` override (non-tensor batch
+        # metadata) lets teacher inference run each teacher with its own CFG scale while the
+        # student rollout / training keeps ``pipeline.guidance_scale``.
+        guidance_scale = tu.get_non_tensor_data(
+            micro_batch, "guidance_scale", default=model_config.pipeline.guidance_scale
+        )
         if guidance_scale is None:
             guidance_scale = 0.0
         if guidance_scale > 1.0:
@@ -161,7 +167,11 @@ class StableDiffusion3FlowGRPO(DiffusionModelBase):
         timesteps = scheduler_inputs["all_timesteps"]
 
         noise_pred = cls.forward(module, model_config, model_inputs)
-        guidance_scale = model_config.pipeline.guidance_scale
+        # Per-call guidance-scale override for on-policy distillation teacher inference
+        # (non-tensor batch metadata, see ``prepare_model_inputs``).
+        guidance_scale = tu.get_non_tensor_data(
+            scheduler_inputs, "guidance_scale", default=model_config.pipeline.guidance_scale
+        )
         if guidance_scale is not None and guidance_scale > 1.0:
             if negative_model_inputs is None:
                 raise ValueError("SD3 CFG requires negative model inputs when guidance_scale > 1.")

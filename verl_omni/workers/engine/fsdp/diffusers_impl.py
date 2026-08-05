@@ -790,9 +790,16 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
 
+        # On-policy distillation: per-call CFG scale override (one scalar per batch; each
+        # MOPD teacher pass targets a single task). Re-assign onto every micro-batch so the
+        # pipeline adapter can read it from ``scheduler_inputs``.
+        guidance_scale = tu.get_non_tensor_data(data, "guidance_scale", default=None)
+
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             tu.assign_non_tensor(micro_batch, gradient_accumulation_steps=gradient_accumulation_steps)
+            if guidance_scale is not None:
+                tu.assign_non_tensor(micro_batch, guidance_scale=guidance_scale)
             meta_info_lst = {"model_output": [], "loss": [], "metrics": []}
             # Forward and backward for each timestep
             with ctx:
@@ -888,11 +895,16 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
 
         if loss_function is not None:
             data = tu.get_tensordict(
-                {
-                    "old_log_probs": micro_batch["old_log_probs"][:, step],
-                    "advantages": micro_batch["advantages"][:, step],
-                },
+                {},
             )
+            # ``old_log_probs`` / ``advantages`` are only required by the policy-gradient
+            # primary loss. They are absent in OPD-only mode, where the engine forward step
+            # runs purely to compute the student ``prev_sample_mean``/``std_dev_t`` against the
+            # frozen teacher ``teacher_prev_sample_mean``.
+            if micro_batch.get("old_log_probs", None) is not None:
+                data["old_log_probs"] = micro_batch["old_log_probs"][:, step]
+            if micro_batch.get("advantages", None) is not None:
+                data["advantages"] = micro_batch["advantages"][:, step]
             tu.assign_non_tensor(
                 data,
                 gradient_accumulation_steps=tu.get_non_tensor_data(

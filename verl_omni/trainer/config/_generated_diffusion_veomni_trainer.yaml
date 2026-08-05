@@ -107,6 +107,7 @@ actor_rollout_ref:
     use_distill_loss: false
     distill_loss_mode: distill_kl
     distill_loss_coef: 1.0
+    opd_only: false
     ppo_epochs: 1
     shuffle: false
     data_loader_seed: 42
@@ -333,6 +334,8 @@ actor_rollout_ref:
     lora_adapter_path: null
     policy_state_adapters:
     - default
+    teacher_adapter_path: null
+    teacher_adapter_name: teacher
     lora_dtype: null
     fsdp_layer_prefixes:
     - transformer_blocks.
