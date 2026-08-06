@@ -23,6 +23,46 @@ from verl.utils.py_functional import convert_to_regular_types
 logger = logging.getLogger(__name__)
 
 
+def _lora_config_from_dict(config_dict: dict):
+    """Build a ``LoraConfig`` from an ``adapter_config.json`` dict.
+
+    ``LoraConfig.from_dict`` is not exposed by every PEFT version, so try it
+    first and fall back to explicit construction using only the fields the
+    installed ``LoraConfig`` actually accepts (introspected from its
+    constructor signature).
+    """
+    from peft import LoraConfig
+
+    from_dict = getattr(LoraConfig, "from_dict", None)
+    if from_dict is not None:
+        try:
+            return from_dict(config_dict)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            pass
+
+    import inspect
+
+    candidate = {
+        "r": int(config_dict.get("r", 32)),
+        "lora_alpha": int(config_dict.get("lora_alpha", 64)),
+        "target_modules": config_dict.get("target_modules", "all-linear"),
+        "lora_dropout": float(config_dict.get("lora_dropout", 0.0)),
+        "bias": config_dict.get("bias", "none"),
+        "fan_in_fan_out": bool(config_dict.get("fan_in_fan_out", False)),
+        "modules_to_save": config_dict.get("modules_to_save", None),
+        "init_lora_weights": config_dict.get("init_lora_weights", "gaussian"),
+    }
+    # Forward optional fields only when present in the JSON AND supported by
+    # the installed LoraConfig (avoids unknown-kwarg errors on older PEFT).
+    for key in ("use_rslora", "use_dora", "lora_bias", "layer_replication", "runtimes"):
+        if key in config_dict:
+            candidate[key] = config_dict[key]
+
+    sig_params = inspect.signature(LoraConfig.__init__).parameters
+    kwargs = {k: v for k, v in candidate.items() if k in sig_params}
+    return LoraConfig(**kwargs)
+
+
 def load_peft_adapter_into(module, adapter_path: str, adapter_name: str = "default") -> None:
     """Load a pretrained PEFT LoRA adapter directory into ``module``.
 
@@ -46,7 +86,7 @@ def load_peft_adapter_into(module, adapter_path: str, adapter_name: str = "defau
     import json
     import os
 
-    from peft import LoraConfig, get_peft_model_state_dict
+    from peft import get_peft_model_state_dict
     from safetensors.torch import load_file as safetensors_load_file
 
     adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
@@ -63,7 +103,7 @@ def load_peft_adapter_into(module, adapter_path: str, adapter_name: str = "defau
         )
 
     with open(adapter_config_path) as f:
-        lora_config = LoraConfig.from_dict(json.load(f))
+        lora_config = _lora_config_from_dict(json.load(f))
     module.add_adapter(lora_config, adapter_name=adapter_name)
 
     adapter_state_dict = safetensors_load_file(adapter_weights_path)
