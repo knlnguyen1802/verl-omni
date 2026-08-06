@@ -821,17 +821,14 @@ class BaseRayDiffusionTrainer(ABC):
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout.
-        # OPD-only mode has NO reward signal at all: the student is trained purely against the
-        # frozen teacher's per-step transition mean (``distill_kl``), and the reward phase is
-        # short-circuited in ``fit``. Never hand reward workers to the agent loop in that case,
-        # otherwise every generated sample is dispatched to a rule-based reward function
-        # (``default_compute_score_image``) that is not registered for the task data source.
-        if self.opd_only:
-            reward_loop_worker_handles = None
-        else:
-            reward_loop_worker_handles = (
-                self.reward_loop_manager.reward_loop_workers if self.enable_agent_reward_loop else None
-            )
+        # OPD-only mode has NO reward signal during training, but we still hand the reward
+        # workers to the agent loop so validation batches get scored (eval metrics such as
+        # PickScore are logged via ``_validate``). The agent loop itself skips scoring on
+        # OPD *training* rollouts (``opd_only and not is_validate``), so training stays
+        # reward-free while validation metrics keep working.
+        reward_loop_worker_handles = (
+            self.reward_loop_manager.reward_loop_workers if self.enable_agent_reward_loop else None
+        )
 
         self.llm_server_manager = LLMServerManager.create(
             config=self.config,

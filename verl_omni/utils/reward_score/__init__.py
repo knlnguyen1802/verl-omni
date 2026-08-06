@@ -15,7 +15,7 @@
 """Visual (image) reward scoring functions for VeRL-Omni."""
 
 
-def default_compute_score_image(
+async def default_compute_score_image(
     data_source,
     solution_image,
     ground_truth,
@@ -29,7 +29,8 @@ def default_compute_score_image(
         solution_image: The generated image, as a ``torch.Tensor`` in shape
             ``(C, H, W)`` or ``(N, C, H, W)``.
         ground_truth (str): Ground-truth answer (may be unused for rule-based
-            rewards such as ``jpeg_compressibility``).
+            rewards such as ``jpeg_compressibility``; for PickScore it carries
+            the text prompt used for scoring).
         extra_info (dict, optional): Additional metadata passed by the reward
             manager.
 
@@ -43,6 +44,19 @@ def default_compute_score_image(
         from verl_omni.utils.reward_score import jpeg_compressibility
 
         res = jpeg_compressibility.compute_score(solution_image)
+    elif "pickscore" in str(data_source).lower():
+        # PickScore (e.g. data_source "flow_grpo/pickscore_sfw" or any
+        # path-based variant containing "pickscore"). Async scorer backed by
+        # CLIP-H (laion/CLIP-ViT-H-14 + yuvalkirstain/PickScore_v1).
+        from verl_omni.utils.reward_score.pickscore_reward import compute_score_pickscore
+
+        return await compute_score_pickscore(
+            data_source=data_source,
+            solution_image=solution_image,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            **kwargs,
+        )
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
