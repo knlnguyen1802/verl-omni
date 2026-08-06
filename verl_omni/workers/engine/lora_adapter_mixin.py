@@ -23,6 +23,83 @@ from verl.utils.py_functional import convert_to_regular_types
 logger = logging.getLogger(__name__)
 
 
+def load_peft_adapter_into(module, adapter_path: str, adapter_name: str = "default") -> None:
+    """Load a pretrained PEFT LoRA adapter directory into ``module``.
+
+    Works with both module flavours used by verl-omni engines:
+
+    - PEFT ``PeftModel`` (e.g. non-diffusers backends) which exposes ``load_adapter``;
+    - diffusers models using ``PeftAdapterMixin`` (e.g. ``SD3Transformer2DModel`` on
+      diffusers>=0.37), which expose ``add_adapter`` / ``set_adapter`` / ``use_adapter``
+      but *not* PEFT's ``load_adapter``.
+
+    For the ``PeftAdapterMixin`` path we mirror ``NonDiffusersModelBase.load_lora_adapter``:
+    read ``adapter_config.json``, inject the adapter, then copy the
+    ``adapter_model.safetensors`` weights into the freshly created parameters.
+    Mismatched keys are warned about but do not raise.
+    """
+    if hasattr(module, "load_adapter"):
+        # PEFT PeftModel path (or a diffusers version that exposes load_adapter).
+        module.load_adapter(adapter_path, adapter_name=adapter_name)
+        return
+
+    import json
+    import os
+
+    from peft import LoraConfig, get_peft_model_state_dict
+    from safetensors.torch import load_file as safetensors_load_file
+
+    adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
+    adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+    if not os.path.isfile(adapter_config_path):
+        raise FileNotFoundError(f"LoRA adapter config not found at {adapter_config_path}")
+    if not os.path.isfile(adapter_weights_path):
+        raise FileNotFoundError(f"LoRA adapter weights not found at {adapter_weights_path}")
+
+    if not hasattr(module, "add_adapter"):
+        raise AttributeError(
+            f"Module {type(module).__name__} supports neither PEFT load_adapter nor "
+            "add_adapter; cannot load pretrained LoRA adapter."
+        )
+
+    with open(adapter_config_path) as f:
+        lora_config = LoraConfig.from_dict(json.load(f))
+    module.add_adapter(lora_config, adapter_name=adapter_name)
+
+    adapter_state_dict = safetensors_load_file(adapter_weights_path)
+    current_state = get_peft_model_state_dict(module, adapter_name=adapter_name)
+
+    # PEFT checkpoints may carry a ``base_model.model.`` prefix; strip it to align
+    # with the module's own parameter names (diffusers saves use no prefix).
+    loadable = {}
+    for key, value in adapter_state_dict.items():
+        norm_key = key[len("base_model.model.") :] if key.startswith("base_model.model.") else key
+        if norm_key in current_state:
+            loadable[norm_key] = value
+
+    missing = [k for k in current_state if k not in loadable]
+    unexpected = [
+        k
+        for k in adapter_state_dict
+        if not k.startswith("base_model.model.") and k not in current_state and k not in loadable
+    ]
+    if missing:
+        logger.warning(
+            "LoRA adapter %r: %d keys in model but not in checkpoint; they keep initial values.",
+            adapter_name,
+            len(missing),
+        )
+    if unexpected:
+        logger.warning(
+            "LoRA adapter %r: %d keys in checkpoint but not in model; they are ignored.",
+            adapter_name,
+            len(unexpected),
+        )
+
+    for key, value in loadable.items():
+        current_state[key].copy_(value)
+
+
 class LoRAAdapterMixin:
     """Backend-agnostic helpers for named PEFT/LoRA policy adapters."""
 
@@ -36,7 +113,7 @@ class LoRAAdapterMixin:
             print(f"Loading pre-trained LoRA adapter to from: {lora_adapter_path}")
             local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
 
-            module.load_lora_adapter(local_adapter_path)
+            load_peft_adapter_into(module, local_adapter_path, adapter_name="default")
             peft_config = getattr(module, "peft_config", {}).get("default", None)
             for adapter_name in extra_adapters:
                 if peft_config is not None and adapter_name not in getattr(module, "peft_config", {}):
@@ -81,8 +158,6 @@ class LoRAAdapterMixin:
         if teacher_adapters:
             from verl.utils.fs import copy_to_local
 
-            if not hasattr(module, "load_adapter"):
-                raise AttributeError("Module does not support PEFT load_adapter; cannot load teacher LoRA.")
             teacher_names = [t.get("name", "teacher") for t in teacher_adapters]
             if len(set(teacher_names)) != len(teacher_names):
                 raise ValueError(f"Teacher adapter names must be unique, got {teacher_names}.")
@@ -95,7 +170,7 @@ class LoRAAdapterMixin:
                     )
                 teacher_adapter_path = teacher.get("path")
                 local_teacher_path = copy_to_local(teacher_adapter_path, use_shm=self.model_config.use_shm)
-                module.load_adapter(local_teacher_path, adapter_name=teacher_adapter_name)
+                load_peft_adapter_into(module, local_teacher_path, adapter_name=teacher_adapter_name)
                 # Freeze the teacher adapter parameters in-place.
                 for n, p in module.named_parameters():
                     if teacher_adapter_name in n.split("."):
