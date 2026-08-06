@@ -1276,6 +1276,9 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                         # frozen teacher's per-step transition mean. ``diffusion_loss`` will
                         # short-circuit the primary loss when ``opd_only`` is set, so only the
                         # ``distill_kl`` term contributes.
+                        # No reward is extracted in this mode, so default to an empty
+                        # ``reward_extra_infos_dict`` for metric / rollout-data logging below.
+                        reward_extra_infos_dict: dict = {}
                         with marked_timer("teacher_log_prob", timing_raw, color="olive"):
                             teacher_log_prob = self._compute_teacher_log_prob(batch)
                             batch = batch.union(teacher_log_prob)
