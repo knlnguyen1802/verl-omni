@@ -18,7 +18,7 @@ REWARD_TP=4
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
 # Step-wise continuous batching (mutually exclusive with request-level packing).
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
 
 # Optional reproducibility (yaml defaults are null / unseeded):
 #   data.seed=42
