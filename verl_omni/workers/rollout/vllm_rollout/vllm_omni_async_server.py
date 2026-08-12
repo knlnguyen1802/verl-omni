@@ -610,19 +610,19 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         # Extract extra data from custom_output / first-class trajectory_* fields.
         # FlowGRPO adapters prefer trajectory_* (SHM-packed); custom_output keeps
         # prompt embeds and compat aliases (all_latents / all_log_probs / ...).
-        mm_output = dict(final_res.custom_output or {})
+        custom_output = dict(final_res.custom_output or {})
         traj_latents = getattr(final_res, "trajectory_latents", None)
         traj_log_probs = getattr(final_res, "trajectory_log_probs", None)
         traj_timesteps = getattr(final_res, "trajectory_timesteps", None)
         if traj_latents is not None:
-            mm_output["all_latents"] = traj_latents
+            custom_output["all_latents"] = traj_latents
         if traj_log_probs is not None:
-            mm_output["all_log_probs"] = traj_log_probs
+            custom_output["all_log_probs"] = traj_log_probs
         if traj_timesteps is not None:
-            mm_output["all_timesteps"] = traj_timesteps
+            custom_output["all_timesteps"] = traj_timesteps
 
         if sampling_params.get("logprobs", False):
-            all_log_probs = mm_output.get("all_log_probs")
+            all_log_probs = custom_output.get("all_log_probs")
             log_probs = all_log_probs[0] if all_log_probs is not None else None
         else:
             log_probs = None
@@ -638,7 +638,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 return value[0] if value else None
             return value
 
-        extra_fields = {k: _maybe_unbatch(v) for k, v in mm_output.items() if k != "all_log_probs"}
+        extra_fields = {k: _maybe_unbatch(v) for k, v in custom_output.items() if k != "all_log_probs"}
+        multimodal_output = final_res.multimodal_output or {}
+        if isinstance(multimodal_output, dict):
+            for key, value in multimodal_output.items():
+                extra_fields.setdefault(key, _maybe_unbatch(value))
         extra_fields["global_steps"] = self.global_steps
 
         if final_res.request_output is not None and hasattr(final_res.request_output, "finish_reason"):
