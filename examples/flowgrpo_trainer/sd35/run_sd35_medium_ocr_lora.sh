@@ -30,7 +30,9 @@ TOTAL_TRAINING_STEPS=100
 ATTN_BACKEND=native
 
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
-REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
+# Longer admission wait coalesces per-sample HTTP generates into fewer
+# request-level waves (stable window tracks max_wait/2 in vllm-omni).
+REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-100}
 ROLLOUT_ATTN_BACKEND=TORCH_SDPA
 
 if [ "${FA3:-0}" = "1" ]; then
@@ -82,6 +84,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.pipeline.num_inference_steps=10 \
     actor_rollout_ref.rollout.pipeline.guidance_scale=1.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length=256 \
+    actor_rollout_ref.rollout.max_prompt_embed_length=333 \
     actor_rollout_ref.rollout.algo.noise_level=0.8 \
     actor_rollout_ref.rollout.algo.sde_type="cps" \
     actor_rollout_ref.rollout.algo.sde_window_size=3 \
