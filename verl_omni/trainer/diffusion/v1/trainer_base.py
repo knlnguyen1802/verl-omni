@@ -747,9 +747,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     tags.append(tag)
 
             failed_trajectory_keys = [
-                key
-                for key in self.replay_buffer.partitions["train"]
-                if self._trajectory_uid(key) in failed_uids
+                key for key in self.replay_buffer.partitions["train"] if self._trajectory_uid(key) in failed_uids
             ]
             tq.kv_clear(partition_id="train", keys=[*failed_uids, *failed_trajectory_keys])
 
