@@ -1,6 +1,6 @@
 # BAGEL-7B-MoT FlowGRPO training
 
-Last updated: 07/06/2026
+Last updated: 08/26/2026
 
 [BAGEL-7B-MoT](https://github.com/ByteDance-Seed/BAGEL) is a
 Mixture-of-Transformers model supporting both image understanding and
@@ -52,7 +52,19 @@ For GPU:
 bash examples/flowgrpo_trainer/bagel/run_bagel_ocr_lora.sh
 ```
 
-For NPU:  
+For GPU (V1 sync):
+```bash
+bash examples/flowgrpo_trainer/bagel/run_bagel_ocr_lora_v1.sh
+```
+
+This is the v1 counterpart of the GPU OCR LoRA recipe. It uses
+`verl_omni.trainer.main_diffusion_v1` with `trainer.use_v1=true` and
+`trainer.v1.trainer_mode=sync`. Architecture
+(``OmniBagelForConditionalGeneration``), deploy yaml, LoRA targets, reward,
+and data paths match the v0 GPU script. Extra Hydra overrides can be
+appended the same way.
+
+For NPU:
 ```bash
 bash examples/flowgrpo_trainer/bagel/run_bagel_ocr_lora_npu.sh
 ```
