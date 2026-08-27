@@ -434,8 +434,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
-        """Free cache around a weight sync without discarding Omni weights.
-        """
+        """Free cache around a weight sync without discarding Omni weights."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
