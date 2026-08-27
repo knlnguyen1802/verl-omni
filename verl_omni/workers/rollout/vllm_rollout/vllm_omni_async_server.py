@@ -391,14 +391,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         return ["weights"]
 
     def _resolve_sleep_level(self) -> int:
-        """vLLM-Omni cannot restore after ``sleep(level=2)``.
-
-        AsyncOmni discards GPU weights on level 2 and has not implemented
-        reload-from-disk, so ``wake_up()`` raises ``NotImplementedError``.
-        Level 1 offloads weights to CPU RAM and supports DMA restore. It also
-        preserves non-actor pipeline components (text encoder, VAE) that actor
-        weight sync does not reload.
-
+        """
         # TODO (andy): use sleep_level=2 when vllm-omni implements wake_up
         after level-2 sleep AND the trainer syncs the full pipeline.
         """
@@ -442,12 +435,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     async def release_kv_cache(self):
         """Free cache around a weight sync without discarding Omni weights.
-
-        Upstream ``vLLMHttpServer.release_kv_cache`` (verl ``fefb080``+) does
-        ``engine.sleep(level=_resolve_sleep_level())`` then
-        ``engine.wake_up(tags=["weights"])``. For full-weight GPU rollouts that
-        sleep level is 2, which AsyncOmni cannot wake from. Route through
-        ``collective_rpc`` at level 1, matching ``wake_up`` / ``_sleep_hybrid``.
         """
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
