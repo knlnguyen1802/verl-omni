@@ -38,6 +38,7 @@ import os
 from enum import Enum
 
 import ray
+import transfer_queue as tq
 from omegaconf import DictConfig
 from transfer_queue import KVBatchMeta
 from verl import DataProto
@@ -240,6 +241,11 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
+        queue_state = tq.kv_list("train") or {}
+        if any(tag.get("is_prompt", False) for tag in queue_state.get("train", {}).values()):
+            logger.info("Skipping warmup because checkpointed prompt groups were restored")
+            return
+
         num_warmup_batches = self.config.trainer.v1.separate_async.num_warmup_batches
         for _ in range(num_warmup_batches):
             self._add_batch_to_generate()
