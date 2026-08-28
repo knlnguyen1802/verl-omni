@@ -47,9 +47,8 @@ class PolicyGradientDiffusionTrainerV1Sync(PolicyGradientDiffusionTrainerV1):
     Hook behavior:
 
     - ``on_init_end``: update rollout weights at the current ``global_steps``.
-    - ``on_sample_end``: sleep/offload rollout weight memory (discard weights
-      and any KV cache; pure diffusion has no KV cache so this is a no-op for
-      cache but still frees rollout weights).
+    - ``on_sample_end``: wait for leftover TQ sessions to finish, then sleep/offload
+      rollout weight memory so the colocated actor can train.
     - ``on_step_end``: update rollout weights after the actor update.
     """
 
@@ -63,5 +62,9 @@ class PolicyGradientDiffusionTrainerV1Sync(PolicyGradientDiffusionTrainerV1):
             self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_sample_end(self):
-        # sleep all replicas to discard weights and (no-op) KV cache
+        # v1 TQ ``generate_sequences`` is fire-and-forget: replay_buffer.sample()
+        # can return while other n-way sessions are still on the GPU. Wait for
+        # those to finish, then CuMem sleep. Abort-then-sleep races with
+        # DiffusionWorker kernels and hits torchvision's libcudart on Qwen-Image.
+        self._wait_for_tq_background_tasks()
         self.checkpoint_manager.sleep_replicas()

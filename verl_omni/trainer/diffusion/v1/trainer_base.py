@@ -152,11 +152,18 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def init(self):
         """Initialize workers, rollout server, reward loop, checkpoint engine."""
         self._setup()
+
+    def _sleep_load_checkpoint_and_sync(self) -> None:
+        """Sleep rollout after servers are serving, then load ckpt and sync weights.
+        """
+        self.checkpoint_manager.sleep_replicas()
+        self._load_checkpoint()
         self.on_init_end()
 
     def fit(self, agent_loop_manager: AgentLoopManager):
         """Run the v1 training loop, mirroring upstream ``PPOTrainer.fit``."""
         self.agent_loop_manager = agent_loop_manager
+        self._sleep_load_checkpoint_and_sync()
 
         # initialize SkipManager for V1 rollout skip support (no-op until configured).
         SkipManager.init(self.config)
@@ -312,7 +319,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
             with marked_timer("reward", timing_raw, color="yellow"):
                 self.checkpoint_manager.sleep_replicas()
-                data = self._compute_reward_colocate(data)
+                # compute_rm_score returns an rm_scores-only DataProto; union so
+                # the rollout fields (prompts/responses/all_latents/all_timesteps)
+                # survive for old_log_prob and the actor update.
+                data = data.union(self._compute_reward_colocate(data))
                 self.checkpoint_manager.update_weights(self.global_steps)
 
         data = self._balance_batch(data, metrics=metrics)
@@ -370,6 +380,29 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             fields=["old_log_probs", "advantages", "returns", "sample_level_scores", "sample_level_rewards"],
         )
         return batch_meta
+
+    def _wait_for_tq_background_tasks(self) -> None:
+        """Block until DiffusionAgentLoopWorkerTQ fire-and-forget generates finish.
+
+        v1 ``generate_sequences`` returns immediately. ``replay_buffer.sample()``
+        can succeed while sibling n-way sessions are still on the GPU. Aborting
+        those then CuMem-sleeping is the Qwen-Image v1 SIGSEGV. Wait instead.
+        """
+        manager = getattr(self, "agent_loop_manager", None)
+        if manager is None:
+            return
+        workers = getattr(manager, "agent_loop_workers", None)
+        if not workers:
+            return
+        futures = []
+        for worker in workers:
+            wait = getattr(worker, "wait_for_background_tasks", None)
+            if wait is None:
+                continue
+            remote = getattr(wait, "remote", None)
+            futures.append(remote() if callable(remote) else wait())
+        if futures:
+            ray.get(futures)
 
     def on_init_end(self):
         """Called after initialization ends."""
@@ -432,10 +465,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         actor_rollout_resource_pool = self._init_colocated_workers()
         self._init_online_rollout_stack(actor_rollout_resource_pool)
-        self.checkpoint_manager.sleep_replicas()
-        self._load_checkpoint()
 
-        logger.info("diffusion v1 trainer initialized, ready to fit")
+        logger.info("diffusion v1 workers and rollout servers initialized, ready to fit")
 
     def _init_tokenizer(self):
         import json
@@ -1008,7 +1039,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
             if self.use_rm and self.reward_loop_manager.reward_loop_worker_handles is None:
                 self.checkpoint_manager.sleep_replicas()
-                data = self._compute_reward_colocate(data)
+                # Same union as the training path: keep prompts/responses for logging.
+                data = data.union(self._compute_reward_colocate(data))
                 self.checkpoint_manager.update_weights(self.global_steps)
 
             input_ids = data.batch["prompts"]

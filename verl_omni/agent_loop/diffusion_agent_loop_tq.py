@@ -105,6 +105,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
 
+    async def wait_for_background_tasks(self) -> None:
+        """Block until fire-and-forget ``generate_sequences`` tasks finish."""
+        while self.background_tasks:
+            pending = list(self.background_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+
     @staticmethod
     def _extract_prompt(batch: TensorDict, i: int) -> dict:
         """Extract per-sample fields from a TensorDict row."""

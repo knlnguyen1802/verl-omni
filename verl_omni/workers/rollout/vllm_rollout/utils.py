@@ -13,7 +13,9 @@
 # limitations under the License.
 import logging
 import os
+import sys
 import time
+from pathlib import Path
 
 import torch
 from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, set_death_signal
@@ -24,6 +26,82 @@ from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_han
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# Linux maps file; tests may patch this.
+_PROC_SELF_MAPS = "/proc/self/maps"
+
+
+def torchvision_bundled_cudart_is_mapped() -> bool:
+    """True when torchvision's private libcudart is mapped into this process."""
+    try:
+        with open(_PROC_SELF_MAPS, encoding="utf-8") as maps:
+            for line in maps:
+                if "libcudart" in line and "torchvision" in line:
+                    return True
+    except OSError:
+        pass
+    tv = sys.modules.get("torchvision")
+    if tv is None:
+        return False
+    tv_file = getattr(tv, "__file__", None)
+    if not tv_file:
+        return False
+    parent = Path(tv_file).resolve().parent
+    for libs in (parent / "libs", parent.parent / "torchvision.libs"):
+        if libs.is_dir() and any(libs.glob("*cudart*")):
+            return True
+    return False
+
+
+def is_diffusion_pipeline_worker(worker: object) -> bool:
+    """True for vLLM-Omni diffusion workers (not AR / standard vLLM workers)."""
+    model_runner = getattr(worker, "model_runner", None)
+    if model_runner is not None and getattr(model_runner, "pipeline", None) is not None:
+        return True
+    return getattr(worker, "od_config", None) is not None
+
+
+def should_skip_unsafe_cumem_sleep(worker: object) -> bool:
+    """Skip CuMem offload when torchvision's libcudart would memcpy PyTorch pages."""
+    return is_diffusion_pipeline_worker(worker) and torchvision_bundled_cudart_is_mapped()
+
+
+def skipped_cumem_sleep_ack(task, worker: object):
+    """Return a SUCCESS ACK so AsyncOmni does not treat a skipped sleep as engine death."""
+    from vllm_omni.diffusion.data import OmniACK, OmniSleepTask
+
+    if isinstance(task, dict):
+        task = OmniSleepTask(**task)
+    rank = getattr(worker, "rank", 0)
+    if rank != 0:
+        return None
+    return OmniACK(
+        task_id=task.task_id,
+        status="SUCCESS",
+        stage_id=getattr(worker, "stage_id", 0),
+        rank=rank,
+        freed_bytes=0,
+        metadata={"skipped": "torchvision_libcudart"},
+    )
+
+
+def skipped_cumem_wake_ack(task, worker: object):
+    """Return a SUCCESS ACK for a wake that is a no-op because sleep was skipped."""
+    from vllm_omni.diffusion.data import OmniACK, OmniWakeTask
+
+    if isinstance(task, dict):
+        task = OmniWakeTask(**task)
+    rank = getattr(worker, "rank", 0)
+    if rank != 0:
+        return None
+    return OmniACK(
+        task_id=task.task_id,
+        status="SUCCESS",
+        stage_id=getattr(worker, "stage_id", 0),
+        rank=rank,
+        freed_bytes=0,
+        metadata={"state": "WARM", "skipped": "cumem_sleep_was_skipped"},
+    )
 
 
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
@@ -41,6 +119,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
 
     _pending_lora_peft_config: dict | None = None
+    _cumem_sleep_skipped: bool = False
 
     def __new__(cls, **kwargs):
         set_death_signal()
@@ -49,6 +128,73 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         VLLMOmniHijack.hijack()
 
         return super().__new__(cls)
+
+    def sleep(self, level: int = 1):
+        """Offload CuMem weights unless torchvision's libcudart would SIGSEGV."""
+        if should_skip_unsafe_cumem_sleep(self):
+            self._cumem_sleep_skipped = True
+            logger.warning(
+                "Skipping CuMem sleep: torchvision bundled libcudart is mapped. "
+                "Offload would cudaMemcpy PyTorch CuMem pages through the wrong "
+                "CUDA runtime (invalid permissions for mapped object). Rely on "
+                "FSDP param_offload for colocated actor VRAM."
+            )
+            return 0
+        self._cumem_sleep_skipped = False
+        parent = getattr(super(), "sleep", None)
+        if callable(parent):
+            return parent(level)
+        return 0
+
+    def handle_sleep_task(self, task):
+        """ACK-protocol sleep. Skip CuMem memcpy when torchvision libcudart is mapped."""
+        if should_skip_unsafe_cumem_sleep(self):
+            self._cumem_sleep_skipped = True
+            logger.warning(
+                "Skipping handle_sleep_task CuMem offload: torchvision bundled "
+                "libcudart is mapped in this DiffusionWorker."
+            )
+            return skipped_cumem_sleep_ack(task, self)
+        self._cumem_sleep_skipped = False
+        parent = getattr(super(), "handle_sleep_task", None)
+        if not callable(parent):
+            raise TypeError("handle_sleep_task is not available on the worker MRO")
+        return parent(task)
+
+    def wake_up(self, tags: list[str] | None = None):
+        """No-op when the matching sleep was skipped.
+
+        vLLM 0.26's ``CuMemAllocator.wake_up`` re-creates every tagged
+        allocation unconditionally (no per-allocation asleep guard). Waking
+        after a skipped sleep therefore cuMemMaps already-mapped pages, which
+        fails with "CUDA Error: invalid argument" and leaks the freshly
+        created physical handle (vllm-project/vllm#36651).
+        """
+        if getattr(self, "_cumem_sleep_skipped", False):
+            logger.info("Skipping wake_up: previous CuMem sleep was skipped, nothing to restore.")
+            return True
+        parent = getattr(super(), "wake_up", None)
+        if callable(parent):
+            return parent(tags)
+        return True
+
+    def handle_wake_task(self, task):
+        """ACK-protocol wake. No-op when the matching sleep was skipped."""
+        if getattr(self, "_cumem_sleep_skipped", False):
+            logger.info("Skipping handle_wake_task: previous CuMem sleep was skipped.")
+            return skipped_cumem_wake_ack(task, self)
+        parent = getattr(super(), "handle_wake_task", None)
+        if not callable(parent):
+            raise TypeError("handle_wake_task is not available on the worker MRO")
+        return parent(task)
+
+    def is_worker_ready(self) -> bool:
+        """Readiness probe used before hybrid CuMem sleep.
+
+        ``LLMServerManager.create`` must not return until this RPC succeeds,
+        otherwise v1 ``sleep_replicas`` can memcpy unmapped DiffusionWorker pages.
+        """
+        return True
 
     def set_pending_lora_peft_config(self, peft_config: dict | None = None):
         """Stash the actor's LoRA ``peft_config`` for the next

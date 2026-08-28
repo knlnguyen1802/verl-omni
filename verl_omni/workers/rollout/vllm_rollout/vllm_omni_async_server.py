@@ -25,7 +25,6 @@ from typing import Any, Optional
 import numpy as np
 import ray
 import torch
-import torchvision.transforms as T
 import vllm_omni.entrypoints.cli.serve
 import yaml
 from verl.utils.config import omega_conf_to_dataclass
@@ -143,8 +142,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 self.config.max_model_len = self.config.prompt_length + self.config.response_length
 
     def _post_init(self, cuda_visible_devices: str) -> None:
-        """Diffusion needs a PIL→tensor converter; AR does not."""
+        """Diffusion needs a PIL→tensor converter; AR does not.
+        """
         if not self._ar_mode:
+            import torchvision.transforms as T
+
             self._to_tensor = T.PILToTensor()
         self._lora_request_cache: LoRARequest | None | object = _LORA_REQUEST_CACHE_MISS
         self._lora_resolve_lock = asyncio.Lock()
@@ -376,6 +378,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             self._temp_deploy_ctx = None
 
         self.engine = engine_client
+        await self._wait_for_diffusion_worker()
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
@@ -398,27 +401,79 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         return 1
 
     async def wake_up(self, tags: list[str] | None = None):
-        """Override parent to use collective_rpc instead of engine.wake_up().
+        """Restore weights via ``AsyncOmni.wake_up`` (``handle_wake_task``).
 
-        The parent (verl ``1927ad33``+) calls ``self.engine.wake_up(tags=...)``
-        which triggers CUDA initialisation in this HTTP server process when
-        running under vLLM-Omni (AsyncOmni engine).
-        Use ``collective_rpc`` instead.
-
-        # TODO (long): drop this override once vllm-omni wake_up
-        without triggering GPU initialisation.
+        Raw ``collective_rpc("wake_up")`` skips the ACK protocol and can
+        memcpy unmapped CuMem pages in the diffusion worker. Keep this
+        override so hybrid rollout only restores the ``weights`` tag (no KV
+        cache) instead of the parent LLM default.
         """
         if self.node_rank != 0:
             return
-        await self.engine.collective_rpc(
-            "wake_up", kwargs={"tags": tags if tags is not None else self._get_wake_up_tags()}
-        )
+        await self.engine.wake_up(tags=tags if tags is not None else self._get_wake_up_tags())
         self._invalidate_lora_request_cache()
 
     async def set_global_steps(self, global_steps: int):
         if global_steps != self.global_steps:
             self._invalidate_lora_request_cache()
         await super().set_global_steps(global_steps)
+
+    async def _wait_for_diffusion_worker(self) -> None:
+        """Block until DiffusionWorker can serve RPCs.
+
+        ``AsyncOmni`` + Orchestrator can mark the HTTP path ready while
+        ``DiffusionWorker-0`` is still in ``Py_RunMain``. Hybrid CuMem sleep in
+        that window ``cudaMemcpy``s unmapped pages and segfaults, which is the
+        Qwen-Image v1 failure mode (SD3.5 often finishes init first).
+        """
+        if self._ar_mode:
+            return
+        logger.info("Waiting for vLLM-Omni diffusion worker to accept RPCs")
+        try:
+            collective_rpc = getattr(self.engine, "collective_rpc", None)
+            if callable(collective_rpc):
+                result = collective_rpc("is_worker_ready")
+                if asyncio.iscoroutine(result):
+                    await result
+            else:
+                await self.engine.list_loras()
+        except Exception as exc:
+            logger.warning("diffusion worker readiness probe failed (%s); falling back to list_loras", exc)
+            await self.engine.list_loras()
+        logger.info("vLLM-Omni diffusion worker is ready")
+
+    def _uses_async_omni_orchestrator(self) -> bool:
+        """True when this server's engine is AsyncOmni (Orchestrator), not AsyncLLM.
+
+        Do not use ``engine.output_processor`` as the discriminator: AsyncOmni
+        subclasses vLLM ``EngineClient``, which may expose that attribute and
+        send abort/sleep into ``pause_generation`` → ``reset_*_cache`` (unsupported
+        on Orchestrator) then ``handle_sleep_task``.
+        """
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return False
+        if type(engine).__name__ == "AsyncOmni":
+            return True
+        inner = getattr(engine, "engine", None)
+        return getattr(inner, "stage_clients", None) is not None
+
+    async def sleep(self):
+        """Hybrid sleep without Orchestrator-unsupported ``reset_*_cache``.
+
+        Parent ``vLLMHttpServer.sleep`` may ``pause_generation`` (logs
+        reset_prefix/mm/encoder_cache warnings) then ``engine.sleep()``. After
+        Qwen-Image's first generate, that CuMem memcpy goes through torchvision's
+        bundled libcudart and SIGSEGVs. Drain in-flight work, then level-1 sleep
+        only. The DiffusionWorker extension skips the memcpy when that libcudart
+        is mapped.
+        """
+        if self.node_rank != 0 or not getattr(self.config, "free_cache_engine", True):
+            return
+        if self._uses_async_omni_orchestrator():
+            await self._sleep_hybrid()
+            return
+        await super().sleep()
 
     async def _sleep_hybrid(self):
         """Preserve non-actor pipeline weights during hybrid training sleep.
@@ -428,28 +483,44 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         of the trainable actor and therefore are not included in full-model
         weight syncs. Use level-1 sleep so those weights are offloaded and can
         be restored on wake-up instead of discarded by level-2 sleep.
+
+        Do **not** call ``reset_prefix_cache`` / ``reset_mm_cache`` /
+        ``reset_encoder_cache``: AsyncOmni only logs that they are unsupported
+        with Orchestrator, and a post-sleep reset is what parent verl does for
+        vLLM >= 0.17.
+
+        Route through ``engine.sleep()`` (``handle_sleep_task``), not raw
+        ``collective_rpc("sleep")``. The raw RPC skips the pre-offload CUDA
+        sync, so ``CuMemAllocator`` ``cudaMemcpy`` can segfault with
+        "invalid permissions for mapped object".
         """
         self._invalidate_lora_request_cache()
-        await self.engine.collective_rpc("sleep", kwargs={"level": self._resolve_sleep_level()})
-        await self.engine.reset_encoder_cache()
+        await self.engine.sleep(level=1)
 
     async def release_kv_cache(self):
-        """Free cache around a weight sync without discarding Omni weights."""
+        """Free cache around a weight sync without discarding Omni weights.
+
+        Route through ``engine.sleep()``/``engine.wake_up()`` (ACK protocol)
+        like ``_sleep_hybrid``: raw ``collective_rpc`` skips the pre-offload
+        CUDA sync, so ``CuMemAllocator`` ``cudaMemcpy`` can segfault. Level 1
+        keeps pipeline weights restorable; the immediate ``wake_up`` on the
+        ``weights`` tag leaves only caches freed for the duration of the sync.
+        """
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
         self._invalidate_lora_request_cache()
-        await self.engine.collective_rpc("sleep", kwargs={"level": self._resolve_sleep_level()})
-        await self.engine.collective_rpc("wake_up", kwargs={"tags": ["weights"]})
+        await self.engine.sleep(level=self._resolve_sleep_level())
+        await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
-        """Restore after a weight sync. Route through collective_rpc like wake_up."""
+        """Restore after a weight sync. Route through engine wake_up like wake_up."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        await self.engine.collective_rpc("wake_up", kwargs={"tags": ["kv_cache"]})
+        await self.engine.wake_up(tags=["kv_cache"])
 
     async def resume_generation(self):
         if self.node_rank == 0:
@@ -819,8 +890,21 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         )
 
     async def wait_for_requests_to_drain(self):
-        # TODO (mike): implement this once DP is supported.
-        pass
+        """Block until AsyncOmni has no in-flight requests, then abort leftovers.
+
+        Parent ``vLLMReplica.sleep()`` calls this before hybrid sleep. The LLM
+        server waits on ``engine.wait_for_requests_to_drain()``; AsyncOmni has
+        no such API and tracks in-flight work in ``request_states``.
+
+        v0 ``generate_sequences`` is blocking, so this is a no-op by the time
+        sleep runs. v1 TransferQueue workers spawn generation without waiting,
+        so sleeping without this drain memcpy's CuMem pages still in use.
+        """
+        if not self._uses_async_omni_orchestrator():
+            return await super().wait_for_requests_to_drain()
+        # Wait for in-flight generate to finish. Do not hard-abort first:
+        # abort then CuMem-sleep races with DiffusionWorker kernels (Qwen-Image).
+        await self.abort_all_requests(reset_prefix_cache=False)
 
     # -----------------------------------------------------------------------
     # Abort: AsyncOmni has no `output_processor` (it routes through an
@@ -836,7 +920,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         drains and the drain terminates quickly in practice.
         """
         engine = self.engine
-        if getattr(engine, "output_processor", None) is not None:
+        if not self._uses_async_omni_orchestrator():
             return await super().abort_all_requests(reset_prefix_cache)
 
         try:
@@ -871,8 +955,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 await asyncio.sleep(drain_poll_interval_s)
 
             if drained:
-                if reset_prefix_cache:
-                    await self.clear_kv_cache()
                 logger.info(
                     "abort_all_requests: drained all in-flight requests in %.2fs; no abort needed",
                     time.monotonic() - drain_start,
@@ -903,10 +985,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             # Orchestrator already dropped the real abort output.
             for internal_id, state in in_flight_states:
                 self._enqueue_abort_output(internal_id, state)
-
-            if reset_prefix_cache:
-                await self.clear_kv_cache()
-                logger.info("Prefix cache reset after abort")
 
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
@@ -955,7 +1033,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a single in-flight request on the AsyncOmni engine."""
         engine = self.engine
-        if getattr(engine, "output_processor", None) is not None:
+        if not self._uses_async_omni_orchestrator():
             return await super().abort_request(request_id, reset_prefix_cache)
 
         try:
@@ -972,9 +1050,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             if in_flight_state is not None:
                 self._enqueue_abort_output(in_flight_state.request_id, in_flight_state)
 
-            if reset_prefix_cache:
-                await self.clear_kv_cache()
-                logger.info(f"Prefix cache reset after abort request {request_id}")
             logger.info(f"Aborted request: {request_id}")
             return {"aborted": True, "request_id": request_id}
         except Exception as e:
