@@ -767,6 +767,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def get_per_tensor_param(
         self, layered_summon=False, base_sync_done=False, adapter_name: str | None = None, **kwargs
     ):
+        """Export the transformer weights for a rollout-engine weight sync."""
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
