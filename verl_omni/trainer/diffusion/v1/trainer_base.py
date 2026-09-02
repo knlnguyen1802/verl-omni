@@ -1651,11 +1651,18 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         else:
             logger.warning(f"No dataloader state at {dataloader_path}, starting from scratch")
 
-        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+        if self.trainer_mode != "sync":
             tq_checkpoint = os.path.join(global_step_folder, "transfer_queue")
-            if os.path.exists(tq_checkpoint):
+            if not _tq_supports_checkpoint():
+                logger.warning(
+                    "TransferQueue checkpoint recovery is unavailable; async queue state will start empty. "
+                    "TransferQueue >= 0.1.9 with save_checkpoint/load_checkpoint is required."
+                )
+            elif os.path.exists(tq_checkpoint):
                 logger.info(f"Loading TransferQueue state from {tq_checkpoint}")
                 tq.load_checkpoint(tq_checkpoint)
+            else:
+                logger.warning(f"No TransferQueue state at {tq_checkpoint}; async queue state will start empty")
 
     def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
         """Restart checkpointed pending and running prompt groups."""
@@ -1686,7 +1693,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in inflight_uids]
-        tq.kv_batch_put(keys=inflight_uids, partition_id=partition_id, tags=tags)
+        from tensordict.tensorclass import NonTensorData
+
+        tq.kv_batch_put(
+            keys=inflight_uids,
+            partition_id=partition_id,
+            tags=tags,
+            fields=batch.select(*[key for key in batch.keys() if not isinstance(batch.get(key), NonTensorData)]),
+        )
         self.agent_loop_manager.generate_sequences(batch)
 
         logger.info(

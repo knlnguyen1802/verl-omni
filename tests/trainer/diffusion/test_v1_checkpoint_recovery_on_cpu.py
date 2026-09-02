@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU regression tests for diffusion V1 async checkpoint recovery."""
 
+import logging
 import uuid
 from copy import deepcopy
 from pathlib import Path
@@ -57,7 +58,7 @@ def test_transfer_queue_checkpoint_guard(monkeypatch):
     assert trainer_base_module._tq_supports_checkpoint() is False
 
 
-def test_async_checkpoint_saves_and_loads_transfer_queue(monkeypatch, tmp_path):
+def test_async_checkpoint_saves_and_loads_transfer_queue(monkeypatch, tmp_path, caplog):
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
     checkpoint_dir = tmp_path / "global_step_4"
     trainer.global_steps = 4
@@ -103,6 +104,17 @@ def test_async_checkpoint_saves_and_loads_transfer_queue(monkeypatch, tmp_path):
     assert loaded == [tq_checkpoint]
     assert loaded_dataloader_states == [{"cursor": 2}]
 
+    Path(tq_checkpoint).rmdir()
+    with caplog.at_level(logging.WARNING, logger=trainer_base_module.logger.name):
+        trainer._load_checkpoint()
+    assert "No TransferQueue state at" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(trainer_base_module, "_tq_supports_checkpoint", lambda: False)
+    with caplog.at_level(logging.WARNING, logger=trainer_base_module.logger.name):
+        trainer._load_checkpoint()
+    assert "TransferQueue checkpoint recovery is unavailable" in caplog.text
+
 
 def test_reissue_restarts_only_inflight_prompt_groups(monkeypatch):
     pending = "pending"
@@ -147,7 +159,7 @@ def test_reissue_restarts_only_inflight_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         trainer_base_module.tq,
         "kv_batch_put",
-        lambda *, keys, partition_id, tags: updated.append((keys, tags)),
+        lambda **kwargs: updated.append(kwargs),
     )
 
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
@@ -158,15 +170,13 @@ def test_reissue_restarts_only_inflight_prompt_groups(monkeypatch):
     assert trainer._reissue_inflight_prompts() == 2
     assert set(cleared) == {f"{pending}_0_0", f"{running}_0_0"}
     assert f"{finished}_0_0" not in cleared
-    assert updated == [
-        (
-            [pending, running],
-            [
-                {"is_prompt": True, "status": "pending", "global_steps": 8},
-                {"is_prompt": True, "status": "pending", "global_steps": 8},
-            ],
-        )
+    assert len(updated) == 1
+    assert updated[0]["keys"] == [pending, running]
+    assert updated[0]["tags"] == [
+        {"is_prompt": True, "status": "pending", "global_steps": 8},
+        {"is_prompt": True, "status": "pending", "global_steps": 8},
     ]
+    assert set(updated[0]["fields"].keys()) == {"uid", "raw_prompt", "index"}
     assert submitted == [prompt_batch]
 
 
@@ -220,24 +230,37 @@ def test_transfer_queue_checkpoint_roundtrip_and_reissue(initialized_tq, tmp_pat
         assert list(submitted[0]["uid"]) == [pending]
         assert list(submitted[0]["raw_prompt"]) == ["pending prompt"]
         assert int(submitted[0]["global_steps"]) == 4
+        persisted_prompt = tq.kv_batch_get(keys=[pending], partition_id=partition_id)
+        assert list(persisted_prompt["uid"]) == [pending]
+        assert list(persisted_prompt["raw_prompt"]) == ["pending prompt"]
+        assert int(persisted_prompt["index"][0]) == 0
     finally:
         tq.kv_clear(keys=list(tq.kv_list(partition_id)[partition_id]), partition_id=partition_id)
 
 
-def test_separate_async_warmup_does_not_duplicate_restored_prompt_groups(monkeypatch):
+@pytest.mark.parametrize(
+    ("statuses", "expected_submissions"),
+    [
+        (["pending"] * 4, []),
+        (["finished"], [("batch", 2), ("batch", 2)]),
+        (["running"] * 3, [("prompts", 1)]),
+    ],
+)
+def test_warmup_tops_up_inflight_prompts(monkeypatch, statuses, expected_submissions):
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
-    trainer.config = OmegaConf.create({"trainer": {"v1": {"separate_async": {"num_warmup_batches": 2}}}})
-    submitted = []
-    trainer._add_batch_to_generate = lambda: submitted.append("warmup")
-
-    monkeypatch.setattr(
-        separate_async_module.tq,
-        "kv_list",
-        lambda partition_id: {partition_id: {"restored": {"is_prompt": True, "status": "finished", "global_steps": 3}}},
+    trainer.config = OmegaConf.create(
+        {
+            "data": {"train_batch_size": 2},
+            "trainer": {"v1": {"separate_async": {"num_warmup_batches": 2}}},
+        }
     )
-    trainer.on_train_begin()
-    assert submitted == []
+    submitted = []
+    trainer._add_batch_to_generate = lambda: submitted.append(("batch", 2))
+    trainer._add_prompts_to_generate = lambda count: submitted.append(("prompts", count))
 
-    monkeypatch.setattr(separate_async_module.tq, "kv_list", lambda partition_id: {partition_id: {}})
+    queue_items = {
+        f"prompt-{idx}": {"is_prompt": True, "status": status, "global_steps": 3} for idx, status in enumerate(statuses)
+    }
+    monkeypatch.setattr(separate_async_module.tq, "kv_list", lambda partition_id: {partition_id: queue_items})
     trainer.on_train_begin()
-    assert submitted == ["warmup", "warmup"]
+    assert submitted == expected_submissions
