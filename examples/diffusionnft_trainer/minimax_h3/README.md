@@ -191,6 +191,9 @@ export DATA_DIR=/path/to/h3_t2va_data
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
 
+For CUDA V1 sync (TransferQueue + ReplayBuffer), use
+`examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora_v1.sh`.
+
 MiniMax H3 t2va requires an explicit named `aspect_ratio` (one of
 `21:9/16:9/4:3/1:1/3:4/9:16`); the launch script sets `16:9` and explicit
 `height`/`width` control the actual canvas (must be multiples of 32).
@@ -257,6 +260,9 @@ MODEL_PATH=/path/to/MiniMax-H3 \
 DATA_DIR=/path/to/parquet \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_fl2va_lora.sh
 ```
+
+For CUDA V1 sync, use
+`examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_fl2va_lora_v1.sh`.
 
 The latest vLLM-Omni contract requires 4–15 seconds at 24 FPS. The launcher's
 `NUM_FRAMES=96` is aligned by vLLM-Omni to the next valid `17n+5` boundary.
@@ -346,6 +352,9 @@ REF_IMAGE_SHORT_EDGE=512 \
 VAL_REF_IMAGE_SHORT_EDGE=1024 \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_ref2va_lora.sh
 ```
+
+For CUDA V1 sync, use
+`examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_ref2va_lora_v1.sh`.
 
 The H3 Agent Loop keeps the user prompt token-ID-native while vLLM-Omni adds
 the reference presentation. The default `MAX_PROMPT_EMBEDS=12288` is both the
