@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import gc
 import logging
 import os
+import sys
 import time
+import types
+from importlib.machinery import ModuleSpec
 
 import torch
 from verl.utils.device import get_visible_devices_keyword
@@ -31,6 +33,66 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 def _split_visible_devices(value: str) -> list[str]:
     """Split a visible-devices env value into stripped, non-empty entries."""
     return [entry.strip() for entry in value.split(",") if entry.strip()]
+
+
+def _is_qwen_image_t2i_pipeline(pipeline_class: object) -> bool:
+    """True for Qwen-Image text-to-image adapters, not edit / other models."""
+    if isinstance(pipeline_class, str):
+        name = pipeline_class
+    else:
+        name = f"{getattr(pipeline_class, '__module__', '')}.{getattr(pipeline_class, '__qualname__', '')}"
+    key = name.lower().replace("-", "_")
+    if "qwen_image" not in key and "qwenimage" not in key:
+        return False
+    return "edit" not in key
+
+
+def _block_torchvision_cuda_runtime() -> None:
+    """Keep Qwen-Image from mapping torchvision's hashed ``libcudart``.
+
+    T2I only needs the VL *text* encoder. A real ``import torchvision`` loads
+    ``torchvision._C`` and its vendored CUDA runtime, which hijacks CuMem
+    sleep. Stub the package before the pipeline import; leave other models
+    (SD3.5, Wan, Qwen-Image-Edit) on the real torchvision.
+    """
+    real = sys.modules.get("torchvision")
+    if getattr(real, "__file__", None):
+        logger.warning("torchvision already loaded from %s; cannot block its libcudart", real.__file__)
+        return
+
+    class _StubLoader:
+        def create_module(self, spec):
+            module = types.ModuleType(spec.name)
+            module.__file__ = None
+            module.__spec__ = spec
+            if spec.name == "torchvision":
+                module.__version__ = "0.0-stub"
+            if spec.name == "torchvision" or spec.name.startswith("torchvision."):
+                module.__path__ = []
+            return module
+
+        def exec_module(self, module):
+            return None
+
+    class _StubFinder:
+        _verl_omni_qwen_image_tv_stub = True
+
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "torchvision" or fullname.startswith("torchvision."):
+                return ModuleSpec(fullname, _StubLoader(), is_package=True)
+            return None
+
+    if not any(getattr(finder, "_verl_omni_qwen_image_tv_stub", False) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _StubFinder())
+
+    try:
+        import transformers.utils.import_utils as import_utils
+
+        import_utils._torchvision_available = False
+    except Exception:
+        pass
+
+    logger.info("Blocked torchvision CUDA runtime for Qwen-Image T2I worker")
 
 
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
@@ -57,43 +119,11 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
         return super().__new__(cls)
 
-    def _diffusion_pipeline(self):
-        return getattr(getattr(self, "model_runner", None), "pipeline", None)
-
-    def sleep(self, level: int = 1):
-        """Offload diffusion weights with PyTorch copies, not CuMem ctypes.
-
-        ``CuMemAllocator.sleep`` segfaults in the Qwen-Image worker. Moving
-        ``param.data`` to CPU still frees VRAM; the next ``wake_up`` copies
-        back to ``self.device``.
-        """
-        pipeline = self._diffusion_pipeline()
-        if pipeline is None:
-            return super().sleep(level)
-
-        self._sleep_tensors = []
-        freed = 0
-        for tensor in (*pipeline.parameters(), *pipeline.buffers()):
-            if tensor.device.type == "cpu":
-                continue
-            freed += tensor.untyped_storage().nbytes()
-            tensor.data = tensor.data.detach().to("cpu")
-            self._sleep_tensors.append(tensor)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return freed
-
-    def wake_up(self, tags: list[str] | None = None):
-        pipeline = self._diffusion_pipeline()
-        if pipeline is None:
-            return super().wake_up(tags)
-
-        device = self.device
-        for tensor in getattr(self, "_sleep_tensors", ()):
-            tensor.data = tensor.data.to(device, non_blocking=True)
-        self._sleep_tensors = []
-        return True
+    def re_init_pipeline(self, custom_pipeline_args: dict):
+        """Load the custom pipeline, blocking torchvision CUDA for Qwen-Image T2I."""
+        if _is_qwen_image_t2i_pipeline((custom_pipeline_args or {}).get("pipeline_class")):
+            _block_torchvision_cuda_runtime()
+        return super().re_init_pipeline(custom_pipeline_args)
 
     def set_pending_lora_peft_config(self, peft_config: dict | None = None):
         """Stash the actor's LoRA ``peft_config`` for the next

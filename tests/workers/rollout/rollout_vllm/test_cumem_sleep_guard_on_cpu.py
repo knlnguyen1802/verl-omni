@@ -11,50 +11,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU checks: diffusion sleep offloads via PyTorch, not CuMem."""
+"""CPU checks: Qwen-Image T2I blocks torchvision CUDA; other models do not."""
 
-from types import SimpleNamespace
+from unittest.mock import patch
 
-import torch
+from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 
-from verl_omni.workers.rollout.vllm_rollout.utils import vLLMOmniColocateWorkerExtension
-
-
-class _FakeBase:
-    def sleep(self, level: int = 1):
-        self.slept = level
-        return 42
-
-    def wake_up(self, tags=None):
-        self.woke = tags
-        return True
+from verl_omni.workers.rollout.vllm_rollout.utils import (
+    _is_qwen_image_t2i_pipeline,
+    vLLMOmniColocateWorkerExtension,
+)
 
 
-class _Worker(vLLMOmniColocateWorkerExtension, _FakeBase):
-    pass
+def test_qwen_image_t2i_is_detected_and_edit_is_not():
+    assert _is_qwen_image_t2i_pipeline(
+        "verl_omni.pipelines.qwen_image_dpo.vllm_omni_rollout_adapter.QwenImageDPOPipeline"
+    )
+    assert _is_qwen_image_t2i_pipeline(
+        "verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter.QwenImageFlowGRPOPipeline"
+    )
+    assert _is_qwen_image_t2i_pipeline("vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image.QwenImagePipeline")
+    assert not _is_qwen_image_t2i_pipeline(
+        "verl_omni.pipelines.qwen_image_edit_flow_grpo.vllm_omni_rollout_adapter.QwenImageEditPipeline"
+    )
+    assert not _is_qwen_image_t2i_pipeline("vllm_omni.diffusion.models.sd3.pipeline_sd3.StableDiffusion3Pipeline")
 
 
-def _make_worker(pipeline=None, model=None):
-    worker = object.__new__(_Worker)
-    worker.model_runner = SimpleNamespace(pipeline=pipeline, model=model)
-    worker.device = torch.device("cpu")
-    return worker
+def test_re_init_pipeline_blocks_torchvision_only_for_qwen_image_t2i():
+    worker = object.__new__(vLLMOmniColocateWorkerExtension)
 
+    with (
+        patch("verl_omni.workers.rollout.vllm_rollout.utils._block_torchvision_cuda_runtime") as block,
+        patch.object(CustomPipelineWorkerExtension, "re_init_pipeline", return_value=None) as parent,
+    ):
+        vLLMOmniColocateWorkerExtension.re_init_pipeline(
+            worker,
+            {"pipeline_class": "verl_omni.pipelines.qwen_image_dpo.vllm_omni_rollout_adapter.QwenImageDPOPipeline"},
+        )
+        block.assert_called_once()
+        parent.assert_called_once()
 
-def test_diffusion_sleep_does_not_call_cumem():
-    pipeline = torch.nn.Linear(2, 2)
-    worker = _make_worker(pipeline=pipeline)
-
-    assert vLLMOmniColocateWorkerExtension.sleep(worker, 1) == 0
-    assert not hasattr(worker, "slept")
-    assert vLLMOmniColocateWorkerExtension.wake_up(worker, ["weights"]) is True
-    assert not hasattr(worker, "woke")
-
-
-def test_ar_worker_still_uses_cumem_sleep():
-    worker = _make_worker(model=object())
-
-    assert vLLMOmniColocateWorkerExtension.sleep(worker, 1) == 42
-    assert worker.slept == 1
-    assert vLLMOmniColocateWorkerExtension.wake_up(worker, ["weights"]) is True
-    assert worker.woke == ["weights"]
+        block.reset_mock()
+        parent.reset_mock()
+        vLLMOmniColocateWorkerExtension.re_init_pipeline(
+            worker,
+            {"pipeline_class": "vllm_omni.diffusion.models.sd3.pipeline_sd3.StableDiffusion3Pipeline"},
+        )
+        block.assert_not_called()
+        parent.assert_called_once()
