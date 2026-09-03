@@ -18,7 +18,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import torchvision.transforms as T
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -93,6 +92,12 @@ class DiffusionStrategy(OmniStrategyBase):
     model_config_cls = DiffusionModelConfig
 
     def post_init(self, cuda_visible_devices: str) -> None:
+        # Import lazily: torchvision ships a hashed ``libcudart`` that hijacks
+        # CuMem sleep's ``cudaMemcpy`` in the diffusion workers. Only the
+        # frontend server needs PILToTensor, so keep this import out of the
+        # worker import path (see _block_torchvision_cuda_runtime).
+        import torchvision.transforms as T
+
         self.server._to_tensor = T.PILToTensor()
 
     def worker_extension_cls(self, device_type: str) -> str:
