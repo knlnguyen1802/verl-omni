@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import logging
 import os
 import time
@@ -55,6 +56,44 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         VLLMOmniHijack.hijack()
 
         return super().__new__(cls)
+
+    def _diffusion_pipeline(self):
+        return getattr(getattr(self, "model_runner", None), "pipeline", None)
+
+    def sleep(self, level: int = 1):
+        """Offload diffusion weights with PyTorch copies, not CuMem ctypes.
+
+        ``CuMemAllocator.sleep`` segfaults in the Qwen-Image worker. Moving
+        ``param.data`` to CPU still frees VRAM; the next ``wake_up`` copies
+        back to ``self.device``.
+        """
+        pipeline = self._diffusion_pipeline()
+        if pipeline is None:
+            return super().sleep(level)
+
+        self._sleep_tensors = []
+        freed = 0
+        for tensor in (*pipeline.parameters(), *pipeline.buffers()):
+            if tensor.device.type == "cpu":
+                continue
+            freed += tensor.untyped_storage().nbytes()
+            tensor.data = tensor.data.detach().to("cpu")
+            self._sleep_tensors.append(tensor)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return freed
+
+    def wake_up(self, tags: list[str] | None = None):
+        pipeline = self._diffusion_pipeline()
+        if pipeline is None:
+            return super().wake_up(tags)
+
+        device = self.device
+        for tensor in getattr(self, "_sleep_tensors", ()):
+            tensor.data = tensor.data.to(device, non_blocking=True)
+        self._sleep_tensors = []
+        return True
 
     def set_pending_lora_peft_config(self, peft_config: dict | None = None):
         """Stash the actor's LoRA ``peft_config`` for the next
