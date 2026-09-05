@@ -72,6 +72,9 @@ Launch the example from the repository root:
 bash examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora.sh
 ```
 
+For CUDA V1 sync (TransferQueue + ReplayBuffer), use
+`examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora_v1.sh`.
+
 ### NPU
 
 For Huawei Ascend NPUs, use the NPU-optimized script:
@@ -79,6 +82,9 @@ For Huawei Ascend NPUs, use the NPU-optimized script:
 ```bash
 bash examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora_npu.sh
 ```
+
+For NPU V1 sync, use
+`examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora_npu_v1.sh`.
 
 This script uses a 16-NPU global distribution strategy with:
 - `actor_rollout_ref.model.attn_backend='_native_npu'`
