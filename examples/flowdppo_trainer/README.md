@@ -49,13 +49,24 @@ Launch the example from the repository root:
 bash examples/flowdppo_trainer/qwen_image/run_qwen_image_ocr_lora.sh
 ```
 
+For CUDA V1 sync (TransferQueue + ReplayBuffer), use `examples/flowdppo_trainer/qwen_image/run_qwen_image_ocr_lora_v1.sh`. See [Diffusion V1 training](../../docs/start/diffusion_v1.md).
+
 The script accepts normal Hydra overrides after the command:
 
 ```bash
 bash examples/flowdppo_trainer/qwen_image/run_qwen_image_ocr_lora.sh trainer.total_training_steps=100
 ```
 
-The script runs `python3 -m verl_omni.trainer.main_diffusion` with Flow-DPPO-specific settings:
+The v0 script runs `python3 -m verl_omni.trainer.main_diffusion` with Flow-DPPO-specific settings. The v1 script keeps the same Hydra overrides and only switches:
+
+```text
+python3 -m verl_omni.trainer.main_diffusion_v1
+trainer.use_v1=true
+trainer.v1.trainer_mode=sync
+trainer.experiment_name=qwen_image_ocr_lora_v1
+```
+
+The shared Flow-DPPO settings are:
 
 - `algorithm.adv_estimator=flow_grpo`
 - `actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_dppo`
@@ -82,6 +93,8 @@ trainer.logger='["console", "wandb"]'
 trainer.project_name=flow_dppo
 trainer.experiment_name=qwen_image_ocr_lora
 ```
+
+The V1 sync recipe uses `trainer.experiment_name=qwen_image_ocr_lora_v1`.
 
 Override these values on the command line if you want to log under a different project or run name.
 
