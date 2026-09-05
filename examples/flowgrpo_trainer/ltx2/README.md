@@ -1,6 +1,6 @@
 # LTX-2.3 text-to-audio-video FlowGRPO
 
-Last updated: 08/21/2026
+Last updated: 08/26/2026
 
 This recipe trains `dg845/LTX-2.3-Diffusers` LoRA adapters with a diffusers +
 FSDP actor, vLLM-Omni rollout, joint audio-video CPS transitions, and the CLAP
@@ -73,6 +73,18 @@ bash examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh
 The GPU recipe defaults to 8 GPUs, vLLM-Omni tensor parallel size 2, and one
 reward worker. CLAP and ImageBind run on `cuda:0` and `cuda:1`, respectively.
 
+### GPU (V1 sync)
+
+```bash
+bash examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_v1.sh
+```
+
+This is the v1 counterpart of the GPU recipe. It uses
+`verl_omni.trainer.main_diffusion_v1` with `trainer.use_v1=true` and
+`trainer.v1.trainer_mode=sync`. Tensor parallel, LoRA, video+audio knobs, and
+`actor_rollout_ref.rollout.agent.default_agent_loop=ltx2_diffusion_single_turn_agent`
+match the v0 GPU script. Extra Hydra overrides can be appended the same way.
+
 ### Ascend NPU
 
 ```bash
@@ -84,11 +96,11 @@ worker, and reward devices `npu:0` and `npu:1`. It sources the Ascend toolkit
 and ATB environment from `ASCEND_HOME_PATH`, which defaults to
 `/usr/local/Ascend/ascend-toolkit`.
 
-Both launch scripts accept `WORKSPACE`, `MODEL_PATH`, `DATA_DIR`, `OUTPUT_DIR`,
-`NUM_GPUS`, `ROLLOUT_TP`, `TOTAL_TRAINING_STEPS`, and `WANDB_MODE` through
-environment variables. The NPU script additionally accepts `ASCEND_HOME_PATH`,
-`CLAP_MODEL_PATH`, `IMAGEBIND_MODEL_PATH`, `REWARD_DEVICE`, and
-`REWARD_NUM_WORKERS`. Extra Hydra overrides can be appended to either command.
+The GPU, GPU V1, and NPU launch scripts accept `WORKSPACE`, `MODEL_PATH`,
+`DATA_DIR`, `OUTPUT_DIR`, `NUM_GPUS`, `ROLLOUT_TP`, `TOTAL_TRAINING_STEPS`, and
+`WANDB_MODE` through environment variables. The NPU script additionally accepts
+`ASCEND_HOME_PATH`, `CLAP_MODEL_PATH`, `IMAGEBIND_MODEL_PATH`, `REWARD_DEVICE`,
+and `REWARD_NUM_WORKERS`. Extra Hydra overrides can be appended to any command.
 
 The current scripts use a training batch size of 32, eight rollouts per prompt,
 a PPO mini-batch size of 16, and 100 total training steps by default. Outputs
