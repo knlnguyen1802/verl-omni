@@ -863,7 +863,184 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
+        # Prefer a single batched forward/backward over the whole SDE window when
+        # the adapter implements ``forward_and_sample_window`` and the current
+        # loss mode is window-safe. This collapses the per-timestep autograd
+        # graphs (and the many small ``MulBackward0`` / ``MmBackward0`` nodes)
+        # into one large forward + one backward, which is the dominant
+        # ``update_actor`` / ``infer_actor_batch`` speedup.
+        if self._supports_window_forward(loss_function):
+            return self._run_window_forward_backward_batch(data, loss_function, forward_only)
         return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="all_timesteps")
+
+    def _supports_window_forward(self, loss_function: Callable) -> bool:
+        """True when the adapter overrides ``forward_and_sample_window`` AND the
+        current loss mode is window-safe.
+
+        "Window-safe" means the loss ``compute_loss`` only uses element-wise ops
+        over the batch dim — no per-step scalar reductions (e.g.
+        ``sqrt_dt.mean()``) that would be silently mixed by folding the window
+        axis into the batch dim. ``flow_grpo`` / ``dance_grpo`` / ``flow_dppo``
+        are window-safe; ``grpo_guard`` is NOT and must keep the per-step loop.
+        """
+        from verl_omni.pipelines.model_base import DiffusionModelBase
+
+        loss_mode = self._resolve_loss_mode(loss_function)
+        window_safe_modes = {"flow_grpo", "dance_grpo", "flow_dppo"}
+        if loss_mode not in window_safe_modes:
+            return False
+        try:
+            adapter_cls = DiffusionModelBase.get_class(self.model_config)
+        except NotImplementedError:
+            return False
+        return adapter_cls.forward_and_sample_window is not DiffusionModelBase.forward_and_sample_window
+
+    @staticmethod
+    def _resolve_loss_mode(loss_function: Callable) -> Optional[str]:
+        """Best-effort extraction of the diffusion loss mode from the wrapped loss fn.
+
+        ``loss_function`` is typically ``functools.partial(diffusion_loss, config=...)``
+        where ``config`` is a ``DiffusionActorConfig`` carrying
+        ``diffusion_loss.loss_mode``. Falls back to ``None`` when the mode cannot
+        be resolved (in which case the caller treats the loss as not window-safe).
+        """
+        keywords = getattr(loss_function, "keywords", None) or {}
+        config = keywords.get("config")
+        if config is None:
+            return None
+        try:
+            return config.diffusion_loss.get("loss_mode", "flow_grpo")
+        except (AttributeError, KeyError):
+            return None
+
+    def _run_window_forward_backward_batch(
+        self, data: TensorDict, loss_function: Callable, forward_only: bool
+    ) -> dict:
+        """One batched forward + one backward per micro-batch over the full SDE window."""
+        from verl_omni.pipelines.model_base import DiffusionModelBase
+
+        tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+        tu.assign_non_tensor(data, use_dynamic_bsz=False)
+
+        micro_batches, indices = prepare_micro_batches(
+            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+        )
+
+        # With the window folded into the batch dim, each micro-batch contributes
+        # exactly one backward, so the accumulation denominator is the number of
+        # micro-batches (not micro-batches * num_timesteps). The per-element loss
+        # is averaged over (B*W), which keeps the effective gradient scale equal to
+        # the per-step path: 1/(M*B*W) == 1/(M*W*B).
+        gradient_accumulation_steps = len(micro_batches)
+        adapter_cls = DiffusionModelBase.get_class(self.model_config)
+        output_lst = []
+        ctx = torch.no_grad() if forward_only else nullcontext()
+
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            tu.assign_non_tensor(micro_batch, gradient_accumulation_steps=gradient_accumulation_steps)
+            meta_info = {"model_output": [], "loss": [], "metrics": []}
+
+            all_latents = micro_batch["all_latents"]
+            all_timesteps = micro_batch["all_timesteps"]
+            prompt_embeds = micro_batch["prompt_embeds"]
+            pooled_prompt_embeds = micro_batch["pooled_prompt_embeds"]
+            negative_prompt_embeds = micro_batch.get("negative_prompt_embeds", None)
+            negative_pooled_prompt_embeds = micro_batch.get("negative_pooled_prompt_embeds", None)
+
+            sp_size = self.ulysses_sequence_parallel_size if self.use_ulysses_sp else 1
+            if isinstance(prompt_embeds, torch.Tensor) and prompt_embeds.is_nested:
+                prompt_embeds, _ = self._unpad_nested_embeds(prompt_embeds, micro_batch.get("prompt_embeds_mask", None))
+            if isinstance(prompt_embeds, torch.Tensor) and sp_size > 1:
+                prompt_embeds, _ = self._pad_embeds_for_sp(prompt_embeds, micro_batch.get("prompt_embeds_mask", None), sp_size)
+            if isinstance(negative_prompt_embeds, torch.Tensor) and negative_prompt_embeds.is_nested:
+                negative_prompt_embeds, _ = self._unpad_nested_embeds(negative_prompt_embeds, micro_batch.get("negative_prompt_embeds_mask", None))
+            if isinstance(negative_prompt_embeds, torch.Tensor) and sp_size > 1:
+                negative_prompt_embeds, _ = self._pad_embeds_for_sp(negative_prompt_embeds, micro_batch.get("negative_prompt_embeds_mask", None), sp_size)
+
+            with ctx:
+                log_prob, prev_sample_mean, std_dev_t, sqrt_dt = adapter_cls.forward_and_sample_window(
+                    self.module,
+                    self.scheduler,
+                    self.model_config,
+                    all_latents=all_latents,
+                    all_timesteps=all_timesteps,
+                    prompt_embeds=prompt_embeds,
+                    pooled_prompt_embeds=pooled_prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                )
+
+            model_output = {
+                "log_probs": log_prob,
+                "prev_sample_mean": prev_sample_mean,
+                "std_dev_t": std_dev_t,
+                "sqrt_dt": sqrt_dt,
+            }
+
+            if loss_function is not None:
+                # Flatten the window axis into the batch dim so the loss sees one
+                # (B*W,) vector per field, matching the per-step path's (B,) shape.
+                window = all_timesteps.shape[1]
+                data_td = tu.get_tensordict(
+                    {
+                        "old_log_probs": micro_batch["old_log_probs"].reshape(-1),
+                        "advantages": micro_batch["advantages"].reshape(-1),
+                    }
+                )
+                flat_model_output = {
+                    "log_probs": model_output["log_probs"].reshape(-1),
+                    "prev_sample_mean": model_output["prev_sample_mean"].reshape(-1, *prev_sample_mean.shape[2:]),
+                    "std_dev_t": model_output["std_dev_t"].reshape(-1, *std_dev_t.shape[2:]),
+                    "sqrt_dt": model_output["sqrt_dt"].reshape(-1),
+                }
+                tu.assign_non_tensor(
+                    data_td,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
+                )
+                for opt_key, src in (
+                    ("ref_log_prob", "ref_log_prob"),
+                    ("ref_prev_sample_mean", "ref_prev_sample_mean"),
+                    ("old_prev_sample_mean", "old_prev_sample_mean"),
+                    ("rollout_is_weights", "rollout_is_weights"),
+                ):
+                    if micro_batch.get(src, None) is not None:
+                        tensor = micro_batch[src]
+                        if tensor.ndim >= 2 and tensor.shape[1] == window:
+                            data_td[opt_key] = tensor.reshape(-1, *tensor.shape[2:]) if tensor.ndim > 2 else tensor.reshape(-1)
+                        else:
+                            data_td[opt_key] = tensor
+
+                loss, metrics = loss_function(
+                    model_output=flat_model_output, data=data_td, dp_group=self.get_data_parallel_group()
+                )
+            else:
+                assert forward_only, "forward_only must be True when loss_function is None"
+                loss = torch.tensor(1.0, device=device_name)
+                metrics = {}
+
+            if not forward_only:
+                loss.backward()
+
+            # Split the window-stacked output back into per-step dicts (cheap
+            # slicing, no copy) so ``postprocess_batch_func`` can stack them
+            # along dim=1 exactly as in the per-step path.
+            per_step_outputs = [
+                {
+                    "log_probs": model_output["log_probs"][:, w],
+                    "prev_sample_mean": model_output["prev_sample_mean"][:, w],
+                    "std_dev_t": model_output["std_dev_t"][:, w],
+                    "sqrt_dt": model_output["sqrt_dt"][:, w],
+                }
+                for w in range(window)
+            ]
+            meta_info["model_output"] = per_step_outputs
+            meta_info["loss"].append(loss.detach().item())
+            meta_info["metrics"].append(metrics)
+            output_lst.append(meta_info)
+
+        return self.postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         """

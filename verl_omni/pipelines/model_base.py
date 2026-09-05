@@ -237,6 +237,46 @@ class DiffusionModelBase(ABC):
         pass
 
     @classmethod
+    def forward_and_sample_window(
+        cls,
+        module: ModelMixin,
+        scheduler: SchedulerMixin,
+        model_config: DiffusionModelConfig,
+        *,
+        all_latents: torch.Tensor,
+        all_timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward every SDE-window step in one batched pass and sample all previous steps.
+
+        Optional batched counterpart of :meth:`forward_and_sample_previous_step`.
+        Adapters that implement this fold the window axis into the batch
+        dimension so the transformer runs one large forward instead of ``W``
+        small ones, and the reverse-SDE log-prob is computed in a single
+        ``sample_previous_step`` call. The base implementation raises so engines
+        can detect unsupported adapters and fall back to the per-step loop.
+
+        Args:
+            all_latents: ``(B, W+1, ...)`` trajectory; step ``s`` uses
+                ``all_latents[:, s]`` as the sample and ``all_latents[:, s+1]``
+                as the realised ``prev_sample``.
+            all_timesteps: ``(B, W)`` per-step timesteps.
+            prompt_embeds / pooled_prompt_embeds: positive prompt conditioning.
+            negative_*: optional CFG negative conditioning.
+
+        Returns:
+            ``(log_prob, prev_sample_mean, std_dev_t, sqrt_dt)`` with the window
+            axis restored as ``dim=1``.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not implement forward_and_sample_window; "
+            "the engine will fall back to the per-step forward/backward loop."
+        )
+
+    @classmethod
     def forward(
         cls,
         module: ModelMixin,

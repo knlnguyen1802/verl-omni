@@ -21,6 +21,11 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 
+# Precomputed log(sqrt(2*pi)) as a float constant; lazily placed on the sample
+# device inside ``sample_previous_step`` to avoid creating a CPU tensor (and an
+# implicit H2D sync) on every denoising step.
+_LOG_SQRT_2PI: float = math.log(math.sqrt(2.0 * math.pi))
+
 
 @dataclass
 class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
@@ -210,6 +215,9 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
             sigma_max = self.sigmas[1]
             dt = sigma_prev - sigma
+            # sqrt(-dt) is shared by the sde noise scale, the log-prob normalizer,
+            # and the ``return_sqrt_dt`` tail; compute it once here.
+            sqrt_neg_dt = torch.sqrt(-1 * dt)
 
         if sde_type == "sde":
             std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * noise_level
@@ -226,18 +234,16 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                     device=model_output.device,
                     dtype=model_output.dtype,
                 )
-                prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
+                prev_sample = prev_sample_mean + std_dev_t * sqrt_neg_dt * variance_noise
 
             if return_logprobs:
-                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (
-                    2 * ((std_dev_t * torch.sqrt(-1 * dt)) ** 2)
-                )
+                noise_scale = std_dev_t * sqrt_neg_dt
+                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (noise_scale**2))
                 if include_logprob_normalizer:
-                    log_prob = (
-                        log_prob
-                        - torch.log(std_dev_t * torch.sqrt(-1 * dt))
-                        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-                    )
+                    # Use the float constant to avoid creating a CPU tensor (and an
+                    # implicit H2D copy) on every step; subtracting a python float
+                    # from a GPU tensor is a single fused kernel.
+                    log_prob = log_prob - torch.log(noise_scale) - _LOG_SQRT_2PI
             else:
                 log_prob = None
 
@@ -305,14 +311,14 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             if return_logprobs:
                 log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
                 if include_logprob_normalizer:
-                    log_prob = log_prob - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+                    log_prob = log_prob - torch.log(std_dev_t) - _LOG_SQRT_2PI
             else:
                 log_prob = None
 
         # mean along all but batch dimension
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim))) if log_prob is not None else None
         if return_sqrt_dt:
-            sqrt_dt = torch.sqrt(-1 * dt)
+            sqrt_dt = sqrt_neg_dt
             if sqrt_dt.ndim == 0:
                 sqrt_dt = sqrt_dt.expand(sample.shape[0]).clone()
             else:
