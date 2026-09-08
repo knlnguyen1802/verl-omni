@@ -255,25 +255,38 @@ def test_ref2va_rollout_keeps_all_reference_rows_fixed(monkeypatch):
 
 
 def test_ref2va_actor_replays_full_layout_and_scores_only_targets(monkeypatch):
+    from verl_omni.workers.engine.fsdp.diffusers_impl import PPODiffusersFSDPEngine
+
     pipeline, _ = _run_ref_rollout(monkeypatch)
     trajectory = pipeline._flow_grpo_trajectory
-    trajectory["condition_video_rows"] = torch.nn.functional.pad(trajectory["condition_video_rows"], (0, 0, 0, 3))
-    trajectory["condition_audio_rows"] = torch.nn.functional.pad(trajectory["condition_audio_rows"], (0, 0, 0, 2))
+    video_rows = trajectory["condition_video_rows"][0]
+    audio_rows = trajectory["condition_audio_rows"][0]
+    trajectory["condition_video_rows"] = torch.nested.as_nested_tensor([video_rows], layout=torch.jagged)
+    trajectory["condition_video_rows_mask"] = torch.nested.as_nested_tensor(
+        [torch.ones(video_rows.shape[0], dtype=torch.bool)], layout=torch.jagged
+    )
+    trajectory["condition_audio_rows"] = torch.nested.as_nested_tensor([audio_rows], layout=torch.jagged)
+    trajectory["condition_audio_rows_mask"] = torch.nested.as_nested_tensor(
+        [torch.ones(audio_rows.shape[0], dtype=torch.bool)], layout=torch.jagged
+    )
     micro_batch = TensorDict(trajectory, batch_size=[1])
 
-    model_inputs, negative_inputs = MiniMaxH3FlowGRPO.prepare_model_inputs(
-        module=MagicMock(),
-        model_config=MagicMock(),
-        latents=trajectory["all_latents"],
-        timesteps=trajectory["all_timesteps"],
-        prompt_embeds=trajectory["prompt_embeds"],
-        prompt_embeds_mask=trajectory["prompt_embeds_mask"],
-        negative_prompt_embeds=None,
-        negative_prompt_embeds_mask=None,
-        micro_batch=micro_batch,
-        step=0,
+    engine = object.__new__(PPODiffusersFSDPEngine)
+    engine.module = MagicMock()
+    engine.model_config = SimpleNamespace(
+        architecture="MiniMaxH3Pipeline",
+        algorithm="flow_grpo",
+        external_lib=None,
     )
+    engine.use_ulysses_sp = False
+    engine.ulysses_sequence_parallel_size = 1
 
+    assert micro_batch["condition_video_rows"].is_nested
+    assert micro_batch["condition_audio_rows"].is_nested
+    model_inputs, negative_inputs = engine.prepare_model_inputs(micro_batch=micro_batch, step=0)
+
+    assert not micro_batch["condition_video_rows"].is_nested
+    assert not micro_batch["condition_audio_rows"].is_nested
     assert negative_inputs is None
     assert model_inputs["hidden_states"].shape == (1, 24, H3_VIDEO_WIDTH)
     assert model_inputs["audio_hidden_states"].shape == (1, 16, H3_AUDIO_WIDTH)
@@ -569,3 +582,78 @@ def test_ref2va_layout_masks_cover_every_reference_block():
     standalone_audio = packed["audio_pos"][4:10]
     assert int(video_soundtrack[-1]) < int(video_visual[0])
     assert int(video_visual[-1]) < int(standalone_audio[0])
+
+
+def test_ref2va_engine_unpads_nested_condition_rows():
+    """FlowGRPO engine restores padded condition rows before adapter slicing.
+
+    Ref2VA condition rows are padded to a global length and turned into jagged
+    nested tensors by ``embeds_padding_2_no_padding``. The FlowGRPO engine must
+    restore them to dense padded tensors before the adapter slices them with
+    ``[:, :count]``, which fails on a nested tensor's jagged dim-0.
+    """
+    import torch
+    from tensordict import TensorDict
+
+    from verl_omni.workers.engine.fsdp.diffusers_impl import PPODiffusersFSDPEngine
+
+    engine = PPODiffusersFSDPEngine.__new__(PPODiffusersFSDPEngine)
+
+    width = 6
+    nested_video = torch.nested.as_nested_tensor([torch.randn(3, width), torch.randn(4, width)], layout=torch.jagged)
+    nested_video_mask = torch.nested.as_nested_tensor(
+        [torch.ones(3, dtype=torch.bool), torch.ones(4, dtype=torch.bool)], layout=torch.jagged
+    )
+    nested_audio = torch.nested.as_nested_tensor([torch.randn(2, width), torch.randn(5, width)], layout=torch.jagged)
+    nested_audio_mask = torch.nested.as_nested_tensor(
+        [torch.ones(2, dtype=torch.bool), torch.ones(5, dtype=torch.bool)], layout=torch.jagged
+    )
+
+    micro_batch = TensorDict(
+        {
+            "condition_video_rows": nested_video,
+            "condition_video_rows_mask": nested_video_mask,
+            "condition_video_row_count": torch.tensor([[3], [4]]),
+            "condition_audio_rows": nested_audio,
+            "condition_audio_rows_mask": nested_audio_mask,
+            "condition_audio_row_count": torch.tensor([[2], [5]]),
+        },
+        batch_size=[2],
+    )
+
+    engine._unpad_condition_rows(micro_batch)
+
+    assert not micro_batch["condition_video_rows"].is_nested
+    assert micro_batch["condition_video_rows"].shape == (2, 4, width)
+    assert micro_batch["condition_video_rows_mask"].shape == (2, 4)
+    assert not micro_batch["condition_audio_rows"].is_nested
+    assert micro_batch["condition_audio_rows"].shape == (2, 5, width)
+    assert micro_batch["condition_audio_rows_mask"].shape == (2, 5)
+
+    # The adapter slices the restored rows with ``[:, :count]``, which is what
+    # previously raised ``RuntimeError: slice() not supported for NestedTensor``.
+    video_count = micro_batch["condition_video_row_count"][:, 0]
+    sliced = micro_batch["condition_video_rows"][:, : int(video_count[0])]
+    assert sliced.shape == (2, 3, width)
+
+
+def test_ref2va_engine_rejects_mismatched_nested_mask():
+    """Nested condition rows without a nested mask must be rejected, not sliced."""
+    import torch
+    from tensordict import TensorDict
+
+    from verl_omni.workers.engine.fsdp.diffusers_impl import PPODiffusersFSDPEngine
+
+    engine = PPODiffusersFSDPEngine.__new__(PPODiffusersFSDPEngine)
+    nested_video = torch.nested.as_nested_tensor([torch.randn(3, 6), torch.randn(4, 6)], layout=torch.jagged)
+
+    micro_batch = TensorDict(
+        {
+            "condition_video_rows": nested_video,
+            "condition_video_row_count": torch.tensor([[3], [4]]),
+        },
+        batch_size=[2],
+    )
+
+    with pytest.raises(ValueError, match="requires a nested"):
+        engine._unpad_condition_rows(micro_batch)
