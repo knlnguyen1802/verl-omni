@@ -1,6 +1,6 @@
 # Qwen3-Omni Thinker GSPO Trainer
 
-Last updated: 08/03/2026
+Last updated: 09/09/2026
 
 This example shows how to post-train the **Qwen3-Omni-30B-A3B Thinker** with
 **GSPO** on multimodal reasoning tasks, using FSDP for the actor and `vllm-omni` as
@@ -15,6 +15,8 @@ Both **GPU** and **NPU** training platforms are supported:
 - `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_npu.sh`
   — **NPU**, **full-parameter** on a single **Atlas 800T A3** node with
   **16 × Ascend 910C 64GB**.
+- [`run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh`](qwen3_omni/run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh)
+  — **GPU**, **LoRA (r=32) V1** for text + image + audio AVQA training.
 - [`run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh`](qwen3_omni/run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh)
   — **NPU**, **full-parameter V1** for text + image + audio AVQA training.
 
@@ -234,6 +236,26 @@ the `<answer>…\boxed{}…</answer>` template; see
 [`verl_omni/utils/reward_score/mmk12_reward.py`](https://github.com/verl-project/verl-omni/blob/main/verl_omni/utils/reward_score/mmk12_reward.py)
 for the full formula.
 
+### MMK12 On-Policy Distillation (OPD)
+
+OPD distills a teacher's distribution into the student during GSPO training.
+The student is the noised Qwen3-Omni-30B-A3B-Instruct (25% weight noise) and
+the teacher is the original (un-noised) model, served by `vllm_omni` in AR mode.
+
+Validated on 2 × Ascend 910C machines — student rollout/actor on 16 GPUs of
+node 1, teacher model on 16 GPUs of node 2:
+
+```bash
+# 1. On the master node (node 1): ray start --head
+# 2. On the slave node (node 2): ray start --address='<head_ip>:<port>'
+# 3. Run on the master node:
+bash examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1_opd_npu.sh
+```
+
+The script sets `distillation.enabled=true` with a `vllm_omni` teacher
+(`loss_mode=kl`, `use_policy_gradient=true`). Teacher and student must share
+the same tokenizer (same model family).
+
 ## Training with `AVQA-R1-6K`
 
 The AVQA recipe trains the Qwen3-Omni Thinker to answer a four-way question
@@ -257,8 +279,35 @@ Image and audio paths are decoded by Qwen's `qwen_omni_utils.process_mm_info`
 through
 [`QwenOmniRLHFDataset`](../../verl_omni/utils/dataset/omni_rl_datasets.py). Install
 the official media loader without changing the NPU engine stack with
-`pip install -e ".[audio]"`, and ensure `ffmpeg` is available on every Ray
-worker.
+`pip install -e ".[audio]"`. `ffmpeg` is only required when the dataset carries
+compressed audio (mp3/m4a/aac/ogg) or http(s) audio URLs — those go through
+`audioread`/ffmpeg. Plain local WAV files decode via `librosa`/`soundfile`
+(libsndfile) and need no ffmpeg.
+
+### Run GPU training
+
+Launch the GPU LoRA script (4 × H800 80GB, LoRA r=32, same GSPO recipe as the
+other GPU recipes). The audio-specific settings it adds on top of the base
+recipe are:
+
+1. `data.custom_cls` = `QwenOmniRLHFDataset` — the audio-aware dataset class
+   that parses `<audio>` placeholders and loads the WAV files (the default
+   dataset handles images only).
+2. `+data.mm_processor_kwargs.sampling_rate=16000` — the Qwen3-Omni feature
+   extractor rate, used when filtering overlong multimodal prompts.
+3. Rollout memory-margin knobs for colocated audio workloads —
+   `gpu_memory_utilization=0.7` (the base GPU recipe uses `0.8`),
+   `rollout.prompt_length=4160`, `engine_kwargs.vllm_omni.max_num_seqs=256`,
+   and `cudagraph_capture_sizes=[1,2,4,8,16,32,64,128,256]` — see *Sizing
+   rollout memory in colocated sleep mode* in the [integrating
+   guide](../../docs/contributing/integrating_an_omni_model.md).
+
+```bash
+bash examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh
+```
+
+The reward extracts the first `<answer>...</answer>` payload from the response
+and returns a binary exact-match score against the tagged dataset label.
 
 ### Run NPU training
 
@@ -280,29 +329,37 @@ computes entropy in 2048-token chunks to reduce peak NPU memory. It registers
 the audio-aware dataset class by importable package path so multiprocessing
 preserves its `RLHFDataset` base class, sets rollout NPU memory utilization to
 `0.6`, uses deterministic validation, and wires
-[`choice_reward.py`](../../verl_omni/utils/reward_score/choice_reward.py). It
-extracts the first `<answer>...</answer>` payload and returns a binary exact-match
-reward against the tagged dataset label.
+[`choice_reward.py`](../../verl_omni/utils/reward_score/choice_reward.py).
 
 ## Performance
 
 All GPU results measured on a single node of **4 × H800 80GB**, actor and
-rollout colocated, LoRA r=32, GSPO.
+rollout colocated, LoRA r=32, GSPO. Curves are hosted in the shared
+[`verl-omni/gspo_demo`](https://wandb.ai/verl-omni/gspo_demo) W&B project; the
+runs were trained with the
+[`release/v0.2.0`](https://github.com/verl-project/verl-omni/tree/release/v0.2.0)
+branch.
 
 | Script | Dataset | # Cards | Batch × `rollout.n` | lr | Steps | val acc@1 / reward@1 | rollout↔actor pearson | GPU memory |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [`gsm8k (wandb)`](https://wandb.ai/mikecheung/gspo/runs/j5mro1tn) | gsm8k | 4 | 128 × 16 = 2048 | 3e-6 | 578 | acc 0.969 | 0.997 | ~43 GB |
-| [`MMK12 (wandb)`](https://wandb.ai/mikecheung/gspo/runs/2j8hxr36) | MMK12 | 4 | 128 × 16 = 2048 | 3e-6 | 456 | reward 0.833 | 0.998 | ~59 GB |
+| [`gsm8k (wandb)`](https://wandb.ai/verl-omni/gspo_demo/runs/0tma6mas) | gsm8k | 4 | 128 × 16 = 2048 | 3e-6 | 578 | acc 0.971 | 0.998 | ~43 GB |
+| [`MMK12 (wandb)`](https://wandb.ai/verl-omni/gspo_demo/runs/mls202j1) | MMK12 | 4 | 128 × 16 = 2048 | 3e-6 | 392 | reward 0.811 | 0.998 | ~59 GB |
+| [`AVQA-R1-6K (wandb)`](https://wandb.ai/verl-omni/gspo_demo/runs/kzzrq9pr) | AVQA-R1-6K | 4 | 128 × 16 = 2048 | 3e-6 | 348 | reward 0.877 | 0.996 | ~46 GB |
 
-**gsm8k** ([wandb](https://wandb.ai/mikecheung/gspo/runs/j5mro1tn), `naive`
-reward, math accuracy): `critic/rewards/mean` rose from ~0.93 to ~0.97,
-`val-core/openai/gsm8k/acc/mean@1` reached **0.969**.
+**gsm8k** ([wandb](https://wandb.ai/verl-omni/gspo_demo/runs/0tma6mas), `naive`
+reward, math accuracy): `critic/rewards/mean` rose from ~0.88 to ~0.97,
+`val-core/openai/gsm8k/acc/mean@1` reached **0.971**.
 `rollout_corr/log_ppl_diff` stayed near zero (~0.002).
 
-**MMK12** ([wandb](https://wandb.ai/mikecheung/gspo/runs/2j8hxr36), composite
-reward, `math_verify` + format): `critic/rewards/mean` reached 0.842,
-`val-core/mmk12/reward/mean@1` reached **0.833** (still training at
-step 456). `rollout_corr/log_ppl_diff` stayed near zero (~0.002).
+**MMK12** ([wandb](https://wandb.ai/verl-omni/gspo_demo/runs/mls202j1), composite
+reward, `math_verify` + format): `critic/rewards/mean` rose from ~0.71 to ~0.81,
+`val-core/mmk12/reward/mean@1` reached **0.811** (last logged at
+step 392). `rollout_corr/log_ppl_diff` stayed near zero (~0.002).
+
+**AVQA-R1-6K** ([wandb](https://wandb.ai/verl-omni/gspo_demo/runs/kzzrq9pr),
+binary `<answer>` exact-match reward): `critic/rewards/mean` rose from ~0.73 to
+~0.94, `val-core/avqa_r1_6k/reward/mean@1` reached **0.877**.
+`rollout_corr/log_ppl_diff` stayed near zero (~0.007).
 
 ## Logging
 
@@ -320,6 +377,7 @@ examples/gspo_trainer/
 ├── qwen3_omni/
 │   ├── run_qwen3_omni_thinker_gspo_lora_v1.sh       ← V1 launch script (GPU, LoRA r=32, text)
 │   ├── run_qwen3_omni_thinker_gspo_lora_mmk12_v1.sh  ← V1 launch script (GPU, LoRA r=32, image)
+│   ├── run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh   ← V1 launch script (GPU, LoRA r=32, audio + image)
 │   ├── run_qwen3_omni_thinker_gspo_lora.sh           ← deprecated (old main_ppo entrypoint)
 │   ├── run_qwen3_omni_thinker_gspo_npu.sh            ← launch script (NPU, full-parameter)
 │   ├── run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh    ← V1 launch script (NPU, AVQA)

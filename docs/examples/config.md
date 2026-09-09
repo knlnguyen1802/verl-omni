@@ -73,6 +73,59 @@ algorithm:
 - `algorithm.paired_preference`: `true` for pair-based algorithms (e.g. offline DPO); doubles actor batch size and disables shuffle.
 - `algorithm.rollout_correction.*`: Experimental IS / RS correction. Schema mirrors upstream verl; see {doc}`../algo/rollout_correction` and [verl Rollout Correction](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html).
 
+### `actor_rollout_ref.separate` — synchronous resource separation
+
+`actor_rollout_ref.separate` defaults to `false`. When enabled, the legacy synchronous
+diffusion trainer (`trainer.use_v1=false`) places pure Actor workers on the trainer
+resources and launches rollout/checkpoint workers on a separate Ray resource pool.
+The mode is limited to online policy-gradient training and publishes actor weights once
+before training and once after every logical-batch update.
+
+The current baseline supports full finetuning only. For the diffusion/FSDP
+configuration, LoRA must be disabled with `actor_rollout_ref.model.lora_rank=0`
+and `actor_rollout_ref.model.lora_adapter_path=null`.
+
+Required topology settings are:
+
+```yaml
+actor_rollout_ref:
+  separate: true
+  hybrid_engine: false
+  rollout:
+    nnodes: 1
+    n_gpus_per_node: 8
+    checkpoint_engine:
+      backend: nccl
+trainer:
+  use_v1: false
+  nnodes: 1
+  n_gpus_per_node: 8
+```
+
+`rollout.nnodes` and `rollout.n_gpus_per_node` must both be positive, and the
+checkpoint backend must be non-naive (for example, `nccl` on CUDA). Trainer and
+rollout resources are additive; the example above requests 8 Trainer GPUs and 8
+standalone rollout GPUs from the Ray cluster.
+
+`actor_rollout_ref.rollout.agent.num_workers` controls CPU request concurrency; it
+does not allocate rollout GPUs and does not need to match `rollout.n_gpus_per_node`.
+
+On a CUDA Ray cluster, the Wan2.2 auto-device recipe forwards trailing Hydra
+overrides, so the same topology can be launched with the NCCL checkpoint backend:
+
+```bash
+bash examples/dancegrpo_trainer/wan22/run_wan22_5b_t2v_hpsv3_auto.sh \
+  actor_rollout_ref.separate=true \
+  actor_rollout_ref.hybrid_engine=false \
+  actor_rollout_ref.model.lora_rank=0 \
+  actor_rollout_ref.model.lora_adapter_path=null \
+  actor_rollout_ref.rollout.nnodes=1 \
+  actor_rollout_ref.rollout.n_gpus_per_node=8 \
+  actor_rollout_ref.rollout.checkpoint_engine.backend=nccl \
+  trainer.nnodes=1 \
+  trainer.n_gpus_per_node=8
+```
+
 ### `actor_rollout_ref.model` — `DiffusionModelConfig`
 
 ```yaml
@@ -106,7 +159,7 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.tokenizer_path`: Optional tokenizer path if not under `path` (falls back to `<path>/tokenizer` or `path`).
 - `actor_rollout_ref.model.config_path`: Optional transformer config path. If null, backends use `<path>/<transformer_subfolder>`.
 - `actor_rollout_ref.model.transformer_subfolder`: Subfolder with diffusion transformer weights/config (default `transformer`).
-- `actor_rollout_ref.model.attn_backend`: Diffusers attention backend. One of `native`, `_native_npu`, `_flash_3_varlen_hub`. Must stay consistent with `rollout.rollout_attn_backend`.
+- `actor_rollout_ref.model.attn_backend`: Diffusers attention backend. One of `native`, `_native_npu`, `flash_varlen_hub`, `_flash_3_varlen_hub`. Must stay consistent with `rollout.rollout_attn_backend`.
 - `actor_rollout_ref.model.lora_rank`: LoRA rank; `> 0` enables LoRA.
 - `actor_rollout_ref.model.lora_alpha`: LoRA scaling factor.
 - `actor_rollout_ref.model.lora_init_weights`: LoRA init method (default `gaussian`).
@@ -187,6 +240,7 @@ actor_rollout_ref:
       true_cfg_scale: 1.0
       max_sequence_length: 512
       guidance_scale: null
+      reference_image_short_edge: null
       num_frames: 1
       task: null
 ```
@@ -196,6 +250,7 @@ actor_rollout_ref:
 - `actor_rollout_ref.rollout.pipeline.true_cfg_scale`: True classifier-free guidance scale; values `> 1.0` enable CFG with a negative prompt (e.g. Qwen-Image).
 - `actor_rollout_ref.rollout.pipeline.max_sequence_length`: Max text-encoder token length for prompt encoding.
 - `actor_rollout_ref.rollout.pipeline.guidance_scale`: Distilled guidance scale for models with guidance embeddings; `null` disables.
+- `actor_rollout_ref.rollout.pipeline.reference_image_short_edge`: Reference-image resize short edge for compatible pipelines. MiniMax-H3 Ref2VA accepts multiples of 32 from 256 through 2048; use `val_kwargs.pipeline.reference_image_short_edge` for a different validation value.
 - `actor_rollout_ref.rollout.pipeline.num_frames`: Wan2.2 (and similar) video frame count (`81` ≈ 3s at 24 fps; image models keep `1`).
 - `actor_rollout_ref.rollout.pipeline.task`: Optional task label forwarded to the pipeline's request contract (vLLM-Omni reads it as the request `task`); values are pipeline-specific (e.g. MiniMax-H3: `t2va` / `fl2va` / `ref2va`), `null` lets the engine infer it.
 - `actor_rollout_ref.rollout.pipeline.output_type`: Pipeline output modality (dataclass default `image`).

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import copy
 import os
 from typing import Any, Literal
@@ -39,6 +41,7 @@ from verl_omni.pipelines.request_batch import (
 from verl_omni.pipelines.request_batch import (
     split_diffusion_output_by_request as _split_diffusion_output_by_request,
 )
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 from .common import QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
@@ -60,6 +63,11 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
     """
 
     supports_request_batch = True
+
+    #: Declares the primary rollout media stream so downstream consumers read
+    #: the modality from the adapter instead of inferring it from tensor rank.
+    #: Inherited by the dual-GRPO and mix-GRPO Qwen-Image subclasses.
+    diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("image"))
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -218,9 +226,9 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
     def prepare_encode(
         self,
-        state: "StepRequestState",
+        state: StepRequestState,
         **kwargs: Any,
-    ) -> "StepRequestState":
+    ) -> StepRequestState:
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config.
 
         Override of ``QwenImagePipeline.prepare_encode`` that accepts pre-tokenized
