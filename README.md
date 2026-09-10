@@ -16,7 +16,6 @@ It originated from the multi-modal generation RL effort in `verl`, and now has a
 
 ## News 🔥
 
-- **[2026-09]** [Wan2.2 DanceGRPO](examples/dancegrpo_trainer/README.md) now defaults to the V1 sync trainer (TransferQueue). The v0 auto-detect launcher is deprecated for CUDA.
 - **[2026-08]** **[DiffusionOPD](docs/algo/diffusion_opd.md)** (on-policy distillation, including multi-teacher MOPD) is now supported.
 - **[2026-08]** 🔥 **MiniMax-H3** now supports T2VA, FL2VA, and Ref2VA with both [FlowGRPO](examples/flowgrpo_trainer/minimax_h3/README.md) and [DiffusionNFT](examples/diffusionnft_trainer/minimax_h3/README.md).
 - **[2026-08]** 🎉 We have released [v0.2.0](https://github.com/verl-project/verl-omni/releases/tag/v0.2.0) for faster diffusion rl and more stable Qwen3-Omni multimodal training. Blog: [VeRL-Omni v0.2.0](https://verl-project.github.io/posts/2026-08-17-verl-omni-v0-2-0/)
