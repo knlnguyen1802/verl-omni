@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
@@ -37,6 +38,23 @@ def _request_output(diffusion_output, multimodal_output=None):
         trajectory_log_probs=None,
         trajectory_timesteps=None,
     )
+
+
+def test_diffusion_prompt_preserves_multimodal_processor_kwargs(diffusion_strategy):
+    diffusion_strategy.server.engine = SimpleNamespace(default_sampling_params_list=[object()])
+    multi_modal_data = {"image": ["image"], "audio": ["audio"]}
+    mm_processor_kwargs = {"fps": 24, "sampling_rate": 32000}
+
+    request = OmniRolloutRequest.from_generate_kwargs(
+        prompt_ids=[1, 2, 3],
+        image_data=multi_modal_data["image"],
+        audio_data=multi_modal_data["audio"],
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    prompt, _ = diffusion_strategy.preprocess_input(request, {"task": "ref2va"}, None)
+
+    assert prompt["multi_modal_data"] == multi_modal_data
+    assert prompt["mm_processor_kwargs"] == mm_processor_kwargs
 
 
 def test_pixel_output_is_always_uint8(diffusion_strategy):

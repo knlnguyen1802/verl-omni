@@ -21,6 +21,8 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
 from vllm_omni.lora.request import LoRARequest
 
+from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+
 if TYPE_CHECKING:
     from argparse import Namespace
 
@@ -56,8 +58,8 @@ class OmniStrategyBase(ABC):
     * optionally override the concrete hooks (:meth:`init_config`,
       :meth:`init_model_config`, :meth:`validate_configs`, :meth:`post_init`,
       :meth:`apply_quantization`, :meth:`override_generation_config`,
-      :meth:`preprocess_engine_kwargs`) when the mode needs behavior beyond the
-      shared defaults.
+      :meth:`preprocess_engine_kwargs`, :meth:`collective_rpc_stage_ids`) when
+      the mode needs behavior beyond the shared defaults.
 
     The two concrete subclasses are
     :class:`~verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy.ARStrategy`
@@ -155,6 +157,14 @@ class OmniStrategyBase(ABC):
         """
         engine_kwargs.pop("output_mode", None)
 
+    def collective_rpc_stage_ids(self, method: Any) -> list[int] | None:
+        """Return pipeline stages targeted by a shared collective RPC.
+
+        ``None`` preserves the engine default of broadcasting to every stage.
+        AR adapters can narrow actor weight synchronization to trainable stages.
+        """
+        return None
+
     @abstractmethod
     def prepare_engine_args(self, engine_args: dict[str, Any], args: Namespace) -> None:
         """Mutate ``engine_args`` in place with mode-specific engine arguments.
@@ -190,37 +200,21 @@ class OmniStrategyBase(ABC):
             ``TokenOutput`` for AR mode or ``DiffusionOutput`` for diffusion mode.
         """
         prompt_ids = normalize_token_ids(prompt_ids)
-        multi_modal_data = self._build_multi_modal_data(image_data, video_data, audio_data)
-        lora_request = await self.server._resolve_lora_request()
-        prompt, params = self.preprocess_input(
-            prompt_ids,
-            sampling_params,
-            multi_modal_data,
-            lora_request,
-            negative_prompt_ids,
-            prompt_mask,
-            mm_processor_kwargs,
-            extra_prompt_ids,
-            negative_extra_prompt_ids,
+        request = OmniRolloutRequest.from_generate_kwargs(
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            negative_prompt_ids=negative_prompt_ids,
+            extra_prompt_ids=extra_prompt_ids,
+            negative_extra_prompt_ids=negative_extra_prompt_ids,
+            mm_processor_kwargs=mm_processor_kwargs,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
         )
+        lora_request = await self.server._resolve_lora_request()
+        prompt, params = self.preprocess_input(request, sampling_params, lora_request)
         final_res = await self.run_generation(prompt, params, request_id, lora_request, priority)
         return self.process_output(final_res, params, sampling_params)
-
-    @staticmethod
-    def _build_multi_modal_data(
-        image_data: Optional[list[Any]],
-        video_data: Optional[list[Any]],
-        audio_data: Optional[list[Any]] = None,
-    ) -> dict[str, Any]:
-        """Assemble vLLM multimodal inputs from the public rollout arguments."""
-        multi_modal_data: dict[str, Any] = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-        if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
-        return multi_modal_data
 
     @staticmethod
     def _map_stop_reason(finish_reason: Optional[str]) -> Optional[str]:
@@ -252,22 +246,23 @@ class OmniStrategyBase(ABC):
     @abstractmethod
     def preprocess_input(
         self,
-        prompt_ids: list[int],
+        request: OmniRolloutRequest,
         sampling_params: dict[str, Any],
-        multi_modal_data: dict[str, Any],
         lora_request: Optional[LoRARequest],
-        negative_prompt_ids: Optional[list[int]],
-        prompt_mask: torch.BoolTensor | None = None,
-        mm_processor_kwargs: Optional[dict[str, Any]] = None,
-        extra_prompt_ids: Optional[dict[str, list[int]]] = None,
-        negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
     ) -> tuple[Any, Any]:
         """Build the engine prompt and sampling params for this mode.
 
-        Called by :meth:`generate` after prompt normalization and multimodal
-        assembly. AR mode returns a token-centric prompt plus ``SamplingParams``;
-        diffusion mode returns an ``OmniCustomPrompt`` plus a diffusion sampling
-        params list.
+        Called by :meth:`generate` after the loose rollout keyword arguments have
+        been assembled into a single typed :class:`OmniRolloutRequest`. AR mode
+        returns a token-centric prompt plus ``SamplingParams``; diffusion mode
+        returns an ``OmniCustomPrompt`` plus a diffusion sampling params list.
+
+        Args:
+            request: The typed rollout request (prompt token ids, negatives,
+                per-encoder token ids and condition media).
+            sampling_params: The public sampling params dict (mutated in place by
+                some modes).
+            lora_request: The resolved LoRA request, or ``None``.
 
         Returns:
             A ``(prompt, params)`` pair understood by :meth:`run_generation`.
