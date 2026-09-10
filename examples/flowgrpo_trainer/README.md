@@ -75,7 +75,14 @@ The script runs `python3 -m verl_omni.trainer.main_diffusion` with:
 - `trainer.n_gpus_per_node=4`
 
 The V1 script uses `python3 -m verl_omni.trainer.main_diffusion_v1` with the same
-model/LoRA/reward knobs plus `trainer.use_v1=true` and `trainer.v1.trainer_mode=sync`.
+model/LoRA/reward knobs plus `trainer.use_v1=true` and `trainer.v1.trainer_mode=sync`,
+including the v0 micro-batch sizes: between phases the v1 trainer sleeps the rollout
+engine, and a vllm-omni level-1 sleep offloads the whole pipeline (transformer + text
+encoder + VAE) to pinned host memory, so the actor update runs next to only a few GB
+of engine skeleton instead of ~55GB of resident weights. Both micro-batch knobs are
+env-overridable (`PPO_MICRO_BATCH_SIZE`, `LOG_PROB_MICRO_BATCH_SIZE`) if you colocate
+other tenants on the same GPUs. Each sleeping replica pins ~55GB of host RAM
+(220GB total for the four TP=1 replicas of this recipe).
 
 ## Logging
 

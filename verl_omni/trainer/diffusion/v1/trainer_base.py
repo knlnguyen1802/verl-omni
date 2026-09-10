@@ -375,9 +375,13 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # [OPTIONAL] colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
             with marked_timer("reward", timing_raw, color="yellow"):
+                # Free rollout-engine GPU memory so the colocated RM fits. The
+                # replicas must stay asleep through the training phases below:
+                # update_weights resumes their weights (~55GB for Qwen-Image at
+                # rollout TP=1) and the actor update would OOM next to them.
+                # on_step_end wakes and weight-syncs for the next rollout.
                 self.checkpoint_manager.sleep_replicas()
                 data = data.union(self._compute_reward_colocate(data))
-                self.checkpoint_manager.update_weights(self.global_steps)
 
         if self._is_direct_preference:
             return self._train_direct_preference_batch(metrics, timing_raw, batch_meta, data)

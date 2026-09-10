@@ -32,6 +32,16 @@ REWARD_ENGINE=vllm
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
 
+# Colocated memory layout (sync mode, 4x 80GB GPUs): between phases the rollout
+# engine sleeps at level 1 — vllm-omni offloads the whole pipeline (transformer
+# + text encoder + VAE, ~55GB at rollout TP=1) to pinned host memory — so the
+# reward and actor-update phases run next to only a few GB of engine skeleton.
+# Micro batches therefore match the v0 recipe. The env knobs below only matter
+# if you shrink the rollout engine (e.g. ROLLOUT_TP=2) or run alongside other
+# tenants; raise/lower them instead of editing the Hydra overrides.
+PPO_MICRO_BATCH_SIZE=${PPO_MICRO_BATCH_SIZE:-16}
+LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
+
 # Optional reproducibility (yaml defaults are null / unseeded):
 #   data.seed=42
 #   actor_rollout_ref.rollout.seed=42
@@ -49,12 +59,12 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.actor.optim.lr=3e-4 \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE \
     actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-5 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.n=16 \
@@ -71,7 +81,7 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.request_batch_max_wait_ms=${REQUEST_BATCH_MAX_WAIT_MS} \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
     reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
     reward.reward_model.enable=True \
     reward.reward_model.model_path=$reward_model_name \
