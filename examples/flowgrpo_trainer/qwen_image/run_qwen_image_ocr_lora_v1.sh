@@ -42,9 +42,14 @@ REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
 PPO_MICRO_BATCH_SIZE=${PPO_MICRO_BATCH_SIZE:-16}
 LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
 
-# Optional reproducibility (yaml defaults are null / unseeded):
-#   data.seed=42
-#   actor_rollout_ref.rollout.seed=42
+# Reproducibility knobs:
+#   actor_rollout_ref.rollout.seed defaults to 42 in
+#   verl_omni/trainer/config/diffusion/rollout/diffusion_rollout.yaml (NOT
+#   null). When set, each rollout request derives a deterministic seed from
+#   its global prompt index + session id, so multi-worker chunking no longer
+#   duplicates noise (#561); set it to null for fully random rollouts.
+#   data.seed (dataloader shuffling) defaults to null / unseeded:
+#     data.seed=42
 
 python3 -m verl_omni.trainer.main_diffusion_v1 \
     data.train_files=$ocr_train_path \

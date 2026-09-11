@@ -98,7 +98,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     prompt,
                     sampling_params,
                     trajectory=trajectory_info[i],
-                    sample_index=i,
+                    prompt_index=int(index[i]),
                     rollout_base_seed=rollout_base_seed,
                 )
             )
@@ -125,7 +125,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         prompt: dict,
         sampling_params: dict,
         trajectory: dict,
-        sample_index: int,
+        prompt_index: int,
         rollout_base_seed: int | None = None,
     ) -> None:
         """Spawn ``rollout.n`` sessions per prompt and write trajectories to TQ."""
@@ -139,7 +139,11 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             for session_id in range(n):
                 run_sampling_params = dict(sampling_params)
                 if rollout_base_seed is not None and not trajectory["validate"]:
-                    run_sampling_params["seed"] = _derive_rollout_seed(rollout_base_seed, sample_index * n + session_id)
+                    # Seed from the global prompt index: each worker only sees a
+                    # chunk of the batch, so a chunk-local position would reuse
+                    # the same seed offsets in every worker and roll out
+                    # duplicated noise (#561).
+                    run_sampling_params["seed"] = _derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params,
