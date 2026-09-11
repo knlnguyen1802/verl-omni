@@ -186,6 +186,8 @@ class FSDPDiffusionActorConfig(DiffusionActorConfig):
     strategy: str = "fsdp"
     grad_clip: float = 1.0
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
+    # Stage training inputs from CPU one timestep at a time.
+    enable_timestep_staging: bool = False
 
     def __post_init__(self):
         """Validate diffusion FSDP actor configuration parameters."""

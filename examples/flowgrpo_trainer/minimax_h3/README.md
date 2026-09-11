@@ -233,6 +233,26 @@ the official reference-image short edge of 2048 by default. Set
 validation to multiples of 32 from 256 through 2048. The validation setting
 defaults to the training value.
 
+### NVIDIA GPU (V1 sync)
+
+The V1 recipes use TransferQueue and ReplayBuffer synchronously. They preserve
+the corresponding V0 model, LoRA, reward, pipeline, and CPS FlowGRPO settings;
+they only select `main_diffusion_v1`, `trainer.use_v1=true`, and
+`trainer.v1.trainer_mode=sync`:
+
+```bash
+# T2VA
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora_v1.sh
+
+# FL2VA
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_fl2va_lora_v1.sh
+```
+
+These recipes use the same GPU topology as their V0 counterparts. A
+`separate_async` MiniMax H3 recipe is not provided: it requires dedicated
+actor/rollout pools and checkpoint-engine synchronization rather than a
+mechanical V1 entrypoint switch.
+
 ### Ascend NPU
 
 ```bash

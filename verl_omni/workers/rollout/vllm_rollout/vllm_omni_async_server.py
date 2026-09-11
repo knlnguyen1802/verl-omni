@@ -21,6 +21,7 @@ from typing import Any, Optional
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
+from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
 from verl.workers.rollout.utils import run_uvicorn
@@ -130,6 +131,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     async def run_server(self, args: argparse.Namespace):
         engine_args = OmniEngineArgs.from_cli_args(args)
         engine_args = asdict(engine_args)
+        engine_args["log_stats"] = not self.config.disable_log_stats
 
         # TODO (mike): drop this patch once vllm-omni strips the serialized default
         # fault_tolerance_config at its kwargs boundary, or vLLM defaults it to None —
@@ -212,11 +214,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         )
 
     # -----------------------------------------------------------------------
-    # wake_up hook: Omni does not restore KV cache on wake-up
+    # wake_up hook: full wake must include kv_cache
     # -----------------------------------------------------------------------
 
     def _get_wake_up_tags(self) -> list[str]:
-        return ["weights"]
+        # AsyncOmni.generate() rejects leftover sleeping tags. Weights-only left
+        # kv_cache asleep and every generate() failed.
+        return ["kv_cache", "weights"]
 
     def _resolve_sleep_level(self) -> int:
         """Level 1 is the correct phase-separation level for vllm-omni diffusion.
@@ -239,10 +243,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             logger.info("skip wake_up in standalone mode")
             return
         resolved_tags = tags if tags is not None else self._get_wake_up_tags()
-        acks = await self.engine.wake_up(tags=resolved_tags)
-        self._validate_acks("wake_up", acks)
-        await self.engine.resume_generation()
-        self._invalidate_lora_request_cache()
+        with RLInsightLogger.trace_state(
+            f"vllm_wake_up[{','.join(resolved_tags)}]", state_lane_id=f"replica_{self.replica_rank}"
+        ):
+            acks = await self.engine.wake_up(tags=resolved_tags)
+            self._validate_acks("wake_up", acks)
+            await self.engine.resume_generation()
+            self._invalidate_lora_request_cache()
 
     async def set_global_steps(self, global_steps: int):
         if global_steps != self.global_steps:
@@ -263,36 +270,44 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
             return
-        acks = await self.engine.sleep(level=self._resolve_sleep_level())
-        self._validate_acks("sleep", acks)
-        await self._reset_frontend_mm_cache()
-        self._invalidate_lora_request_cache()
+        with RLInsightLogger.trace_state("vllm_sleep", state_lane_id=f"replica_{self.replica_rank}"):
+            acks = await self.engine.sleep(level=self._resolve_sleep_level())
+            self._validate_acks("sleep", acks)
+            await self._reset_frontend_mm_cache()
+            self._invalidate_lora_request_cache()
 
     async def release_kv_cache(self):
-        """Free cache around a weight sync without discarding Omni weights."""
+        """Free cache around a weight sync without discarding Omni weights.
+
+        Sleeps both tags then wakes weights only so NCCL can write into the
+        existing buffers. Do not resume generation here: kv_cache is still
+        asleep and AsyncOmni.generate() rejects that state. resume_kv_cache()
+        restores the cache and re-opens admission after the sync.
+        """
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        acks = await self.engine.sleep(level=self._resolve_sleep_level())
-        self._validate_acks("sleep", acks)
-        await self._reset_frontend_mm_cache()
-        self._invalidate_lora_request_cache()
-        acks = await self.engine.wake_up(tags=["weights"])
-        self._validate_acks("wake_up", acks)
-        await self.engine.resume_generation()
-        self._invalidate_lora_request_cache()
+        with RLInsightLogger.trace_state("vllm_release_kv_cache", state_lane_id=f"replica_{self.replica_rank}"):
+            acks = await self.engine.sleep(level=self._resolve_sleep_level())
+            self._validate_acks("sleep", acks)
+            await self._reset_frontend_mm_cache()
+            self._invalidate_lora_request_cache()
+            acks = await self.engine.wake_up(tags=["weights"])
+            self._validate_acks("wake_up", acks)
+            self._invalidate_lora_request_cache()
 
     async def resume_kv_cache(self):
-        """Restore after a weight sync."""
+        """Restore kv_cache after a weight sync and re-open generate admission."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        acks = await self.engine.wake_up(tags=["kv_cache"])
-        self._validate_acks("wake_up", acks)
-        await self.engine.resume_generation()
-        self._invalidate_lora_request_cache()
+        with RLInsightLogger.trace_state("vllm_resume_kv_cache", state_lane_id=f"replica_{self.replica_rank}"):
+            acks = await self.engine.wake_up(tags=["kv_cache"])
+            self._validate_acks("wake_up", acks)
+            await self.engine.resume_generation()
+            self._invalidate_lora_request_cache()
 
     async def resume_generation(self):
         if self.node_rank == 0:

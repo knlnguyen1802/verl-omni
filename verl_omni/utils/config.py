@@ -23,6 +23,11 @@ def _select(config: Any, path: str, default: Any = None) -> Any:
 
 def validate_config(config: Any) -> None:
     """Validate configuration values that otherwise trigger silent fallbacks."""
+    if _select(config, "actor_rollout_ref.actor.enable_timestep_staging", False):
+        sp_size = _select(config, "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size", 1)
+        if sp_size != 1:
+            raise ValueError("Timestep staging requires ulysses_sequence_parallel_size=1.")
+
     resume_mode = _select(config, "trainer.resume_mode")
     valid_resume_modes = ("disable", "auto", "resume_path")
     if resume_mode not in valid_resume_modes:

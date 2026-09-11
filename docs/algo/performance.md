@@ -1,9 +1,60 @@
 (performance)=
 # Performance Reference
 
-Last updated: 09/09/2026
+Last updated: 09/10/2026
 
 Below are reference benchmark results for VeRL-Omni training runs.
+
+## Diffusion actor output retention
+
+The FSDP/FSDP2 PPO and NFT engines discard per-timestep model outputs after
+backward during ordinary training. Losses and metrics are still aggregated, but
+unused prediction/latent tensors are not retained and stacked across all
+timesteps and micro-batches. Forward-only calls keep their complete outputs,
+including reference-policy inference.
+
+Direct engine callers that need outputs during training can opt in using the
+existing verl batch metadata: `tu.assign_non_tensor(batch, return_model_output=True)`.
+The engine result retains the `model_output` key; it is an empty dictionary when
+outputs are discarded. The training worker continues to return metrics only.
+
+This changes output lifetime, not the loss, gradient accumulation, input-trajectory
+placement, or DPO's one-shot update. It does not make total device memory independent
+of trajectory length; capacity and throughput gains require workload-specific measurement.
+
+### Opt-in timestep input staging
+
+For Qwen-Image FlowGRPO or DiffusionNFT training with FSDP/FSDP2 on GPU and
+`ulysses_sequence_parallel_size=1`, enable:
+
+```bash
+actor_rollout_ref.actor.enable_timestep_staging=true
+```
+
+This default-false option keeps the caller's trajectory on CPU, copies shared
+prompt conditions once per micro-batch, and transfers only the current step's
+inputs before forward/backward. PPO transfers the current/next latent pair and
+matching loss fields; NFT keeps the clean latent and any shared noise on device
+and transfers per-step noise when supplied. Dtypes, step order and gradient
+accumulation are unchanged. Unused driver tensors are not copied to the device.
+Consumed tensor inputs must be on CPU and must not require gradients.
+
+The validated scope is `QwenImagePipeline` with `flow_grpo` or `diffusion_nft`
+on GPU, FSDP/FSDP2 and SP=1; see the
+[Qwen-Image README](../../examples/flowgrpo_trainer/qwen_image/README.md#optional-timestep-input-staging).
+The shared engine does not enforce a model/device allowlist; trainer config
+validation rejects sequence parallelism. Inference keeps its existing input/output behavior. Training output
+opt-in still works, but retaining those outputs reintroduces trajectory-length
+dependent output memory.
+
+Direct engine callers can set `tu.assign_non_tensor(batch, enable_timestep_staging=True)`
+on a training batch. The public actor worker supplies this metadata from its actor
+configuration; the reference engine uses the unchanged upstream `FSDPEngineConfig`.
+
+Transfers are synchronous: there is no prefetch, pinned-memory pool, or overlap
+guarantee. Full CPU trajectory storage is unchanged. Measure both peak allocated/
+reserved device memory and update time on the intended workload before choosing
+this memory-for-transfer-cost tradeoff; staging is not a throughput guarantee.
 
 ## DAPO Phase 1: LoRA Training on Qwen3-Omni Thinker AVQA
 

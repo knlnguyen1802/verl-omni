@@ -28,5 +28,8 @@ _target_: verl_omni.workers.config.diffusion.FSDPDiffusionActorConfig
 # Training strategy: fsdp, fsdp2
 strategy: fsdp
 
+# Stage training inputs from CPU per timestep; see the Qwen-Image recipe README.
+enable_timestep_staging: false
+
 # Gradient clipping for actor updates, specific to the strategy.
 grad_clip: 1.0
