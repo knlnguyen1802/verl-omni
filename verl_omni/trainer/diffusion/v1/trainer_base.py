@@ -1533,7 +1533,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return metric_dict
 
     def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
-        data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+        # "responses" carries the full generated images (e.g. ~400MB for a 512x512
+        # batch of 512). Metrics only need scalar metadata + advantages/rewards, so
+        # skip materializing it here; the image count is derived from advantages /
+        # sample_level_scores below. This avoids a large per-step CPU allocation
+        # and a driver memory spike that does not appear in timing_s/*.
+        data = diffusion_tq_batch_to_dataproto(
+            batch_meta,
+            pad_token_id=self.tokenizer.pad_token_id or 0,
+            exclude_fields={"responses"},
+        )
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics_diffusion(batch=data))
         n_gpus = self._get_n_gpus_for_throughput()
@@ -1542,16 +1551,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if "advantages" in data.batch
             else data.batch["sample_level_scores"].shape[0]
         )
-        responses = data.batch.get("responses")
-        real_images = 0
-        if isinstance(responses, torch.Tensor) and responses.numel() > 0 and responses.dim() >= 4:
-            real_images = int(responses.shape[0])
+        # responses was excluded from the read; the real-image count for the
+        # diagnostic log line is approximated by the trajectory count (equal to
+        # the number of real images on a successful step; pad/aborted rows are
+        # already excluded from the sampled keys).
+        real_images = num_images
         logger.info(
-            "Train step=%d: %d trajectories, %d real images, responses shape=%s",
+            "Train step=%d: %d trajectories, %d real images",
             global_steps,
             len(data),
             real_images,
-            tuple(responses.shape) if isinstance(responses, torch.Tensor) else None,
         )
         metrics.update(compute_timing_metrics_diffusion(timing_raw=timing_raw, num_images=num_images))
         metrics.update(compute_throughput_metrics_diffusion(batch=data, timing_raw=timing_raw, n_gpus=n_gpus))
