@@ -189,6 +189,10 @@ class FSDPDiffusionActorConfig(DiffusionActorConfig):
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     # Stage training inputs from CPU one timestep at a time.
     enable_timestep_staging: bool = False
+    # When staging is on, prefetch the next timestep's inputs on a side CUDA stream
+    # so the H2D copy overlaps with the current timestep's forward/backward.
+    # Requires enable_timestep_staging=true. Off by default (sync transfers).
+    enable_timestep_staging_prefetch: bool = False
 
     def __post_init__(self):
         """Validate diffusion FSDP actor configuration parameters."""
