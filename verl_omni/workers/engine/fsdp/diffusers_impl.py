@@ -32,7 +32,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -933,7 +933,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         return step_fields, shared_keys
 
     def _get_prefetch_stream(self):
-        """Lazily create and reuse a side CUDA stream for staging prefetch."""
+        """Lazily create and reuse a side CUDA stream for staging prefetch.
+
+        Returns ``None`` on non-CUDA devices (e.g. NPU) where a CUDA stream is not
+        available; the caller then falls back to synchronous transfers.
+        """
+        if not is_cuda_available:
+            return None
         stream = getattr(self, "_timestep_prefetch_stream", None)
         if stream is None:
             stream = torch.cuda.Stream()
@@ -970,6 +976,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 yield self._stage_step_inputs(micro_batch, shared_batch, step_fields, step)
             return
         prefetch_stream = self._get_prefetch_stream()
+        if prefetch_stream is None:
+            # Non-CUDA device without a side stream: fall back to synchronous staging
+            # so the prefetch flag is a safe no-op there rather than a crash.
+            for step in range(num_timesteps):
+                yield self._stage_step_inputs(micro_batch, shared_batch, step_fields, step)
+            return
         buf = [None, None]
         # Pre-load step 0 on the prefetch stream.
         buf[0] = self._stage_step_inputs(micro_batch, shared_batch, step_fields, 0, prefetch_stream)
