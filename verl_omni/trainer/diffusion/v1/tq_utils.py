@@ -14,7 +14,7 @@
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -91,12 +91,18 @@ def _stack_field(value: Any, padding: float = 0.0) -> torch.Tensor | None:
 def diffusion_tq_batch_to_dataproto(
     batch_meta: KVBatchMeta,
     pad_token_id: int = 0,
+    exclude_fields: Optional[set[str]] = None,
 ) -> DataProto:
     """Read selected TQ rows and assemble a diffusion ``DataProto``.
 
     Args:
         batch_meta: ``KVBatchMeta`` returned by ``ReplayBuffer.sample``.
         pad_token_id: Padding token id for variable-length prompt token tensors.
+        exclude_fields: Optional set of field names whose values should not be
+            stacked into tensors even when present in the TQ rows. Callers that only
+            need scalar metadata (e.g. metrics) can pass large image/video fields
+            here to avoid materializing them (e.g. ~400MB for a 512x512 batch). The
+            field is still popped from the result, so callers must not read it.
 
     Returns:
         ``DataProto`` whose ``batch`` carries diffusion tensors (prompts,
@@ -114,6 +120,11 @@ def diffusion_tq_batch_to_dataproto(
     batch_dict: dict[str, torch.Tensor] = {}
     non_tensor_batch: dict[str, Any] = {}
     for field, value in data.items():
+        if exclude_fields is not None and field in exclude_fields:
+            # Skip stacking heavy fields the caller does not need; this avoids
+            # materializing large image/video tensors (e.g. "responses") when only
+            # scalar metadata is required.
+            continue
         padding = float(pad_token_id) if field == "prompts" else 0.0
         stacked = None
         try:
