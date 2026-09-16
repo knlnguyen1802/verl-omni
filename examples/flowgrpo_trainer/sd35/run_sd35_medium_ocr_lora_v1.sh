@@ -8,6 +8,10 @@
 # TransferQueue is force-enabled inside the runner, so it does not need to be
 # set on the CLI.
 #
+# actor.use_no_sync_for_gradient_accumulation=true defers FSDP2 reduce-scatter
+# until the last denoise-timestep backward of each mini-batch (fork #48). GPU
+# peak-memory vs the default-off twin is not measured on this machine.
+#
 # Reference (legacy v0 script):
 # verl-omni/examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh
 set -x
@@ -69,6 +73,7 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.use_no_sync_for_gradient_accumulation=true \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
