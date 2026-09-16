@@ -1,18 +1,18 @@
 # Diffusion V1 training
 
-Last updated: 09/15/2026
+Last updated: 09/16/2026
 
-This guide runs the diffusion V1 trainer in synchronous or separate-asynchronous
-mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
-Qwen-Image FlowGRPO now has a matching V1 sync LoRA recipe as well. The V1
-trainer uses TransferQueue and ReplayBuffer to move rollout trajectories into
-the training loop. Synchronous mode waits for a complete rollout batch before
-each training step. Wan2.2 DanceGRPO on CUDA also defaults to the V1 sync
-recipe; see {doc}`../examples/dancegrpo_trainer`.
+This guide runs the diffusion V1 trainer in synchronous, colocate-asynchronous,
+or separate-asynchronous mode using the provided Stable Diffusion 3.5 Medium
+FlowGRPO OCR recipes. Qwen-Image FlowGRPO now has a matching V1 sync LoRA recipe
+as well. The V1 trainer uses TransferQueue and ReplayBuffer to move rollout
+trajectories into the training loop. Synchronous mode waits for a complete
+rollout batch before each training step. Wan2.2 DanceGRPO on CUDA also defaults
+to the V1 sync recipe; see {doc}`../examples/dancegrpo_trainer`.
 
-The examples support a single-node NVIDIA GPU setup. Sync mode uses two GPUs for
-the colocated actor and rollout plus one reward GPU. Separate-async mode also
-requires dedicated standalone rollout GPUs.
+The examples support a single-node NVIDIA GPU setup. Sync and colocate-async
+modes use two GPUs for the colocated actor and rollout plus one reward GPU.
+Separate-async mode also requires dedicated standalone rollout GPUs.
 
 ## Prerequisites
 
@@ -119,6 +119,53 @@ See {doc}`../examples/dancegrpo_trainer` for dataset and HPSv3 setup. The
 legacy v0 auto-detect script (`run_wan22_5b_t2v_hpsv3_auto.sh`) is
 **deprecated** for CUDA and remains for NPU.
 
+## Run V1 colocate-async mode
+
+Launch the colocate-async recipe:
+
+```bash
+bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1_colocate_async.sh
+```
+
+Colocate-async overlaps generation and training on one shared GPU pool, with no
+dedicated rollout nodes. The trainer submits
+`trainer.v1.colocate_async.num_warmup_batches` warmup batches before the first
+step, so the next batch is already generating while the current one completes.
+At each sample boundary the trainer aborts in-flight requests and sleeps the
+replicas to free weight memory for the actor update; aborted samples are
+retried as whole samples by `DiffusionWholeSampleRetryLLMServerClient` once
+generation resumes (diffusion has no token-append resume). At step end the
+trainer updates rollout weights and then resumes generation.
+
+The mode is selected with:
+
+```text
+python3 -m verl_omni.trainer.main_diffusion_v1
+trainer.use_v1=true
+trainer.v1.trainer_mode=colocate_async
+trainer.v1.colocate_async.num_warmup_batches=1
+```
+
+`trainer.v1.colocate_async.parameter_sync_step` is pinned to 1: every local
+update samples inside its own abort/sleep window, so multi-update cycles are
+rejected at trainer construction.
+
+A Qwen-Image variant ships as well:
+
+```bash
+bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_v1_colocate_async.sh
+```
+
+Both scripts are GPU-unverified until the smoke run lands. On the first runs,
+watch `timing_s/gen`, `training/off_policy/trajectory_staleness/*`, and the
+`training/rollout_retry/*` abort counters. Each abort boundary adds at most one
+model version to a sample's span, and the TransferQueue row records the true
+span, so the `training/off_policy/*` metrics report real staleness for retried
+samples. `algorithm.rollout_correction` (importance-sampling weights) is
+available as an opt-in correction for the residual off-policy gap; it requires
+`actor_rollout_ref.rollout.calculate_log_probs=True` and raises at training time
+if rollout log-probs are missing.
+
 ## Run V1 separate-async mode
 
 Launch the separate-async recipe:
@@ -206,7 +253,10 @@ bash tests/special_e2e/run_flowgrpo_qwen_image_v1_separate_async.sh
 
 - `trainer.use_v1=true` selects the V1 trainer instead of the legacy diffusion
   trainer.
-- `trainer.v1.trainer_mode` selects `sync` or `separate_async`.
+- `trainer.v1.trainer_mode` selects `sync`, `colocate_async`, or
+  `separate_async`.
+- `trainer.v1.colocate_async.num_warmup_batches` controls how many prompt
+  batches are submitted before the first training step in colocate-async mode.
 - `trainer.v1.separate_async.parameter_sync_step` controls the number of local
   actor updates per rollout-weight synchronization cycle.
 - `trainer.v1.separate_async.hybrid_rollout.enable_switch` lends the colocated
@@ -227,8 +277,8 @@ bash tests/special_e2e/run_flowgrpo_qwen_image_v1_separate_async.sh
   number of in-memory storage units.
 
 The configurable incomplete-group refill policy above applies to `sync` mode.
-In `separate_async`, the upstream async replay buffer automatically evicts and
-replaces stale or failed prompt groups. `colocate_async` is not yet supported.
+In `colocate_async` and `separate_async`, the upstream async replay buffer
+automatically evicts and replaces stale or failed prompt groups.
 
 ## Troubleshooting
 
