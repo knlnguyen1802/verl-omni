@@ -454,6 +454,21 @@ def collect_lora_params(
         adapter_name=adapter_name,
         layered_summon_fn=layered_summon_fn,
     )
+    # Prefix walker only visits ``transformer_blocks.<i>`` FSDP units. LoRA leaf
+    # wrap (verl #6512) and PEFT's full-tree key match both yield {}. Same
+    # fallback as verl.utils.fsdp_utils.collect_lora_params.
+    if not lora_params and layered_summon and base_sync_done:
+        import logging
+
+        logging.getLogger(__name__).warning("layered_summon returned empty, falling back to full PEFT dump")
+        peft_model = getattr(module, "_fsdp_wrapped_module", module)
+        if fsdp_version(module) == 1:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            with FSDP.summon_full_params(module, writeback=False, offload_to_cpu=True):
+                lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
+        else:
+            lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
     if not lora_params:
         if layered_summon:
             detail = (

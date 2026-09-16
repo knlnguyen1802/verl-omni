@@ -63,3 +63,24 @@ def test_fsdp2_non_layered_collects_lora_without_child_units(monkeypatch):
     )
     assert any("lora_" in name for name in params)
     assert all(isinstance(t, torch.Tensor) for t in params.values())
+
+
+def test_layered_diffusers_falls_back_when_prefix_walker_is_empty(monkeypatch):
+    """Qwen-Image e2e: layered_summon=True; prefix walker skips non-block FSDP units."""
+    import verl_omni.utils.fsdp_utils as fsdp_utils
+
+    module = _peft_dit()
+
+    def _version(m):
+        return 2 if m is module else 0
+
+    monkeypatch.setattr(fsdp_utils, "fsdp_version", _version)
+
+    params = collect_lora_params(
+        module,
+        layered_summon=True,
+        base_sync_done=True,
+        is_diffusers=True,
+    )
+    assert any("lora_" in name for name in params)
+    assert all(isinstance(t, torch.Tensor) for t in params.values())
