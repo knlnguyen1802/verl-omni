@@ -242,10 +242,21 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             extra_fields_out["img_shapes"] = extra["img_shapes"]
         if reward_extra_info is not None:
             extra_fields_out["reward_extra_info"] = reward_extra_info
-        # Track the rollout model version this trajectory was generated against.
+        # Track the rollout model version span this trajectory was generated
+        # against. The retry client records the true span across abort-retries;
+        # fall back to the dispatch step for single-attempt samples.
         step = trajectory["step"] if trajectory else global_steps
-        extra_fields_out["min_global_steps"] = step
-        extra_fields_out["max_global_steps"] = step
+        min_global_steps = extra.get("min_global_steps")
+        max_global_steps = extra.get("max_global_steps")
+        if min_global_steps is None:
+            min_global_steps = step
+        if max_global_steps is None:
+            max_global_steps = step
+        extra_fields_out["min_global_steps"] = min_global_steps
+        extra_fields_out["max_global_steps"] = max_global_steps
+        retry_count = extra.get("retry_count")
+        if retry_count is not None:
+            extra_fields_out["retry_count"] = retry_count
         field["extra_fields"] = extra_fields_out
 
         fields_td = list_of_dict_to_tensordict([field])
@@ -258,8 +269,8 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                 "response_len": 1,
                 "seq_len": prompt_len + 1,
                 "global_steps": step,
-                "min_global_steps": step,
-                "max_global_steps": step,
+                "min_global_steps": min_global_steps,
+                "max_global_steps": max_global_steps,
             }
         ]
         await tq.async_kv_batch_put(

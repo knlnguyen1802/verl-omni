@@ -1611,6 +1611,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 }
             )
 
+        # Whole-sample abort/retry counters recorded by the retry client (async modes).
+        retry_counts = data.non_tensor_batch.get("retry_count")
+        if retry_counts is not None:
+            counts = np.array([float(count) for count in retry_counts if count is not None], dtype=float)
+            if counts.size:
+                metrics.update(
+                    {
+                        "training/rollout_retry/count/mean": counts.mean(),
+                        "training/rollout_retry/count/max": counts.max(),
+                        "training/rollout_retry/retried_fraction": (counts > 0).mean(),
+                    }
+                )
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 

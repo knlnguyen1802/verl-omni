@@ -37,6 +37,8 @@ class DiffusionWholeSampleRetryLLMServerClient(LLMServerClient):
     - Track ``min_global_steps`` (earliest version seen) and ``max_global_steps``
       (latest version seen) across attempts and write them onto the final
       output's ``extra_fields`` so off-policy staleness metrics stay correct.
+    - Write ``retry_count`` (number of abort-triggered retries) onto the final
+      output's ``extra_fields`` so abort rates are visible in training metrics.
     - Give up after ``max_retries`` attempts and return the last (aborted) output
       so the agent loop can mark the prompt as a failure.
     """
@@ -99,4 +101,5 @@ class DiffusionWholeSampleRetryLLMServerClient(LLMServerClient):
         if output is not None:
             output.extra_fields["min_global_steps"] = min_global_steps
             output.extra_fields["max_global_steps"] = max_global_steps
+            output.extra_fields["retry_count"] = attempt
         return output
