@@ -590,6 +590,7 @@ trainer:
     sync: {}
     colocate_async:
       num_warmup_batches: 1
+      parameter_sync_step: 1
     separate_async:
       num_warmup_batches: 1
       parameter_sync_step: 4
