@@ -16,6 +16,7 @@
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
@@ -312,3 +313,123 @@ class TestColocatedRewardModeGate:
         trainer = self._bare_trainer("separate_async", ppo_mini_batch_size=2)
         _run_reward_path(trainer, monkeypatch)
         assert trainer.checkpoint_manager.events == [("sleep",), ("update_weights", 1)]
+
+
+class TestRolloutCorrectionOptIn:
+    def _bare_trainer(self, algorithm):
+        trainer = object.__new__(PolicyGradientDiffusionTrainerV1ColocateAsync)
+        trainer.trainer_mode = "colocate_async"
+        trainer.config = OmegaConf.create(
+            {
+                "algorithm": algorithm,
+                "actor_rollout_ref": {
+                    "actor": {"ppo_mini_batch_size": 1},
+                    "rollout": {"n": 1},
+                },
+            }
+        )
+        trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=["rm-worker"])
+        trainer.use_rm = False
+        trainer._is_direct_preference = False
+        trainer.use_reference_policy = False
+        trainer.use_teacher_policy = False
+        trainer.checkpoint_manager = _FakeCheckpointManager()
+        trainer.timing_raw = {}
+        trainer.global_steps = 1
+        trainer.actor_rollout_wg = SimpleNamespace()  # no _query_dispatch_info -> dp_size 1
+        return trainer
+
+    def test_is_weights_applied_when_enabled(self, monkeypatch):
+        monkeypatch.setattr(
+            "verl_omni.trainer.diffusion.v1.trainer_base.put_dataproto_fields_to_tq", lambda *args, **kwargs: None
+        )
+        trainer = self._bare_trainer({"rollout_correction": {"rollout_is": "sequence", "rollout_is_threshold": 2.0}})
+        n = 4
+        trainer._compute_old_log_prob = lambda data: DataProto.from_dict(tensors={"old_log_probs": torch.zeros(n, 2)})
+        trainer._compute_advantage = lambda data: data
+        captured = {}
+
+        def fake_update_actor(data):
+            captured["keys"] = set(data.batch.keys())
+            return DataProto.from_single_dict(data={}, meta_info={"metrics": {}})
+
+        trainer._update_actor = fake_update_actor
+        data = DataProto.from_dict(
+            tensors={
+                "responses": torch.zeros(n, 1, 2, 2),
+                "rollout_log_probs": torch.full((n, 2), 0.1),
+            }
+        )
+        batch_meta = KVBatchMeta(partition_id="train", keys=[f"k{i}" for i in range(n)], tags=[{}] * n)
+        metrics = {}
+        trainer._train_sampled_batch(metrics, trainer.timing_raw, batch_meta, data=data)
+
+        assert "rollout_is_weights" in captured["keys"]
+        assert any(key.startswith("rollout_corr/") for key in metrics)
+
+    def test_missing_rollout_log_probs_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            "verl_omni.trainer.diffusion.v1.trainer_base.put_dataproto_fields_to_tq", lambda *args, **kwargs: None
+        )
+        trainer = self._bare_trainer({"rollout_correction": {"rollout_is": "sequence"}})
+        n = 2
+        trainer._compute_old_log_prob = lambda data: DataProto.from_dict(tensors={"old_log_probs": torch.zeros(n, 2)})
+        data = DataProto.from_dict(tensors={"responses": torch.zeros(n, 1, 2, 2)})
+        batch_meta = KVBatchMeta(partition_id="train", keys=["a", "b"], tags=[{}, {}])
+        with pytest.raises(ValueError, match="rollout_log_probs"):
+            trainer._train_sampled_batch({}, trainer.timing_raw, batch_meta, data=data)
+
+
+class TestRetryMetrics:
+    def test_retry_counters_aggregated(self, monkeypatch):
+        trainer = object.__new__(PolicyGradientDiffusionTrainerV1ColocateAsync)
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+        trainer._get_n_gpus_for_throughput = lambda: 1
+        data = DataProto.from_dict(
+            tensors={
+                "sample_level_rewards": torch.ones(3),
+                "sample_level_scores": torch.ones(3),
+                "responses": torch.zeros(3, 1, 2, 2),
+            },
+        )
+        data.non_tensor_batch["retry_count"] = np.array([0, 2, 1], dtype=object)
+        monkeypatch.setattr(
+            "verl_omni.trainer.diffusion.v1.trainer_base.diffusion_tq_batch_to_dataproto",
+            lambda batch_meta, pad_token_id=0: data,
+        )
+        batch_meta = KVBatchMeta(
+            partition_id="train",
+            keys=["a", "b", "c"],
+            tags=[{"is_padding": False, "min_global_steps": 1, "max_global_steps": 1}] * 3,
+        )
+        metrics = {}
+        trainer._compute_metrics(batch_meta, metrics, {"step": 1.0}, global_steps=2, epoch=0)
+
+        assert metrics["training/rollout_retry/count/mean"] == pytest.approx(1.0)
+        assert metrics["training/rollout_retry/count/max"] == 2.0
+        assert metrics["training/rollout_retry/retried_fraction"] == pytest.approx(2 / 3)
+
+    def test_no_retry_field_no_metrics(self, monkeypatch):
+        trainer = object.__new__(PolicyGradientDiffusionTrainerV1ColocateAsync)
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+        trainer._get_n_gpus_for_throughput = lambda: 1
+        data = DataProto.from_dict(
+            tensors={
+                "sample_level_rewards": torch.ones(2),
+                "sample_level_scores": torch.ones(2),
+                "responses": torch.zeros(2, 1, 2, 2),
+            },
+        )
+        monkeypatch.setattr(
+            "verl_omni.trainer.diffusion.v1.trainer_base.diffusion_tq_batch_to_dataproto",
+            lambda batch_meta, pad_token_id=0: data,
+        )
+        batch_meta = KVBatchMeta(
+            partition_id="train",
+            keys=["a", "b"],
+            tags=[{"is_padding": False, "min_global_steps": 1, "max_global_steps": 1}] * 2,
+        )
+        metrics = {}
+        trainer._compute_metrics(batch_meta, metrics, {"step": 1.0}, global_steps=2, epoch=0)
+
+        assert not any(key.startswith("training/rollout_retry/") for key in metrics)

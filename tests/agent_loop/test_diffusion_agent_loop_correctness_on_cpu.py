@@ -238,6 +238,72 @@ async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(mo
     assert field["condition_image_latents"].shape == (4096, 64)
 
 
+def _make_tq_writer_harness(monkeypatch, extra_fields):
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    captured = {}
+    internal = SimpleNamespace(
+        prompt_ids=torch.tensor([[1, 2]]),
+        response_diffusion_output=torch.zeros(1, 3, 2, 2),
+        response_logprobs=None,
+        reward_score=None,
+        num_turns=2,
+        extra_fields=extra_fields,
+    )
+
+    monkeypatch.setattr(diffusion_agent_loop_tq, "list_of_dict_to_tensordict", lambda rows: rows)
+
+    async def fake_kv_batch_put(*, keys, fields, tags, partition_id):
+        captured.update(keys=keys, fields=fields, tags=tags, partition_id=partition_id)
+
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_batch_put", fake_kv_batch_put)
+    return worker, internal, captured
+
+
+@pytest.mark.asyncio
+async def test_tq_writer_propagates_client_staleness_span_for_retried_samples(monkeypatch):
+    """Aborted-and-retried samples must carry the client-recorded version span."""
+    img_shapes = [(1, 32, 32)]
+    worker, internal, captured = _make_tq_writer_harness(
+        monkeypatch,
+        {
+            "img_shapes": img_shapes,
+            "global_steps": 5,
+            "min_global_steps": 4,
+            "max_global_steps": 5,
+            "retry_count": 1,
+        },
+    )
+
+    await worker._write_trajectory_to_tq(internal, uid="sample", session_id=0, trajectory={"step": 4}, validate=False)
+
+    field = captured["fields"][0]
+    assert field["extra_fields"]["min_global_steps"] == 4
+    assert field["extra_fields"]["max_global_steps"] == 5
+    assert field["extra_fields"]["retry_count"] == 1
+    assert field["extra_fields"]["img_shapes"] == img_shapes
+    tag = captured["tags"][0]
+    assert tag["min_global_steps"] == 4
+    assert tag["max_global_steps"] == 5
+    assert tag["global_steps"] == 4  # dispatch step is unchanged
+
+
+@pytest.mark.asyncio
+async def test_tq_writer_falls_back_to_dispatch_step_without_client_span(monkeypatch):
+    """Single-attempt samples (or a client without span tracking) tag the dispatch step."""
+    worker, internal, captured = _make_tq_writer_harness(monkeypatch, {"global_steps": 3})
+
+    await worker._write_trajectory_to_tq(internal, uid="sample", session_id=0, trajectory={"step": 3}, validate=False)
+
+    field = captured["fields"][0]
+    assert field["extra_fields"]["min_global_steps"] == 3
+    assert field["extra_fields"]["max_global_steps"] == 3
+    assert "retry_count" not in field["extra_fields"]
+    tag = captured["tags"][0]
+    assert tag["min_global_steps"] == 3
+    assert tag["max_global_steps"] == 3
+
+
 def test_tq_batch_restores_non_tensor_trajectory_metadata(monkeypatch):
     img_shapes = [
         [(1, 32, 32), (1, 64, 64)],
