@@ -325,23 +325,20 @@ def _collect_lora_params_non_layered(module, peft_model, adapter_name: str, base
         get_torch_device().empty_cache()
         return lora_params
 
+    # FSDP2 DTensor params all-gather via full_tensor() (same as verl). Do not
+    # pass a child unit's short-key state_dict into get_peft_model_state_dict:
+    # PEFT matches full-model tuner prefixes and returns {}.
+    if base_sync_done:
+        return _peft_lora_params_to_cpu(peft_model, adapter_name)
+
     lora_params = OrderedDict()
     for name, submodule in _iter_fsdp2_submodules(module):
         with FSDP.summon_full_params(submodule, writeback=False):
-            if base_sync_done:
-                sub_lora_params = get_peft_model_state_dict(
-                    peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name
-                )
-                block_prefix = name.replace("_fsdp_wrapped_module.", "")
-                for param_name, param in sub_lora_params.items():
-                    full_name = f"{block_prefix}.{param_name}" if block_prefix else param_name
-                    lora_params[full_name] = _param_to_cpu(param)
-            else:
-                block_prefix = name.replace("_fsdp_wrapped_module.", "")
-                sub_base_params = _collect_base_weights_from_state_dict(submodule.state_dict())
-                for param_name, param in sub_base_params.items():
-                    full_name = f"{block_prefix}.{param_name}" if block_prefix else param_name
-                    lora_params[full_name] = param
+            block_prefix = name.replace("_fsdp_wrapped_module.", "")
+            sub_base_params = _collect_base_weights_from_state_dict(submodule.state_dict())
+            for param_name, param in sub_base_params.items():
+                full_name = f"{block_prefix}.{param_name}" if block_prefix else param_name
+                lora_params[full_name] = param
     get_torch_device().empty_cache()
     return lora_params
 
@@ -458,9 +455,13 @@ def collect_lora_params(
         layered_summon_fn=layered_summon_fn,
     )
     if not lora_params:
-        raise RuntimeError(
-            f"collect_lora_params collected 0 parameters with prefixes={layer_prefixes}. "
-            "Check ``fsdp_layer_prefixes`` in the model config matches the model's "
-            "FSDP layer naming (e.g. ``['transformer_blocks.']`` for DiT models)."
-        )
+        if layered_summon:
+            detail = (
+                f"with prefixes={layer_prefixes}. Check ``fsdp_layer_prefixes`` in the "
+                "model config matches the model's FSDP layer naming "
+                "(e.g. ``['transformer_blocks.']`` for DiT models)."
+            )
+        else:
+            detail = "(FSDP LoRA collection returned no tensors)."
+        raise RuntimeError(f"collect_lora_params collected 0 parameters {detail}")
     return lora_params
