@@ -210,4 +210,7 @@ def test_bagel_pickscore_e2e_uses_merged_lora_like_the_recipe():
     e2e = (repo / "tests/special_e2e/run_flowgrpo_bagel_pickscore.sh").read_text(encoding="utf-8")
     recipe = (repo / "examples/flowgrpo_trainer/bagel/run_bagel_pickscore_lora.sh").read_text(encoding="utf-8")
     assert "actor_rollout_ref.model.lora.merge=True" in recipe
-    assert "actor_rollout_ref.model.lora.merge=True" in e2e
+    assert any(
+        "actor_rollout_ref.model.lora.merge=True" in line and not line.lstrip().startswith("#")
+        for line in e2e.splitlines()
+    )

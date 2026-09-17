@@ -62,6 +62,7 @@ def test_fsdp2_non_layered_collects_lora_without_child_units(monkeypatch):
         is_diffusers=True,
     )
     assert any("lora_" in name for name in params)
+    assert all(".default." not in name for name in params)
     assert all(isinstance(t, torch.Tensor) for t in params.values())
 
 
@@ -83,6 +84,7 @@ def test_layered_diffusers_falls_back_when_prefix_walker_is_empty(monkeypatch):
         is_diffusers=True,
     )
     assert any("lora_" in name for name in params)
+    assert all(".default." not in name for name in params)
     assert all(isinstance(t, torch.Tensor) for t in params.values())
 
 
@@ -93,10 +95,16 @@ def test_layered_collects_fsdp_leaf_lora_when_peft_dump_is_empty(monkeypatch):
 
     import verl_omni.utils.fsdp_utils as fsdp_utils
 
+    class _Adapter(nn.Module):
+        def __init__(self, fill: float):
+            super().__init__()
+            self.weight = nn.Parameter(torch.full((2, 4), fill))
+
     class _LoraA(nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = nn.Parameter(torch.ones(2, 4))
+            self.default = _Adapter(1.0)
+            self.old = _Adapter(2.0)
 
     class _Attn(nn.Module):
         def __init__(self):
@@ -132,5 +140,5 @@ def test_layered_collects_fsdp_leaf_lora_when_peft_dump_is_empty(monkeypatch):
         base_sync_done=True,
         is_diffusers=True,
     )
-    assert any(name.endswith("lora_A.weight") for name in params)
-    assert all(isinstance(t, torch.Tensor) for t in params.values())
+    assert list(params) == ["transformer_blocks.0.attn.lora_A.weight"]
+    torch.testing.assert_close(params["transformer_blocks.0.attn.lora_A.weight"], torch.ones(2, 4))
