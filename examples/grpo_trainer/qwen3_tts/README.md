@@ -1,6 +1,6 @@
 # Qwen3-TTS GRPO with an audio reward
 
-Last updated: 09/11/2026.
+Last updated: 09/15/2026.
 
 This example full-parameter tunes the codec-0 policy of
 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`. It uses verl's stock GRPO advantage,
@@ -38,13 +38,15 @@ uv pip install -e ".[gpu]" --torch-backend=auto
 uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
 uv pip install -e ".[omni,train,dev]"
 uv pip install --no-deps --reinstall \
-  "qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git@$(cat .github/qwen_tts_pin.txt)"
+  "qwen-tts @ https://github.com/QwenLM/Qwen3-TTS/archive/$(cat .github/qwen_tts_pin.txt).tar.gz"
 ```
 
 The pinned Qwen3-TTS revision is the upstream Transformers 5 support change
 from Qwen3-TTS PR #360. Its package metadata requires Transformers 5.15.1 or
 newer, while this repository intentionally caps Transformers at 5.14.1. The
-`--no-deps` flag preserves that repository-wide cap; the `omni` extra owns the
+commit archive keeps the exact revision installable even when its source branch
+is no longer advertised by the upstream Git remote. The `--no-deps` flag
+preserves the repository-wide cap; the `omni` extra owns the
 runtime dependencies, including `torchaudio==2.11.0` to match vLLM's Torch pin,
 and CI tests the exact Qwen3-TTS revision from `.github/qwen_tts_pin.txt` on this
 stack. The released `qwen-tts==0.1.1` source targets Transformers 4.57.3 and
