@@ -514,9 +514,7 @@ def collect_lora_params(
         else:
             lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
         if not lora_params:
-            logging.getLogger(__name__).warning(
-                "full PEFT dump returned empty, collecting LoRA from FSDP units"
-            )
+            logging.getLogger(__name__).warning("full PEFT dump returned empty, collecting LoRA from FSDP units")
             lora_params = _collect_lora_params_from_fsdp_units(module)
     if not lora_params:
         if layered_summon:
