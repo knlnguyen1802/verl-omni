@@ -81,6 +81,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     rollout_correction_enabled,
 )
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
+from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.tracking import _export_video, batch_items, log_wandb_media, wrap_val_samples_for_wandb
 from verl_omni.workers.config.reward import reward_is_enabled, reward_role_required, streaming_reward_enabled
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
@@ -104,10 +105,7 @@ def validate_separate_config(config) -> None:
         raise ValueError("Separate mode requires actor_rollout_ref.hybrid_engine=false.")
 
     model = config.actor_rollout_ref.model
-    lora_rank = (model.get("lora") or {}).get("rank", 0) or 0
-    legacy_lora_rank = model.get("lora_rank", 0) or 0
-    lora_adapter_path = model.get("lora_adapter_path")
-    if lora_rank > 0 or legacy_lora_rank > 0 or lora_adapter_path is not None:
+    if resolve_lora_config(model).enabled:
         raise ValueError(
             "Separate mode currently supports full finetuning only; "
             "actor_rollout_ref.model.lora.rank, actor_rollout_ref.model.lora_rank, and "
@@ -245,10 +243,7 @@ class BaseRayDiffusionTrainer(ABC):
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        self.ref_in_actor = resolve_lora_config(config.actor_rollout_ref.model).enabled
         if self.separate and self.use_reference_policy and not self.ref_in_actor:
             if Role.RefPolicy not in role_worker_mapping:
                 raise ValueError(

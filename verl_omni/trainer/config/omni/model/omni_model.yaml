@@ -123,60 +123,16 @@ mtp:
   method: mtp
   num_speculative_tokens: 1
 
-# LoRA (Low-Rank Adaptation) configuration
+# LoRA (Low-Rank Adaptation) configuration.
+# verl-omni reads only merge from this nested block; every other LoRA knob is
+# a flat model field (lora_rank, lora_alpha, target_modules, ...). The pinned
+# verl config additionally merges its Megatron-only lora keys into this block
+# at composition time; those are tolerated but unread
+# (verl_omni.utils.config.resolve_lora_config).
 lora:
 
-  # LoRA type: "lora", "dora", etc.
-  type: lora
-
-  # whether to merge LoRA into base weights before transferring to vLLM
+  # whether to merge LoRA into the base weights before transferring to vLLM
   merge: False
-
-  # LoRA rank (set to 0 to disable)
-  rank: 0
-
-  # LoRA alpha scaling factor
-  alpha: 32
-
-  # LoRA dropout rate
-  dropout: 0.0
-
-  # A list of module names to apply LoRA to
-  target_modules:
-    - linear_qkv
-    - linear_proj
-    - linear_fc1
-    - linear_fc2
-
-  # A list of module names not to apply LoRA to
-  exclude_modules: []
-
-  # Position for applying dropout: "pre" or "post"
-  dropout_position: pre
-
-  # Initialization method for LoRA A
-  lora_A_init_method: xavier
-
-  # Initialization method for LoRA B
-  lora_B_init_method: zero
-
-  # Enables experimental All-to-All communication strategy
-  a2a_experimental: False
-
-  # Parameter dtype for LoRA weights (null = use model dtype)
-  dtype: null
-
-  # Path to pre-trained LoRA adapter weights
-  adapter_path: null
-
-  # VLMLoRA: whether to freeze the vision model
-  freeze_vision_model: True
-
-  # VLMLoRA: whether to freeze the vision projection
-  freeze_vision_projection: True
-
-  # VLMLoRA: whether to freeze the language model
-  freeze_language_model: True
 
 # Multimodal token budget
 max_image_tokens: null

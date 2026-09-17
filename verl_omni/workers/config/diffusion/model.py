@@ -96,7 +96,9 @@ class DiffusionModelConfig(BaseConfig):
 
     exclude_modules: Optional[str] = None
 
-    # megatron lora config
+    # LoRA sync mode; verl-omni reads only lora.merge here. Keys outside the
+    # merge/rank set raise unless injected by the pinned verl config
+    # (see verl_omni.utils.config.resolve_lora_config)
     lora: dict[str, Any] = field(default_factory=dict)
 
     # path to pre-trained LoRA adapter to load for continued training
