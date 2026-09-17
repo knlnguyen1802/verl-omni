@@ -122,12 +122,8 @@ def test_layered_collects_fsdp_leaf_lora_when_peft_dump_is_empty(monkeypatch):
             self.transformer_blocks = nn.ModuleList([_Block()])
 
     module = _Tiny()
-    leaf = module.transformer_blocks[0].attn.lora_A
 
-    def _version(m):
-        return 1 if m is module or m is leaf else 0
-
-    monkeypatch.setattr(fsdp_utils, "fsdp_version", _version)
+    monkeypatch.setattr(fsdp_utils, "fsdp_version", lambda m: 1 if m is module else 0)
     monkeypatch.setattr(fsdp_utils, "_peft_lora_params_to_cpu", lambda *args, **kwargs: OrderedDict())
     monkeypatch.setattr(
         "torch.distributed.fsdp.FullyShardedDataParallel.summon_full_params",
