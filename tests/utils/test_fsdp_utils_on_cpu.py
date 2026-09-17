@@ -62,4 +62,79 @@ def test_fsdp2_non_layered_collects_lora_without_child_units(monkeypatch):
         is_diffusers=True,
     )
     assert any("lora_" in name for name in params)
+    assert all(".default." not in name for name in params)
     assert all(isinstance(t, torch.Tensor) for t in params.values())
+
+
+def test_layered_diffusers_falls_back_when_prefix_walker_is_empty(monkeypatch):
+    """Qwen-Image e2e: layered_summon=True; prefix walker skips non-block FSDP units."""
+    import verl_omni.utils.fsdp_utils as fsdp_utils
+
+    module = _peft_dit()
+
+    def _version(m):
+        return 2 if m is module else 0
+
+    monkeypatch.setattr(fsdp_utils, "fsdp_version", _version)
+
+    params = collect_lora_params(
+        module,
+        layered_summon=True,
+        base_sync_done=True,
+        is_diffusers=True,
+    )
+    assert any("lora_" in name for name in params)
+    assert all(".default." not in name for name in params)
+    assert all(isinstance(t, torch.Tensor) for t in params.values())
+
+
+def test_layered_collects_fsdp_leaf_lora_when_peft_dump_is_empty(monkeypatch):
+    """Qwen-Image-Edit: named targets + FSDP1 leaf wrap; PEFT prefix dump is {}."""
+    from collections import OrderedDict
+    from contextlib import nullcontext
+
+    import verl_omni.utils.fsdp_utils as fsdp_utils
+
+    class _Adapter(nn.Module):
+        def __init__(self, fill: float):
+            super().__init__()
+            self.weight = nn.Parameter(torch.full((2, 4), fill))
+
+    class _LoraA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.default = _Adapter(1.0)
+            self.old = _Adapter(2.0)
+
+    class _Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_A = _LoraA()
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = _Attn()
+
+    class _Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = nn.ModuleList([_Block()])
+
+    module = _Tiny()
+
+    monkeypatch.setattr(fsdp_utils, "fsdp_version", lambda m: 1 if m is module else 0)
+    monkeypatch.setattr(fsdp_utils, "_peft_lora_params_to_cpu", lambda *args, **kwargs: OrderedDict())
+    monkeypatch.setattr(
+        "torch.distributed.fsdp.FullyShardedDataParallel.summon_full_params",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    params = collect_lora_params(
+        module,
+        layered_summon=True,
+        base_sync_done=True,
+        is_diffusers=True,
+    )
+    assert list(params) == ["transformer_blocks.0.attn.lora_A.weight"]
+    torch.testing.assert_close(params["transformer_blocks.0.attn.lora_A.weight"], torch.ones(2, 4))
