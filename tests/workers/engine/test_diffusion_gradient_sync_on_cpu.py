@@ -61,9 +61,7 @@ def _engine(monkeypatch):
 
 
 def _timestep_batch(n_micro=2, n_steps=3):
-    micro_batches = [
-        TensorDict({"all_timesteps": torch.zeros(1, n_steps)}, batch_size=[1]) for _ in range(n_micro)
-    ]
+    micro_batches = [TensorDict({"all_timesteps": torch.zeros(1, n_steps)}, batch_size=[1]) for _ in range(n_micro)]
     data = TensorDict({"all_timesteps": torch.zeros(n_micro, n_steps)}, batch_size=[n_micro])
     return data, micro_batches
 
@@ -74,7 +72,9 @@ def test_timestep_loop_defers_until_last_pair(monkeypatch):
     tu.assign_non_tensor(data, use_no_sync_for_gradient_accumulation=True)
     monkeypatch.setattr(diffusers_impl, "prepare_micro_batches", lambda **_: (micro_batches, None))
 
-    engine._run_forward_backward_batch(data, loss_function=lambda **_: None, forward_only=False, timesteps_key="all_timesteps")
+    engine._run_forward_backward_batch(
+        data, loss_function=lambda **_: None, forward_only=False, timesteps_key="all_timesteps"
+    )
 
     assert sync_states == [False, False, False, False, False, True]
 
@@ -84,7 +84,9 @@ def test_flag_off_never_enters_sync_context(monkeypatch):
     data, micro_batches = _timestep_batch()
     monkeypatch.setattr(diffusers_impl, "prepare_micro_batches", lambda **_: (micro_batches, None))
 
-    engine._run_forward_backward_batch(data, loss_function=lambda **_: None, forward_only=False, timesteps_key="all_timesteps")
+    engine._run_forward_backward_batch(
+        data, loss_function=lambda **_: None, forward_only=False, timesteps_key="all_timesteps"
+    )
 
     assert sync_states == []
 
@@ -95,7 +97,9 @@ def test_forward_only_never_enters_sync_context(monkeypatch):
     tu.assign_non_tensor(data, use_no_sync_for_gradient_accumulation=True)
     monkeypatch.setattr(diffusers_impl, "prepare_micro_batches", lambda **_: (micro_batches, None))
 
-    engine._run_forward_backward_batch(data, loss_function=lambda **_: None, forward_only=True, timesteps_key="all_timesteps")
+    engine._run_forward_backward_batch(
+        data, loss_function=lambda **_: None, forward_only=True, timesteps_key="all_timesteps"
+    )
 
     assert sync_states == []
 

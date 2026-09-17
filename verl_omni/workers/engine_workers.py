@@ -899,9 +899,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         tu.assign_non_tensor(data, enable_timestep_staging=self.config.actor.get("enable_timestep_staging", False))
         tu.assign_non_tensor(
             data,
-            use_no_sync_for_gradient_accumulation=self.config.actor.get(
-                "use_no_sync_for_gradient_accumulation", False
-            ),
+            use_no_sync_for_gradient_accumulation=self.config.actor.get("use_no_sync_for_gradient_accumulation", False),
         )
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None

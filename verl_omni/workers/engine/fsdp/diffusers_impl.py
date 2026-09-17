@@ -1009,9 +1009,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             with ctx:
                 for step in range(num_timesteps):
                     is_last = micro_idx == n_micro - 1 and step == num_timesteps - 1
-                    sync_ctx = (
-                        self._gradient_sync_context(is_last_micro_batch=is_last) if defer_sync else nullcontext()
-                    )
+                    sync_ctx = self._gradient_sync_context(is_last_micro_batch=is_last) if defer_sync else nullcontext()
                     if stage_inputs:
                         step_batch = shared_batch.clone(recurse=False)
                         for key, width in step_fields.items():
