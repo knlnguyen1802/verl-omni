@@ -32,7 +32,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -932,6 +932,71 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 raise ValueError(f"Timestep staging requires CPU inputs without gradients, got {key!r}.")
         return step_fields, shared_keys
 
+    def _get_prefetch_stream(self):
+        """Lazily create and reuse a side CUDA stream for staging prefetch.
+
+        Returns ``None`` on non-CUDA devices (e.g. NPU) where a CUDA stream is not
+        available; the caller then falls back to synchronous transfers.
+        """
+        if not is_cuda_available:
+            return None
+        stream = getattr(self, "_timestep_prefetch_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream()
+            self._timestep_prefetch_stream = stream
+        return stream
+
+    def _stage_step_inputs(self, micro_batch, shared_batch, step_fields, step, stream=None):
+        """Build one timestep's step_batch by copying its slice of each step field to device.
+
+        When ``stream`` is given the H2D copy is issued non-blocking on that stream so
+        it can overlap with forward/backward compute on the default stream. The caller
+        must ``synchronize()`` the stream before reading the returned tensors.
+        """
+        step_batch = shared_batch.clone(recurse=False)
+        non_blocking = stream is not None
+        for key, width in step_fields.items():
+            step_batch[key] = micro_batch[key][:, step : step + width].to(
+                get_device_id(), non_blocking=non_blocking
+            )
+        return step_batch
+
+    def _staged_step_batches(self, micro_batch, shared_batch, step_fields, num_timesteps, prefetch):
+        """Yield per-timestep step_batch, prefetching the next step on a side stream.
+
+        With ``prefetch=False`` this is equivalent to the original synchronous path:
+        each step's inputs are copied to the device just-in-time. With
+        ``prefetch=True`` a side CUDA stream issues the next step's H2D copy before the
+        current step's forward/backward, so the transfer overlaps with compute. Two
+        buffers ping-pong so the in-flight prefetch never overwrites the buffer the
+        current step is reading.
+        """
+        if not prefetch:
+            for step in range(num_timesteps):
+                yield self._stage_step_inputs(micro_batch, shared_batch, step_fields, step)
+            return
+        prefetch_stream = self._get_prefetch_stream()
+        if prefetch_stream is None:
+            # Non-CUDA device without a side stream: fall back to synchronous staging
+            # so the prefetch flag is a safe no-op there rather than a crash.
+            for step in range(num_timesteps):
+                yield self._stage_step_inputs(micro_batch, shared_batch, step_fields, step)
+            return
+        buf = [None, None]
+        # Pre-load step 0 on the prefetch stream.
+        buf[0] = self._stage_step_inputs(micro_batch, shared_batch, step_fields, 0, prefetch_stream)
+        for step in range(num_timesteps):
+            # Ensure this step's prefetched inputs have landed on the device.
+            prefetch_stream.synchronize()
+            step_batch = buf[step % 2]
+            # Issue the next step's H2D on the prefetch stream so it overlaps with
+            # this step's forward/backward on the default stream.
+            if step + 1 < num_timesteps:
+                buf[(step + 1) % 2] = self._stage_step_inputs(
+                    micro_batch, shared_batch, step_fields, step + 1, prefetch_stream
+                )
+            yield step_batch
+
     def _merged_lora_per_tensor_param(self):
         """Stream merged (base + LoRA) weights for rollout weight sync.
 
@@ -974,6 +1039,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         timesteps_key: str,
     ) -> dict:
         stage_inputs = tu.get_non_tensor_data(data, "enable_timestep_staging", default=False) and not forward_only
+        stage_prefetch = stage_inputs and tu.get_non_tensor_data(
+            data, "enable_timestep_staging_prefetch", default=False
+        )
         if stage_inputs:
             step_fields, shared_keys = self._prepare_timestep_staging(data, timesteps_key)
         num_timesteps = int(data[timesteps_key].shape[1])
@@ -998,11 +1066,16 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             meta_info_lst = {"model_output": [], "loss": [], "metrics": []}
             # Forward and backward for each timestep
             with ctx:
+                staged_iter = (
+                    self._staged_step_batches(
+                        micro_batch, shared_batch, step_fields, num_timesteps, stage_prefetch
+                    )
+                    if stage_inputs
+                    else None
+                )
                 for step in range(num_timesteps):
                     if stage_inputs:
-                        step_batch = shared_batch.clone(recurse=False)
-                        for key, width in step_fields.items():
-                            step_batch[key] = micro_batch[key][:, step : step + width].to(get_device_id())
+                        step_batch = next(staged_iter)
                     else:
                         step_batch = micro_batch
                     loss, meta_info = self.forward_step(
