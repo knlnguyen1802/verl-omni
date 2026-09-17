@@ -164,10 +164,10 @@ changed ratio while the rollout weights stay bit-identical to a full broadcast.
 
 `delta_sharded` is gated: it requires `separate_async` mode and full-weight
 training (LoRA configs raise at startup, since adapter sync is already small),
-and QAT exports are refused. The Qwen-Image full-weight recipe is:
+and QAT exports are refused. The SD3.5-Medium full-weight recipe is:
 
 ```bash
-bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_v1_separate_async_delta.sh
+bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_v1_separate_async_delta.sh
 ```
 
 This backend is covered by CPU unit tests only so far; the sparsity preflight

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen-Image full-weight OCR recipe (V1 trainer: separate_async mode) with the
+# SD3.5-Medium full-weight OCR recipe (V1 trainer: separate_async mode) with the
 # delta_sharded checkpoint engine (RFC #38).
 #
 # NOT YET GPU-VERIFIED. This recipe is covered by CPU unit tests only; the
@@ -8,8 +8,8 @@
 # as a supported recipe. See docs/start/diffusion_v1.md ("Weight-sync
 # backends").
 #
-# This is the delta counterpart of run_qwen_image_ocr.sh (full-weight v0) on
-# the separate-async wiring of run_sd35_medium_ocr_lora_v1_separate_async.sh.
+# This is the delta counterpart of a full-weight SD3.5 OCR run on the
+# separate-async wiring of run_sd35_medium_ocr_lora_v1_separate_async.sh.
 # delta_sharded broadcasts only the weights that changed since the last sync:
 # the first (seed) sync streams the full export, steady syncs ship sparse
 # (position, value) updates, and the rollout verifies a per-flush checksum and
@@ -33,12 +33,13 @@ set -x
 # Set OCR_WORKSPACE or WORKSPACE to any writable directory; defaults to $HOME.
 WORKSPACE=${OCR_WORKSPACE:-${WORKSPACE:-$HOME}}
 
-ocr_train_path=$WORKSPACE/data/ocr/qwen_image/train.parquet
-ocr_test_path=$WORKSPACE/data/ocr/qwen_image/test.parquet
+ocr_train_path=$WORKSPACE/data/ocr/sd3/train.parquet
+ocr_test_path=$WORKSPACE/data/ocr/sd3/test.parquet
 
-model_name=Qwen/Qwen-Image
-reward_model_name=Qwen/Qwen3-VL-8B-Instruct
+model_name=stabilityai/stable-diffusion-3.5-medium
+reward_model_name=Qwen/Qwen2.5-VL-3B-Instruct
 reward_function_path=verl_omni/utils/reward_score/genrm_ocr.py
+custom_chat_template='{% for message in messages %}{% if message['\''role'\''] == '\''user'\'' %}{{ message['\''content'\''] }}{% endif %}{% endfor %}'
 
 # --- GPU / parallelism layout (override via env) ---
 NUM_GPUS_ACTOR=${NUM_GPUS_ACTOR:-2}          # colocated actor + rollout
@@ -46,8 +47,11 @@ NUM_GPUS_STANDALONE=${NUM_GPUS_STANDALONE:-2} # dedicated standalone rollout
 NUM_GPUS_REWARD=${NUM_GPUS_REWARD:-1}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 REWARD_TP=${REWARD_TP:-1}
-IMAGE_RESOLUTION=${IMAGE_RESOLUTION:-512}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-300}
+IMAGE_RESOLUTION=${IMAGE_RESOLUTION:-384}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-100}
+ATTN_BACKEND=${ATTN_BACKEND:-native}
+ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND:-TORCH_SDPA}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 
 # Separate-async specific knobs.
 CKPT_BACKEND=${CKPT_BACKEND:-delta_sharded}
@@ -57,17 +61,17 @@ NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-0}
 PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1}
 MAX_OFF_POLICY_THRESHOLD=${MAX_OFF_POLICY_THRESHOLD:-1}
 MAX_OFF_POLICY_STRATEGY=${MAX_OFF_POLICY_STRATEGY:-drop}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 PPO_MINI_BATCH_SIZE=$((TRAIN_BATCH_SIZE / PARAMETER_SYNC_STEP))
 # Pause the standalone rollout during actor training (abort + remove from
 # balancer on on_sample_end, resume after weight sync on on_step_end). Set to
 # 0 to allow async generation overlap.
 SYNC_COMPATIBLE=${SYNC_COMPATIBLE:-1}
 
-# Keep step-wise rollout and old-log-prob recomputation batch shapes aligned
-# (see run_qwen_image_ocr.sh).
-LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-${LOG_PROB_MICRO_BATCH_SIZE}}
+if [ "${FA3:-0}" = "1" ]; then
+    ATTN_BACKEND="_flash_3_varlen_hub"
+    ROLLOUT_ATTN_BACKEND=FLASH_ATTN_3_HUB
+fi
 
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
@@ -105,23 +109,34 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     data.train_files=$ocr_train_path \
     data.val_files=$ocr_test_path \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
-    data.max_prompt_length=256 \
+    data.val_max_samples=32 \
+    data.max_prompt_length=512 \
+    data.truncation=error \
+    data.seed=42 \
     actor_rollout_ref.model.algorithm=flow_grpo \
+    actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-5 \
     actor_rollout_ref.model.path=$model_name \
+    actor_rollout_ref.model.custom_chat_template="\"$custom_chat_template\"" \
+    'actor_rollout_ref.model.extra_tokenizers={clip: {path: tokenizer, max_length: 77}, t5: {path: tokenizer_3, max_length: 256}}' \
+    actor_rollout_ref.model.attn_backend=$ATTN_BACKEND \
+    actor_rollout_ref.rollout.rollout_attn_backend=$ROLLOUT_ATTN_BACKEND \
     actor_rollout_ref.actor.optim.lr=3e-5 \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-5 \
-    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE} \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.n=16 \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.seed=42 \
     actor_rollout_ref.rollout.nnodes=1 \
     actor_rollout_ref.rollout.n_gpus_per_node=$NUM_GPUS_STANDALONE \
@@ -129,19 +144,20 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.delta_sharded.encoding=indices \
     actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS_ACTOR / ROLLOUT_TP)) \
     actor_rollout_ref.rollout.load_format=safetensors \
-    actor_rollout_ref.rollout.layered_summon=True \
-    actor_rollout_ref.rollout.pipeline.true_cfg_scale=1.0 \
     actor_rollout_ref.rollout.pipeline.height=$IMAGE_RESOLUTION \
     actor_rollout_ref.rollout.pipeline.width=$IMAGE_RESOLUTION \
+    actor_rollout_ref.rollout.pipeline.num_inference_steps=10 \
+    actor_rollout_ref.rollout.pipeline.guidance_scale=1.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length=256 \
-    actor_rollout_ref.rollout.algo.noise_level=1.2 \
-    actor_rollout_ref.rollout.algo.sde_type="sde" \
-    actor_rollout_ref.rollout.algo.sde_window_size=2 \
+    actor_rollout_ref.rollout.max_prompt_embed_length=333 \
+    actor_rollout_ref.rollout.algo.noise_level=0.8 \
+    actor_rollout_ref.rollout.algo.sde_type="cps" \
+    actor_rollout_ref.rollout.algo.sde_window_size=3 \
     actor_rollout_ref.rollout.algo.sde_window_range="[0,5]" \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=50 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=$MAX_NUM_SEQS \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=28 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     reward.num_workers=$((NUM_GPUS_REWARD / REWARD_TP)) \
     reward.reward_model.enable=True \
     reward.reward_model.model_path=$reward_model_name \
@@ -152,17 +168,18 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     reward.reward_model.rollout.gpu_memory_utilization=0.9 \
     reward.reward_model.rollout.free_cache_engine=False \
     reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
+    reward.reward_model.rollout.enforce_eager=False \
     reward.custom_reward_function.path=$reward_function_path \
     reward.custom_reward_function.name=compute_score_ocr \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name=flow_grpo \
-    trainer.experiment_name=qwen_image_ocr_v1_separate_async_delta \
+    trainer.experiment_name=sd35_medium_ocr_v1_separate_async_delta \
     trainer.log_val_generations=8 \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR \
     trainer.nnodes=1 \
-    trainer.save_freq=30 \
-    trainer.test_freq=30 \
+    trainer.save_freq=100 \
+    trainer.test_freq=20 \
     trainer.total_epochs=15 \
     trainer.total_training_steps=$TOTAL_TRAINING_STEPS \
     trainer.use_v1=true \
