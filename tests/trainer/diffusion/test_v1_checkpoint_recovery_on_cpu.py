@@ -254,6 +254,8 @@ def test_warmup_tops_up_inflight_prompts(monkeypatch, statuses, expected_submiss
             "trainer": {"v1": {"separate_async": {"num_warmup_batches": 2}}},
         }
     )
+    # Skip the hybrid reclaim branch; this test only covers warmup top-up math.
+    trainer.hybrid_rollout_config = SimpleNamespace(enable_switch=True)
     submitted = []
     trainer._add_batch_to_generate = lambda: submitted.append(("batch", 2))
     trainer._add_prompts_to_generate = lambda count: submitted.append(("prompts", count))
