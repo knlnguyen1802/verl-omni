@@ -18,7 +18,7 @@ FSDP utilities for verl-omni
 import json
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -416,6 +416,50 @@ def _layered_summon_lora_params_diffusers(
     return lora_params
 
 
+def _collect_lora_params_from_fsdp_units(fsdp_module) -> OrderedDict:
+    """Collect LoRA tensors from every FSDP unit, including LoRA leaf wrap.
+
+    Verl's walker skips a unit unless a *local* param name contains ``lora_``.
+    FSDP1 ``min_num_params: 0`` wraps ``lora_A``/``lora_B`` Linears, so the
+    local name is ``weight`` and the LoRA identity lives in the module path.
+    PEFT prefix-matching against that short-key dict (and against a root dump
+    whose keys lost nested ``_fsdp_wrapped_module``) both yield {}.
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from verl.utils.device import get_torch_device
+
+    lora_params = OrderedDict()
+    for name, submodule in fsdp_module.named_modules():
+        if name == "" or fsdp_version(submodule) == 0:
+            continue
+        clean_prefix = name.replace("_fsdp_wrapped_module.", "")
+        nested_fsdp_names = {n for n, m in submodule.named_modules() if n != "" and fsdp_version(m) > 0}
+        if "lora_" not in clean_prefix and not any(
+            "lora_" in n
+            for n, _ in submodule.named_parameters()
+            if not any(n.startswith(f"{nn}.") for nn in nested_fsdp_names)
+        ):
+            continue
+        is_fsdp1 = fsdp_version(submodule) == 1
+        if is_fsdp1:
+            submodule._is_root = True
+        summon_ctx = FSDP.summon_full_params(submodule, writeback=False) if is_fsdp1 else nullcontext()
+        with summon_ctx:
+            for param_name, param in submodule.named_parameters():
+                if any(param_name.startswith(f"{nn}.") for nn in nested_fsdp_names):
+                    continue
+                if "_flat_param" in param_name:
+                    continue
+                full_name = f"{clean_prefix}.{param_name}" if clean_prefix else param_name
+                if "lora_" not in full_name:
+                    continue
+                lora_params[full_name] = _param_to_cpu(param)
+            if is_fsdp1:
+                submodule._is_root = False
+        get_torch_device().empty_cache()
+    return lora_params
+
+
 def collect_lora_params(
     module,
     layered_summon: bool,
@@ -469,6 +513,11 @@ def collect_lora_params(
                 lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
         else:
             lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
+        if not lora_params:
+            logging.getLogger(__name__).warning(
+                "full PEFT dump returned empty, collecting LoRA from FSDP units"
+            )
+            lora_params = _collect_lora_params_from_fsdp_units(module)
     if not lora_params:
         if layered_summon:
             detail = (
