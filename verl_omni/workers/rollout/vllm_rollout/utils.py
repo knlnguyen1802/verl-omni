@@ -17,10 +17,10 @@ import time
 
 import torch
 from verl.utils.device import get_visible_devices_keyword
+from verl.utils.vllm import VLLMHijack
 from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, set_death_signal
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 
-from verl_omni.utils.vllm_omni import OmniTensorLoRARequest, VLLMOmniHijack
 from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_handle
 
 logger = logging.getLogger(__file__)
@@ -51,8 +51,10 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     def __new__(cls, **kwargs):
         set_death_signal()
 
-        # 1. patch for Lora
-        VLLMOmniHijack.hijack()
+        # 1. patch for LoRA on AR (standard vLLM) workers: verl's base hijack
+        #    lets vLLM load adapters from TensorLoRARequest tensors. Diffusion
+        #    workers need no patch: vllm-omni loads TensorLoRARequest natively.
+        VLLMHijack.hijack()
 
         return super().__new__(cls)
 
@@ -67,16 +69,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         later full-weight sync is not misrouted.
         """
         self._pending_lora_peft_config = peft_config
-
-    def _move_diffusion_lora_stacks_to_device(self) -> None:
-        """Move unregistered LoRA stacks to the worker device before execution."""
-        # TODO(@NancyFyong): Move this into vLLM-Omni's DiffusionLoRAManager.
-        manager = getattr(self, "lora_manager", None)
-        for module in getattr(manager, "_lora_modules", {}).values():
-            for name in ("lora_a_stacked", "lora_b_stacked"):
-                tensors = getattr(module, name, None)
-                if tensors is not None:
-                    setattr(module, name, tuple(tensor.to(self.device, non_blocking=True) for tensor in tensors))
 
     def _get_standard_weight_model_and_config(self):
         """Return ``(model, model_config)`` for the standard (non-LoRA) AR weight path.
@@ -152,32 +144,23 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                 lora_total_bytes / (1024 * 1024),
             )
 
-            # AR (standard vLLM) workers go through verl's base VLLMHijack, which
-            # dispatches on ``isinstance(req, TensorLoRARequest)``; diffusion workers
-            # go through vllm-omni's DiffusionLoRAManager, which expects the
-            # OmniLoRARequest-derived ``OmniTensorLoRARequest``. Pick by worker type.
+            # Both engine flavors take a TensorLoRARequest named after their
+            # own stack: AR workers go through verl's base VLLMHijack on vLLM
+            # core, diffusion workers through vllm-omni's DiffusionLoRAManager.
             if self._get_standard_weight_model_and_config() is not None:
-                from verl.utils.vllm.utils import TensorLoRARequest
-
-                lora_request = TensorLoRARequest(
-                    lora_name=VLLM_LORA_NAME,
-                    lora_int_id=VLLM_LORA_INT_ID,
-                    lora_path=VLLM_LORA_PATH,
-                    peft_config=peft_config,
-                    lora_tensors=accumulated_weights,
-                )
+                from verl.utils.vllm.utils import TensorLoRARequest as TensorLoraRequestCls
             else:
-                lora_request = OmniTensorLoRARequest(
-                    lora_name=VLLM_LORA_NAME,
-                    lora_int_id=VLLM_LORA_INT_ID,
-                    lora_path=VLLM_LORA_PATH,
-                    peft_config=peft_config,
-                    lora_tensors=accumulated_weights,
-                )
+                from vllm_omni.lora.request import TensorLoRARequest as TensorLoraRequestCls
+
+            lora_request = TensorLoraRequestCls(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
+                peft_config=peft_config,
+                lora_tensors=accumulated_weights,
+            )
             t2 = time.perf_counter()
             self.add_lora(lora_request)
-            if self._get_standard_weight_model_and_config() is None:
-                self._move_diffusion_lora_stacks_to_device()
             t3 = time.perf_counter()
             logger.debug("add_lora took %.3f ms", (t3 - t2) * 1000)
             logger.debug(
