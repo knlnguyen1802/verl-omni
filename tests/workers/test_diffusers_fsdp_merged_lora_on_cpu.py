@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-import verl_omni.workers.engine.fsdp.diffusers_impl as diffusers_impl
+import verl_omni.workers.engine.lora_export as lora_export
 from verl_omni.workers.config.diffusion import DiffusionModelConfig
 from verl_omni.workers.engine.fsdp.diffusers_impl import PPODiffusersFSDPEngine
 
@@ -49,17 +49,19 @@ def _make_engine(module, lora_config: dict) -> PPODiffusersFSDPEngine:
 
 
 def _patch_sync_helpers(monkeypatch, merged_context=None):
-    monkeypatch.setattr(diffusers_impl, "log_gpu_memory_usage", MagicMock())
-    monkeypatch.setattr(diffusers_impl, "load_fsdp_model_to_gpu", MagicMock())
-    monkeypatch.setattr(diffusers_impl, "offload_fsdp_model_to_cpu", MagicMock())
-    monkeypatch.setattr(diffusers_impl, "get_device_id", lambda: torch.device("cpu"))
+    # The export logic lives in the shared LoRAExportMixin (lora_export module);
+    # get_per_tensor_param / _merged_lora_per_tensor_param delegate to it.
+    monkeypatch.setattr(lora_export, "log_gpu_memory_usage", MagicMock())
+    monkeypatch.setattr(lora_export, "load_fsdp_model_to_gpu", MagicMock())
+    monkeypatch.setattr(lora_export, "offload_fsdp_model_to_cpu", MagicMock())
+    monkeypatch.setattr(lora_export, "get_device_id", lambda: torch.device("cpu"))
     if merged_context is not None:
-        monkeypatch.setattr(diffusers_impl, "merged_lora_context", merged_context)
+        monkeypatch.setattr(lora_export, "merged_lora_context", merged_context)
 
 
 def _passthrough_names(monkeypatch):
-    monkeypatch.setattr(diffusers_impl, "normalize_peft_param_name", lambda state: state)
-    monkeypatch.setattr(diffusers_impl, "convert_weight_keys", lambda state, model: state)
+    monkeypatch.setattr(lora_export, "normalize_peft_param_name", lambda state: state)
+    monkeypatch.setattr(lora_export, "convert_weight_keys", lambda state, model: state)
 
 
 def test_merge_branch_streams_full_weights_without_peft_config(monkeypatch):
@@ -74,7 +76,7 @@ def test_merge_branch_streams_full_weights_without_peft_config(monkeypatch):
     _patch_sync_helpers(monkeypatch, merged_context)
     _passthrough_names(monkeypatch)
     collect = MagicMock(return_value={})
-    monkeypatch.setattr(diffusers_impl, "collect_lora_params", collect)
+    monkeypatch.setattr(lora_export, "collect_lora_params", collect)
 
     engine = _make_engine(module, lora_config={"merge": True})
     params, peft_config = engine.get_per_tensor_param(layered_summon=False, base_sync_done=True)
@@ -141,10 +143,10 @@ def test_merge_branch_rejects_named_adapter(monkeypatch):
 
     _patch_sync_helpers(monkeypatch)
     _passthrough_names(monkeypatch)
-    monkeypatch.setattr(diffusers_impl, "merged_lora_context", MagicMock())
+    monkeypatch.setattr(lora_export, "merged_lora_context", MagicMock())
 
     engine = _make_engine(module, lora_config={"merge": True})
-    with pytest.raises(ValueError, match="rollout_adapter='old'"):
+    with pytest.raises(ValueError, match="adapter_name='old'"):
         engine.get_per_tensor_param(base_sync_done=True, adapter_name="old")
     # "default" is what the weight-sync call sites pass and must stay accepted.
     _, peft_config = engine.get_per_tensor_param(base_sync_done=True, adapter_name="default")
@@ -161,7 +163,7 @@ def test_merged_stream_offloads_on_finally(monkeypatch):
     engine = _make_engine(_ToyModel(), lora_config={"merge": True})
     engine._is_offload_param = True
     list(engine._merged_lora_per_tensor_param())
-    diffusers_impl.offload_fsdp_model_to_cpu.assert_called_once_with(engine.module)
+    lora_export.offload_fsdp_model_to_cpu.assert_called_once_with(engine.module)
 
 
 def test_merged_stream_skips_offload_when_disabled(monkeypatch):
@@ -173,7 +175,7 @@ def test_merged_stream_skips_offload_when_disabled(monkeypatch):
 
     engine = _make_engine(_ToyModel(), lora_config={"merge": True})
     list(engine._merged_lora_per_tensor_param())
-    diffusers_impl.offload_fsdp_model_to_cpu.assert_not_called()
+    lora_export.offload_fsdp_model_to_cpu.assert_not_called()
 
 
 def test_adapter_branch_unchanged_when_merge_disabled(monkeypatch):
@@ -181,11 +183,11 @@ def test_adapter_branch_unchanged_when_merge_disabled(monkeypatch):
     adapter_weight = torch.zeros(8, 4)
 
     _patch_sync_helpers(monkeypatch)
-    monkeypatch.setattr(diffusers_impl, "convert_weight_keys", lambda state, model: state)
+    monkeypatch.setattr(lora_export, "convert_weight_keys", lambda state, model: state)
     collect = MagicMock(
         return_value={"layers.0.self_attn.q_proj_moe_gen.lora_A.weight": adapter_weight},
     )
-    monkeypatch.setattr(diffusers_impl, "collect_lora_params", collect)
+    monkeypatch.setattr(lora_export, "collect_lora_params", collect)
 
     engine = _make_engine(module, lora_config={})
     params, peft_config = engine.get_per_tensor_param(layered_summon=True, base_sync_done=True)
