@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import torch
 
 import verl_omni.workers.engine_workers as ew
+from verl_omni.utils.adapter_scope import resolve_lora_sync_plan
 
 
 def _fast_path_worker(rollout_rank=0):
@@ -58,6 +59,9 @@ def _fast_path_worker(rollout_rank=0):
     worker._rank = 0
     worker.peft_merge = False
     worker.base_sync_done = True
+    worker.lora_sync_plan = resolve_lora_sync_plan(
+        lora_enabled=True, merge=False, base_sync_done=True
+    )
     worker.layered_summon = False
     worker.rollout_adapter = "default"
     worker._zmq_update_seq = 0

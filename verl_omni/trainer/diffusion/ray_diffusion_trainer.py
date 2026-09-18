@@ -81,6 +81,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     rollout_correction_enabled,
 )
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
+from verl_omni.utils.adapter_scope import REFERENCE_FLAG
 from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.tracking import _export_video, batch_items, log_wandb_media, wrap_val_samples_for_wandb
 from verl_omni.workers.config.reward import reward_is_enabled, reward_role_required, streaming_reward_enabled
@@ -1158,7 +1159,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
             "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
         }
         if self.ref_in_actor:
-            metadata["no_lora_adapter"] = True
+            metadata[REFERENCE_FLAG] = True
         tu.assign_non_tensor(batch_td, **metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.infer_actor_batch(batch_td)
@@ -1589,7 +1590,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
             "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
         }
         if self.ref_in_actor:
-            metadata["no_lora_adapter"] = True
+            metadata[REFERENCE_FLAG] = True
         tu.assign_non_tensor(batch_td, **metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.infer_actor_batch(batch_td)

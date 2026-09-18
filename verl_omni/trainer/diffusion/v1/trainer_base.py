@@ -87,6 +87,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
+from verl_omni.utils.adapter_scope import REFERENCE_FLAG
 from verl_omni.utils.config import resolve_lora_config
 from verl_omni.workers.config.reward import (
     reward_is_enabled,
@@ -504,7 +505,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
         }
         if self.ref_in_actor:
-            metadata["no_lora_adapter"] = True
+            metadata[REFERENCE_FLAG] = True
         tu.assign_non_tensor(batch_td, **metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.infer_actor_batch(batch_td)
@@ -1201,7 +1202,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             "vae_scale_factor": self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
         }
         if self.ref_in_actor:
-            metadata["no_lora_adapter"] = True
+            metadata[REFERENCE_FLAG] = True
         tu.assign_non_tensor(batch_td, **metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.infer_actor_batch(batch_td)
