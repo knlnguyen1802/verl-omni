@@ -177,6 +177,14 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.fsdp_layer_prefixes`: FSDP layer name prefixes for LoRA layered summon (default `["transformer_blocks."]`).
 - `actor_rollout_ref.model.pipeline` / `algo`: Mirrored from `actor_rollout_ref.rollout.pipeline` / `algo` via `oc.select`; prefer overriding the rollout copies.
 
+LoRA config contract: every LoRA knob above is a flat `model.` field. The only
+nested `model.lora:` key verl-omni reads is `merge` (merge adapters into the base
+weights before transferring to the rollout engine; the omni trainer yaml trims the
+block to that single key). `resolve_lora_config` (verl_omni.utils.config) resolves
+both spellings for the trainers and raises on unknown nested keys, on conflicting
+`lora.rank` vs `lora_rank` values, and on anything outside the Megatron-only key set
+that verl's pinned config merges into every composed config.
+
 ### `actor_rollout_ref.actor` — diffusion actor / loss
 
 ```yaml
