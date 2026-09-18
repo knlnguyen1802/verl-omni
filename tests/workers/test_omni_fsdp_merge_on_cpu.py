@@ -17,6 +17,7 @@ from contextlib import contextmanager
 import torch
 
 import verl_omni.workers.engine.fsdp.omni_impl as omni_impl
+import verl_omni.workers.engine.lora_export as lora_export
 
 
 class _FakeModule:
@@ -41,11 +42,11 @@ def test_merged_weights_materialized_before_actor_restore(monkeypatch):
         finally:
             module.weight.fill_(1.0)
 
-    monkeypatch.setattr(omni_impl, "merged_lora_context", merged_context)
-    monkeypatch.setattr(omni_impl, "normalize_peft_param_name", lambda state: state)
-    monkeypatch.setattr(omni_impl, "convert_weight_keys", lambda state, model: state)
-    monkeypatch.setattr(omni_impl, "log_gpu_memory_usage", lambda *args, **kwargs: None)
-    monkeypatch.setattr(omni_impl, "get_device_id", lambda: torch.device("cpu"))
+    monkeypatch.setattr(lora_export, "merged_lora_context", merged_context)
+    monkeypatch.setattr(lora_export, "normalize_peft_param_name", lambda state: state)
+    monkeypatch.setattr(lora_export, "convert_weight_keys", lambda state, model: state)
+    monkeypatch.setattr(lora_export, "log_gpu_memory_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lora_export, "get_device_id", lambda: torch.device("cpu"))
 
     engine = object.__new__(omni_impl.OmniFSDPEngine)
     engine.module = module
