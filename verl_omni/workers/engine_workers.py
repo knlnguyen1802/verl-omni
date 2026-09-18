@@ -58,6 +58,8 @@ from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedW
 from verl.workers.utils.losses import ppo_loss
 
 from verl_omni.pipelines.utils import build_scheduler
+from verl_omni.utils.adapter_scope import REFERENCE_FLAG, resolve_lora_sync_plan
+from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.mfu import (
     DiffusionFlopsCounter,
     allgather_diffusion_flops_meta,
@@ -459,7 +461,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         global_token_num = tu.get(data, key="global_token_num")
         compute_loss = tu.get(data, key="compute_loss", default=True)
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
-        no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
+        no_lora_adapter = tu.pop(data, key=REFERENCE_FLAG, default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
         diffusion_flops_meta = collect_diffusion_flops_meta(
             self.flops_counter,
@@ -850,7 +852,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.layered_summon = self.config.rollout.get("layered_summon", False)
         # diffusion-only dual-adapter knob; the omni rollout config has no such field
         self.rollout_adapter: str = self.config.rollout.get("rollout_adapter", "default")
-        self.peft_merge: bool = model_config.lora.get("merge", False)
+        lora_settings = resolve_lora_config(model_config)
+        self.peft_merge: bool = lora_settings.merge
+        # Decision table for every sync: what ships and how far the rollout sleeps.
+        self.lora_sync_plan = resolve_lora_sync_plan(
+            lora_enabled=lora_settings.enabled,
+            merge=lora_settings.merge,
+            base_sync_done=self.base_sync_done,
+        )
         self._zmq_update_seq = 0
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
@@ -1127,7 +1136,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             #       memory). The gathered LoRA tensors are independent CPU
             #       allocations, so moving the base param storage to CPU cannot
             #       corrupt the in-flight sync.
-            self.rollout.sleep_level = 1
+            self.rollout.sleep_level = self.lora_sync_plan.sleep_level
             gather_task = asyncio.create_task(asyncio.to_thread(self._gather_lora_weights, timings))
             if resume_weights_task is not None:
                 await resume_weights_task
@@ -1188,7 +1197,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             do_lora_base_sync = False
             if not self.peft_merge and peft_config is not None:
-                self.rollout.sleep_level = 1
+                self.rollout.sleep_level = self.lora_sync_plan.sleep_level
                 do_lora_base_sync = not self.base_sync_done
 
             # sync weights: For SGLang, we need base first (when needed), then adapter/merged

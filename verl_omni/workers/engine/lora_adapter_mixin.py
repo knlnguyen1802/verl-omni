@@ -20,6 +20,8 @@ import torch
 from peft import LoraConfig
 from verl.utils.py_functional import convert_to_regular_types
 
+from verl_omni.utils.adapter_scope import AdapterScope
+
 logger = logging.getLogger(__name__)
 
 
@@ -114,10 +116,11 @@ class LoRAAdapterMixin:
     def use_adapter(self, name: str):
         """Temporarily select a named PEFT adapter.
 
-        ``"reference"`` is a logical policy state (see ``policy_state_adapters``)
-        that runs with all LoRA adapters disabled, not a registered PEFT adapter.
+        ``AdapterScope.REFERENCE`` is a logical policy state (see
+        ``policy_state_adapters``) that runs with all LoRA adapters disabled,
+        not a registered PEFT adapter.
         """
-        if name == "reference":
+        if name == AdapterScope.REFERENCE:
             with self.disable_adapter():
                 yield
         else:

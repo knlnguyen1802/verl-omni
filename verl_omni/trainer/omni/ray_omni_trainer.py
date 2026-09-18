@@ -56,6 +56,7 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
 from verl_omni.trainer.omni.omni_algos import (
     get_omni_loss_fn,
 )
+from verl_omni.utils.adapter_scope import REFERENCE_FLAG
 from verl_omni.utils.dataset.offline_mllm_dpo_dataset import get_batch_modality
 from verl_omni.utils.metrics_utils import GroupedMetricMean
 from verl_omni.workers.config import OmniModelConfig
@@ -498,7 +499,7 @@ class OmniDirectPreferenceRayTrainer:
             "use_dynamic_bsz": False,
         }
         if self.ref_in_actor:
-            metadata["no_lora_adapter"] = True
+            metadata[REFERENCE_FLAG] = True
         tu.assign_non_tensor(batch_td, **metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.infer_actor_batch(batch_td)
