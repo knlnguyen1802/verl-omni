@@ -8,10 +8,6 @@
 # TransferQueue is force-enabled inside the runner, so it does not need to be
 # set on the CLI.
 #
-# actor.use_no_sync_for_gradient_accumulation=true defers FSDP2 reduce-scatter
-# until the last denoise-timestep backward of each mini-batch (fork #48). GPU
-# peak-memory vs the default-off twin is not measured on this machine.
-#
 # Reference (legacy v0 script):
 # verl-omni/examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh
 set -x
