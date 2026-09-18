@@ -32,9 +32,9 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+from vllm_omni.lora.request import TensorLoRARequest
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import MiniMaxH3RolloutWeightSyncMixin
-from verl_omni.utils.vllm_omni import OmniTensorLoRARequest, VLLMOmniHijack
 
 _TINY_H3 = {
     "num_attention_heads": 4,
@@ -167,9 +167,8 @@ def main() -> None:
             ]
             payload, peft_config = _old_adapter_payload()
 
-            VLLMOmniHijack.hijack()
             manager = DiffusionLoRAManager(_Pipeline(transformer), device=device, dtype=torch.bfloat16)
-            request = OmniTensorLoRARequest(
+            request = TensorLoRARequest(
                 lora_name="h3-tp2-regression",
                 lora_int_id=1,
                 lora_path="/tmp/h3-tp2-regression-unused",
