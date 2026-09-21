@@ -183,6 +183,7 @@ Set `TRAIN_FILES` and `VAL_FILES` to use different parquet files.
 | `PICKSCORE_MODEL_PATH` | `yuvalkirstain/PickScore_v1` | PickScore checkpoint for the native reward model. |
 | `NATIVE_REWARD_DEVICES` | `[0,1,2,3]` (CUDA) / `[0,...,15]` (NPU) | Native-subpool bundle indices; one full PickScore instance per entry. |
 | `REWARD_OFFLOAD` | `true` | `true` wakes/sleeps around scoring; `false` keeps the reward model resident. The meaning is identical for engine and native models. |
+| `PICKSCORE_OFFLOAD` | `true` | Custom-function PickScore only: `true` moves the scorer to the host between scoring batches and spreads reward workers across GPUs, so colocated rollout weights plus scoring fit on one card; `false` keeps one resident scorer per reward worker. |
 
 The launcher configures `reward.models.pickscore.backend=native`; the same-name
 `reward.reward_functions.pickscore` entry binds automatically. Native workers

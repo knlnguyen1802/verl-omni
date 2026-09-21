@@ -4,6 +4,11 @@ set -x
 # Enable reward model on GPU: Ray num_gpus=0 actors can still see CUDA devices.
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 
+# Offload PickScore to the host between scoring batches; scoring streams with
+# rollout generation, so the rollout engine stays resident and each worker only
+# holds the scorer on GPU while a batch is in flight.
+export PICKSCORE_OFFLOAD=${PICKSCORE_OFFLOAD:-true}
+
 model_name=${MODEL_PATH:-Qwen/Qwen-Image-Edit-2511}
 reward_function_path=${REWARD_FUNCTION_PATH:-pkg://verl_omni.utils.reward_score.pickscore_reward}
 

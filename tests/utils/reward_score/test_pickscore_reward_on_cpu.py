@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for PickScore burst batching and prompt deduplication."""
+"""CPU tests for PickScore burst batching, prompt deduplication, and colocated memory."""
 
 import asyncio
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,7 @@ class _FeatureImage:
         self.feature = torch.tensor(feature)
 
 
-def test_inferencer_uses_platform_device_by_default(monkeypatch):
+def test_inferencer_uses_platform_device_by_default(monkeypatch, tmp_path):
     class _FakeLoadedModel:
         def __init__(self):
             self.to_calls = []
@@ -76,19 +77,23 @@ def test_inferencer_uses_platform_device_by_default(monkeypatch):
 
     model = _FakeLoadedModel()
     monkeypatch.setattr(pickscore_reward, "get_device_name", lambda: "cuda")
-    monkeypatch.setattr(pickscore_reward, "get_device_id", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(pickscore_reward.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(pickscore_reward.CLIPProcessor, "from_pretrained", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(pickscore_reward.CLIPModel, "from_pretrained", lambda *_args, **_kwargs: model)
 
-    inferencer = pickscore_reward._PickScoreInferencer()
+    inferencer = pickscore_reward._PickScoreInferencer(offload=False)
 
-    assert inferencer.device == torch.device("cuda", 2)
-    assert model.to_calls[0] == ((torch.device("cuda", 2),), {})
+    # first worker on the node claims the first accelerator slot
+    assert inferencer.device == torch.device("cuda", 0)
+    assert model.to_calls == [((), {"dtype": torch.float32}), ((torch.device("cuda", 0),), {})]
 
 
 def test_score_encodes_duplicate_prompts_once_and_preserves_pairing():
     inferencer = object.__new__(pickscore_reward._PickScoreInferencer)
     inferencer.device = "cpu"
+    inferencer.offload = False
     inferencer.processor = _FakeProcessor()
     inferencer.model = _FakeModel()
 
@@ -310,3 +315,94 @@ async def test_engine_reward_posts_openai_embedding_payloads(monkeypatch):
     assert requests[0][1] == {"model": "pickscore", "input": "prompt", "encoding_format": "float"}
     assert requests[1][1]["encoding_format"] == "float"
     assert requests[1][1]["input"][0]["content"][0]["type"] == "image_url"
+
+
+class _MovingModel:
+    """Records .to() targets; returns fixed embeddings so scores are predictable."""
+
+    logit_scale = torch.tensor(4.0)
+
+    def __init__(self):
+        self.to_targets = []
+
+    def eval(self):
+        return self
+
+    def to(self, target=None, dtype=None):
+        if target is not None:
+            self.to_targets.append(str(target))
+        return self
+
+    def get_image_features(self, **inputs):
+        return torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    def get_text_features(self, **inputs):
+        return torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+
+class _StubProcessor:
+    def __call__(self, images=None, text=None, **kwargs):
+        count = len(images) if images is not None else len(text)
+        return {"input_ids": torch.zeros(count, 2, dtype=torch.long)}
+
+
+def _install_stub_weights(monkeypatch):
+    model = _MovingModel()
+    monkeypatch.setattr(pickscore_reward.CLIPModel, "from_pretrained", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr(pickscore_reward.CLIPProcessor, "from_pretrained", lambda *_args, **_kwargs: _StubProcessor())
+    return model
+
+
+def test_infer_offloads_model_to_host_between_batches(monkeypatch):
+    model = _install_stub_weights(monkeypatch)
+    cleared = []
+    monkeypatch.setattr(pickscore_reward, "_empty_accelerator_cache", lambda: cleared.append(True))
+    inferencer = pickscore_reward._PickScoreInferencer(device="cpu", offload=True)
+
+    assert model.to_targets == []  # construction keeps the weights on the host
+
+    inferencer.infer(["a", "b"], [Image.new("RGB", (2, 2)), Image.new("RGB", (2, 2))])
+
+    # one move to the scoring device per batch, then back to the host
+    assert model.to_targets == ["cpu", "cpu"]
+    assert cleared == [True]
+
+
+def test_infer_keeps_model_resident_when_offload_disabled(monkeypatch):
+    model = _install_stub_weights(monkeypatch)
+    inferencer = pickscore_reward._PickScoreInferencer(device="cpu", offload=False)
+
+    assert model.to_targets == ["cpu"]  # single device move at construction
+
+    inferencer.infer(["a"], [Image.new("RGB", (2, 2))])
+
+    assert model.to_targets == ["cpu"]
+
+
+def test_offload_env_defaults_true_and_parses_false(monkeypatch):
+    monkeypatch.delenv("PICKSCORE_OFFLOAD", raising=False)
+    assert pickscore_reward._offload_enabled() is True
+    for value in ("false", "0", "no"):
+        monkeypatch.setenv("PICKSCORE_OFFLOAD", value)
+        assert pickscore_reward._offload_enabled() is False
+
+
+def test_select_device_claims_distinct_slots_per_worker(monkeypatch, tmp_path):
+    monkeypatch.setattr(pickscore_reward, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(pickscore_reward.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    devices = [pickscore_reward._select_device() for _ in range(3)]
+
+    assert devices == [torch.device("cuda", 0), torch.device("cuda", 1), torch.device("cuda", 2)]
+    # exhausted slots fall back to the pid spread instead of raising
+    assert pickscore_reward._select_device() == torch.device("cuda", os.getpid() % 3)
+
+
+def test_explicit_device_bypasses_slot_claim(monkeypatch, tmp_path):
+    monkeypatch.setattr(pickscore_reward.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    pickscore_reward._PickScoreInferencer(device="cpu", offload=False)
+
+    assert not (tmp_path / "verl_pickscore_slots").exists()

@@ -16,13 +16,15 @@ import asyncio
 import gc
 import logging
 import os
+import tempfile
+from pathlib import Path
 
 import aiohttp
 import numpy as np
 import torch
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_name
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -30,6 +32,50 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 _PROCESSOR_PATH = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
 _MODEL_PATH = "yuvalkirstain/PickScore_v1"
 _MAX_BATCH_SIZE = 16
+
+
+def _offload_enabled() -> bool:
+    """Offload the model to the host between scoring batches (default on)."""
+    return os.getenv("PICKSCORE_OFFLOAD", "true").strip().lower() not in {"0", "false", "no"}
+
+
+def _claim_device_index(device_count: int) -> int:
+    """Hand this worker a distinct accelerator so colocated reward workers do not all land on device 0.
+
+    Reward loop workers are Ray ``num_gpus=0`` actors that all see every GPU, so the
+    default ``cuda:0`` choice stacks one fp32 CLIP copy per worker onto the same card
+    next to the resident rollout engine. Atomic slot files spread them deterministically.
+    """
+    slot_dir = Path(tempfile.gettempdir()) / "verl_pickscore_slots"
+    try:
+        slot_dir.mkdir(exist_ok=True)
+        for index in range(device_count):
+            try:
+                (slot_dir / str(index)).touch(exist_ok=False)
+                return index
+            except FileExistsError:
+                continue
+    except OSError:
+        pass
+    # ponytail: claimed slots from killed runs are never reclaimed; pid hash spreads the overflow
+    return os.getpid() % device_count
+
+
+def _select_device() -> torch.device:
+    name = get_device_name()
+    accelerator = getattr(torch, name, None)
+    count = accelerator.device_count() if accelerator is not None and accelerator.is_available() else 0
+    if count > 1:
+        return torch.device(name, _claim_device_index(count))
+    return torch.device(name)
+
+
+def _empty_accelerator_cache() -> None:
+    accelerator = getattr(torch, get_device_name(), None)
+    empty_cache = getattr(accelerator, "empty_cache", None)
+    if callable(empty_cache) and getattr(accelerator, "is_available", lambda: False)():
+        empty_cache()
+
 
 _inferencer = None
 _score_queue = asyncio.Queue()
@@ -70,19 +116,34 @@ class _PickScoreInferencer:
         dtype=torch.float32,
         model_path: str = _MODEL_PATH,
         processor_path: str = _PROCESSOR_PATH,
+        offload: bool | None = None,
     ):
         if device is None:
-            device = torch.device(get_device_name(), get_device_id())
+            device = _select_device()
         logger.info("Creating PickScore model from %s", model_path)
         self.device = torch.device(device)
         self.dtype = dtype
+        # The rollout engine keeps its weights resident while scoring streams with
+        # generation, so the scorer must yield GPU memory again between batches.
+        self.offload = _offload_enabled() if offload is None else offload
         self.processor = CLIPProcessor.from_pretrained(processor_path)
-        self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
-        self.model = self.model.to(dtype=dtype)
+        self.model = CLIPModel.from_pretrained(model_path).eval().to(dtype=dtype)
+        if not self.offload:
+            self.model = self.model.to(self.device)
 
     @torch.no_grad()
     def infer(self, prompts: list[str], images: list[Image.Image]) -> dict[str, torch.Tensor]:
         """Return the raw model outputs needed by PickScore."""
+        if self.offload:
+            self.model.to(self.device)
+        try:
+            return self._infer_on_device(prompts, images)
+        finally:
+            if self.offload:
+                self.model.to("cpu")
+                _empty_accelerator_cache()
+
+    def _infer_on_device(self, prompts: list[str], images: list[Image.Image]) -> dict[str, torch.Tensor]:
         unique_prompts = list(dict.fromkeys(prompts))
         prompt_to_index = {prompt: index for index, prompt in enumerate(unique_prompts)}
         prompt_indices = [prompt_to_index[prompt] for prompt in prompts]
