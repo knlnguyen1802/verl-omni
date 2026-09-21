@@ -12,7 +12,8 @@ requirements.
 > (`main_omni`) run the V1 trainer (TransferQueue + ReplayBuffer). The
 > remaining CUDA v0 launchers and the `main_diffusion` entrypoint are
 > **deprecated** and emit a `DeprecationWarning` until their V1 port lands
-> ([#389](https://github.com/verl-project/verl-omni/issues/389)). Offline DPO
+> ([#389](https://github.com/verl-project/verl-omni/issues/389)); those
+> scripts pin `trainer.use_v1=false` explicitly. Offline DPO
 > recipes (SD3.5 diffusion DPO, Qwen3-Omni offline DPO) stay on the v0 trainer
 > by design. See {doc}`diffusion_v1` for the V1 guide and the migration recipe.
 

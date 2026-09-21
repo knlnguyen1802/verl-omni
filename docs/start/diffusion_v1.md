@@ -288,6 +288,8 @@ The legacy v0 diffusion trainer — launched by
 - Models without a landed V1 recipe (tracked in
   [verl-project/verl-omni#389](https://github.com/verl-project/verl-omni/issues/389))
   keep working on v0 until their port lands; the warning is expected there.
+  Their scripts pin `trainer.use_v1=false` explicitly, so the launch stays on
+  v0 even if the entrypoint is swapped to `main_diffusion_v1`.
 - **Stays on v0 by design** (no warning, no V1 planned): diffusion offline DPO
   (`examples/dpo_trainer/sd35/`) and omni offline DPO
   (`algorithm.sample_source=offline` + `algorithm.trainer_type=direct_preference`).
