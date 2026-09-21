@@ -39,25 +39,56 @@ def _offload_enabled() -> bool:
     return os.getenv("PICKSCORE_OFFLOAD", "true").strip().lower() not in {"0", "false", "no"}
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name != "posix":
+        return True  # no portable liveness probe; treat the slot as taken
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # EPERM: exists, owned by another user
+    return True
+
+
 def _claim_device_index(device_count: int) -> int:
     """Hand this worker a distinct accelerator so colocated reward workers do not all land on device 0.
 
     Reward loop workers are Ray ``num_gpus=0`` actors that all see every GPU, so the
     default ``cuda:0`` choice stacks one fp32 CLIP copy per worker onto the same card
-    next to the resident rollout engine. Atomic slot files spread them deterministically.
+    next to the resident rollout engine. Atomic slot files spread them deterministically;
+    each records the holder pid so slots from killed runs are reclaimed instead of
+    leaking until /tmp is cleared.
     """
     slot_dir = Path(tempfile.gettempdir()) / "verl_pickscore_slots"
     try:
         slot_dir.mkdir(exist_ok=True)
         for index in range(device_count):
-            try:
-                (slot_dir / str(index)).touch(exist_ok=False)
+            slot = slot_dir / str(index)
+            while True:
+                try:
+                    descriptor = os.open(slot, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    try:
+                        holder = int(slot.read_text(encoding="ascii"))
+                    except (OSError, ValueError):
+                        break  # unreadable holder: leave it, try the next slot
+                    if _pid_alive(holder):
+                        break
+                    try:
+                        slot.unlink()
+                    except OSError:
+                        break
+                    continue  # freed a stale slot: claim this index again
+                try:
+                    os.write(descriptor, str(os.getpid()).encode("ascii"))
+                finally:
+                    os.close(descriptor)
                 return index
-            except FileExistsError:
-                continue
     except OSError:
         pass
-    # ponytail: claimed slots from killed runs are never reclaimed; pid hash spreads the overflow
     return os.getpid() % device_count
 
 

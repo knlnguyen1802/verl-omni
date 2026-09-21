@@ -400,6 +400,31 @@ def test_select_device_claims_distinct_slots_per_worker(monkeypatch, tmp_path):
     assert pickscore_reward._select_device() == torch.device("cuda", os.getpid() % 3)
 
 
+def test_select_device_reclaims_slot_from_dead_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(pickscore_reward, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(pickscore_reward.tempfile, "gettempdir", lambda: str(tmp_path))
+    slot_dir = tmp_path / "verl_pickscore_slots"
+    slot_dir.mkdir()
+    (slot_dir / "0").write_text("999999999", encoding="ascii")  # pid that cannot exist
+
+    assert pickscore_reward._select_device() == torch.device("cuda", 0)
+    assert (slot_dir / "0").read_text(encoding="ascii") == str(os.getpid())
+
+
+def test_select_device_skips_slot_held_by_live_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(pickscore_reward, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(pickscore_reward.tempfile, "gettempdir", lambda: str(tmp_path))
+    slot_dir = tmp_path / "verl_pickscore_slots"
+    slot_dir.mkdir()
+    (slot_dir / "0").write_text(str(os.getpid()), encoding="ascii")  # this test process is alive
+
+    assert pickscore_reward._select_device() == torch.device("cuda", 1)
+
+
 def test_explicit_device_bypasses_slot_claim(monkeypatch, tmp_path):
     monkeypatch.setattr(pickscore_reward.tempfile, "gettempdir", lambda: str(tmp_path))
 
