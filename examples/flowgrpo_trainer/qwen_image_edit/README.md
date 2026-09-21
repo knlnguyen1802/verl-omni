@@ -1,6 +1,6 @@
 # Qwen-Image-Edit-2511 FlowGRPO training
 
-Last updated: 07/14/2026
+Last updated: 09/21/2026
 
 This guide shows how to prepare an image-edit dataset and train
 [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
@@ -46,6 +46,24 @@ python examples/flowgrpo_trainer/qwen_image_edit/prepare_data.py \
     --output_dir data/qwen_image_edit \
     --image_size 512
 ```
+
+If you do not have an image-edit dataset yet, `generate_data.py` in the same
+directory synthesizes one. It renders simple scenes and pairs them with edit
+instructions grounded in each scene's actual attributes (colors, shapes,
+text), writes the same `images/` + JSONL layout under `data/qwen_image_edit_raw`,
+and runs the converter above. No GPU or network access is needed:
+
+```bash
+python examples/flowgrpo_trainer/qwen_image_edit/generate_data.py \
+    --train_size 1024 \
+    --val_size 64
+```
+
+The FlowGRPO recipe needs only (condition image, instruction) pairs — the
+rollout model generates the edits and the reward scores instruction
+alignment — so synthetic pairs are valid training samples. For reward
+fidelity on natural photos, convert a real image dataset with LLM-written
+instructions through `prepare_data.py` instead.
 
 The command writes:
 
