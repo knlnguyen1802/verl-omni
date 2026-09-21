@@ -34,6 +34,19 @@ REWARD_WORKERS=${REWARD_WORKERS:-4}
 IMAGE_RESOLUTION=${IMAGE_RESOLUTION:-512}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-8192}
 
+# Micro-batch defaults assume 8 GPUs; fewer GPUs double the per-rank FSDP shard
+# while activations stay per-rank, which OOMs the training forward. Halve them
+# below 8 GPUs (gradient accumulation keeps the effective batch unchanged).
+if [ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -ge 8 ]; then
+    ppo_micro_default=16
+    logprob_micro_default=32
+else
+    ppo_micro_default=8
+    logprob_micro_default=16
+fi
+PPO_MICRO_BATCH_PER_GPU=${PPO_MICRO_BATCH_PER_GPU:-$ppo_micro_default}
+LOGPROB_MICRO_BATCH_PER_GPU=${LOGPROB_MICRO_BATCH_PER_GPU:-$logprob_micro_default}
+
 ENGINE=vllm_omni
 
 WORKSPACE=${WORKSPACE:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -66,14 +79,14 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.actor.optim.lr=3e-4 \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_PER_GPU \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.model.lora_dtype=float32 \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=$ACTOR_SP \
     actor_rollout_ref.actor.diffusion_loss.clip_ratio=0.0001 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH_PER_GPU \
     actor_rollout_ref.rollout.seed=42 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.name=$ENGINE \
@@ -94,7 +107,7 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.rollout.algo.sde_window_range="[0,6]" \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH_PER_GPU \
     reward.num_workers=$REWARD_WORKERS \
     reward.reward_model.enable=False \
     reward.custom_reward_function.path=$reward_function_path \
