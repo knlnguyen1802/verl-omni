@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (v0): superseded by run_minimax_h3_t2va_lora_v1.sh (V1 sync, the default since v0.3.0).
 # MiniMax H3 T2VA LoRA FlowGRPO with CLAP and ImageBind rewards.
 set -x
 

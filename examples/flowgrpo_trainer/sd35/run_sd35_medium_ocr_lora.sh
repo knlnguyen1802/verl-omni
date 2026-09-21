@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (v0): superseded by run_sd35_medium_ocr_lora_v1.sh (V1 sync, the default since v0.3.0).
 # SD3.5-Medium LoRA OCR recipe aligned with mm_grpo's fast SD3 OCR script.
 #
 # mm_grpo uses a diffusers rollout with raw train.txt/test.txt prompts and a

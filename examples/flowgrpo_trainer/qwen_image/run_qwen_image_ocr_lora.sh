@@ -1,3 +1,4 @@
+# DEPRECATED (v0): superseded by run_qwen_image_ocr_lora_v1.sh (V1 sync, the default since v0.3.0).
 # Qwen-Image lora RL, vllm_omni rollout
 set -x
 
