@@ -75,6 +75,14 @@ def validate_config(config: Any) -> None:
 
     _validate_delta_sharded(config)
 
+    if _select(config, "actor_rollout_ref.actor.use_no_sync_for_gradient_accumulation", False):
+        strategy = _select(config, "actor_rollout_ref.actor.strategy")
+        if strategy not in ("fsdp", "fsdp2"):
+            raise ValueError(
+                "actor.use_no_sync_for_gradient_accumulation=true requires actor.strategy "
+                f"fsdp or fsdp2, got {strategy!r}."
+            )
+
     resume_mode = _select(config, "trainer.resume_mode")
     valid_resume_modes = ("disable", "auto", "resume_path")
     if resume_mode not in valid_resume_modes:
