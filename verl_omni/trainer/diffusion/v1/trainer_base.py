@@ -170,6 +170,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.config = config
         self.trainer_mode = config.trainer.v1.trainer_mode
         self.parameter_sync_step = config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        self._validate_trainer_mode_config()
         loss_mode = config.actor_rollout_ref.actor.diffusion_loss.loss_mode
         self._is_direct_preference = config.algorithm.get("trainer_type", "policy_gradient") == "direct_preference"
         if self._is_direct_preference:
@@ -208,6 +209,27 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # Local update index within the parameter-sync cycle.
         self.local_trigger_step = 0
 
+    def _validate_trainer_mode_config(self) -> None:
+        """Fail-closed validation for the selected v1 trainer mode."""
+        if self.trainer_mode != "colocate_async":
+            return
+        if (
+            isinstance(self.parameter_sync_step, bool)
+            or not isinstance(self.parameter_sync_step, int)
+            or self.parameter_sync_step <= 0
+        ):
+            raise ValueError(
+                "trainer.v1.colocate_async.parameter_sync_step must be a positive integer, "
+                f"got {self.parameter_sync_step!r}"
+            )
+        if self.parameter_sync_step != 1:
+            raise NotImplementedError(
+                "colocate_async requires trainer.v1.colocate_async.parameter_sync_step=1: every local "
+                "update samples inside its own abort/sleep window, so a later update in the same cycle "
+                "would wait on replicas that are already asleep, and the cycle-start old-policy snapshot "
+                "only exists in separate_async."
+            )
+
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
         if sampler_config.get("drop_incomplete_groups", False):
@@ -217,7 +239,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if isinstance(max_refill_rounds, bool) or not isinstance(max_refill_rounds, int) or max_refill_rounds <= 0:
                 raise ValueError("max_incomplete_group_refill_rounds must be a positive integer")
 
-        replay_buffer_cls = ReplayBufferAsync if self.trainer_mode == "separate_async" else ReplayBuffer
+        replay_buffer_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
         return replay_buffer_cls(
             trainer_mode=self.trainer_mode,
             trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
@@ -1047,7 +1069,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             return cached_batch_size
 
         sampler_config = self.config.trainer.v1.sampler
-        exact_refill = sampler_config.get("drop_incomplete_groups", False) or self.trainer_mode == "separate_async"
+        exact_refill = sampler_config.get("drop_incomplete_groups", False) or self.trainer_mode != "sync"
         if exact_refill:
             configured_batch_size = self.config.data.get("gen_batch_size", None)
             if configured_batch_size not in (None, 1):

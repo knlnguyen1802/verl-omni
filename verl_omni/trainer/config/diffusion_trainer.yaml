@@ -230,17 +230,23 @@ trainer:
   # V1 trainer mode configs (mirrors verl/trainer/config/ppo_trainer.yaml `trainer.v1`).
   v1:
 
-    # Trainer mode: "sync", "separate_async".
+    # Trainer mode: "sync", "colocate_async", "separate_async".
     trainer_mode: sync
 
     # Synchronous diffusion trainer (colocated rollout, no partial rollout).
     sync: {}
 
-    # Asynchronous diffusion trainer with colocated trainer and rollout (not implemented yet).
+    # Asynchronous diffusion trainer with colocated trainer and rollout.
+    # Partial rollout is enabled: in-flight samples aborted at a mode transition
+    # are retried as whole samples by DiffusionWholeSampleRetryLLMServerClient.
     colocate_async:
 
       # Number of warmup batches to add before the training loop starts.
       num_warmup_batches: 1
+
+      # Local actor updates per rollout-weight synchronization cycle.
+      # colocate_async currently requires 1 (sync weights every step).
+      parameter_sync_step: 1
 
     # Asynchronous diffusion trainer with separate trainer and rollout.
     # Requires rollout.nnodes > 0 and a non-naive checkpoint_engine backend
