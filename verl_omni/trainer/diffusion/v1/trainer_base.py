@@ -195,6 +195,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         validate_distillation_config(config)
         self._teacher_one_step_off = self.use_teacher_policy and self.distillation_config.scheduler == "one_step_off"
         self._pending_teacher_batch = None
+        # Row-aligned metric data of the batches trained this step, consumed by
+        # `_compute_metrics` to skip a second TransferQueue read.
+        self._pending_metric_data: list[DataProto] = []
         self.replay_buffer = self._build_replay_buffer()
 
         # ref_in_actor: reference policy is the actor without lora applied.
@@ -514,6 +517,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             data_for_tq,
             fields=diffusion_persisted_tq_fields("policy_gradient"),
         )
+        self._pending_metric_data.append(data_for_tq)
         return batch_meta
 
     def _validate_old_adapter_config(self):
@@ -613,6 +617,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 data_for_tq,
                 fields=diffusion_persisted_tq_fields("direct_preference"),
             )
+            self._pending_metric_data.append(data_for_tq)
             data = self._prepare_actor_batch(data, reward_tensor)
             data.batch["sample_level_rewards"] = data.batch["sample_level_scores"]
 
@@ -1596,13 +1601,25 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return metric_dict
 
     def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
-        data = diffusion_tq_batch_to_dataproto(
-            batch_meta,
-            pad_token_id=self.tokenizer.pad_token_id or 0,
-            select_fields=diffusion_metric_tq_fields(
-                "direct_preference" if self._is_direct_preference else "policy_gradient"
-            ),
-        )
+        cached, self._pending_metric_data = self._pending_metric_data, []
+        n_keys = len(batch_meta.keys)
+        cached_rows = sum(len(item) for item in cached)
+        if cached and cached_rows == n_keys:
+            data = DataProto.concat(cached) if len(cached) > 1 else cached[0]
+        else:
+            if cached:
+                logger.warning(
+                    "Cached metric data covers %d rows but step has %d keys; re-reading TransferQueue.",
+                    cached_rows,
+                    n_keys,
+                )
+            data = diffusion_tq_batch_to_dataproto(
+                batch_meta,
+                pad_token_id=self.tokenizer.pad_token_id or 0,
+                select_fields=diffusion_metric_tq_fields(
+                    "direct_preference" if self._is_direct_preference else "policy_gradient"
+                ),
+            )
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics_diffusion(batch=data))
         n_gpus = self._get_n_gpus_for_throughput()
