@@ -1,6 +1,6 @@
 # Qwen-Image-Edit-2511 FlowGRPO training
 
-Last updated: 07/14/2026
+Last updated: 09/21/2026
 
 This guide shows how to prepare an image-edit dataset and train
 [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
@@ -46,6 +46,24 @@ python examples/flowgrpo_trainer/qwen_image_edit/prepare_data.py \
     --output_dir data/qwen_image_edit \
     --image_size 512
 ```
+
+If you do not have an image-edit dataset yet, `generate_data.py` in the same
+directory synthesizes one. It renders simple scenes and pairs them with edit
+instructions grounded in each scene's actual attributes (colors, shapes,
+text), writes the same `images/` + JSONL layout under `data/qwen_image_edit_raw`,
+and runs the converter above. No GPU or network access is needed:
+
+```bash
+python examples/flowgrpo_trainer/qwen_image_edit/generate_data.py \
+    --train_size 1024 \
+    --val_size 64
+```
+
+The FlowGRPO recipe needs only (condition image, instruction) pairs — the
+rollout model generates the edits and the reward scores instruction
+alignment — so synthetic pairs are valid training samples. For reward
+fidelity on natural photos, convert a real image dataset with LLM-written
+instructions through `prepare_data.py` instead.
 
 The command writes:
 
@@ -96,6 +114,30 @@ bash examples/flowgrpo_trainer/qwen_image_edit/run_qwen_image_edit_lora.sh \
     trainer.logger=console
 ```
 
+### V1 sync trainer
+
+A v1 counterpart launches `main_diffusion_v1` in synchronous TransferQueue
+mode. It keeps the same parquet layout (`images` condition bytes), Hydra data
+paths, and model/reward knobs as the v0 LoRA recipe:
+
+```bash
+WORKSPACE=$PWD \
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=8 \
+bash examples/flowgrpo_trainer/qwen_image_edit/run_qwen_image_edit_lora_v1.sh \
+    trainer.logger=console
+```
+
+The v1 launcher differs only in the trainer entrypoint and:
+
+```text
+python3 -m verl_omni.trainer.main_diffusion_v1
+trainer.use_v1=true
+trainer.v1.trainer_mode=sync
+```
+
+See [Diffusion V1 training](../../../docs/start/diffusion_v1.md) for
+TransferQueue prerequisites.
+
 ### Ascend NPU
 
 The NPU recipe uses the synchronous V1 diffusion trainer and a named native
@@ -141,6 +183,10 @@ Set `TRAIN_FILES` and `VAL_FILES` to use different parquet files.
 | `PICKSCORE_MODEL_PATH` | `yuvalkirstain/PickScore_v1` | PickScore checkpoint for the native reward model. |
 | `NATIVE_REWARD_DEVICES` | `[0,1,2,3]` (CUDA) / `[0,...,15]` (NPU) | Native-subpool bundle indices; one full PickScore instance per entry. |
 | `REWARD_OFFLOAD` | `true` | `true` wakes/sleeps around scoring; `false` keeps the reward model resident. The meaning is identical for engine and native models. |
+| `PICKSCORE_OFFLOAD` | `true` | Custom-function PickScore only: `true` moves the scorer to the host between scoring batches and spreads reward workers across GPUs, so colocated rollout weights plus scoring fit on one card; `false` keeps one resident scorer per reward worker. |
+| `PPO_MICRO_BATCH_PER_GPU` | `16` (≥8 GPUs), `8` (fewer) | Actor training micro-batch per GPU. Fewer GPUs double the per-rank FSDP shard while activations stay per-rank, so the default halves below 8 GPUs; override when tuning memory. |
+| `LOGPROB_MICRO_BATCH_PER_GPU` | `32` (≥8 GPUs), `16` (fewer) | Actor and reference log-probability micro-batch per GPU; same scaling rule. |
+| `DUMP_GENERATIONS` | `false` | `true` passes `trainer.rollout_data_dir` / `trainer.validation_data_dir`, writing per-step rollout and validation images to JSONL under the output log dir (the `Dumped generations` files). Off by default: per-step serialization adds CPU and disk load beside the rollout workers. |
 
 The launcher configures `reward.models.pickscore.backend=native`; the same-name
 `reward.reward_functions.pickscore` entry binds automatically. Native workers
@@ -257,5 +303,6 @@ checkpoint. A successful run ends with:
 FlowGRPO Qwen-Image-Edit e2e test passed (training completed successfully).
 ```
 
-Training logs and generated validation images are written below
-`$WORKSPACE/outputs/qwen_image_edit_lora/` by the full example launcher.
+Training logs are written below `$WORKSPACE/outputs/qwen_image_edit_lora/` by
+the full example launcher. Per-step rollout and validation image JSONL dumps
+are opt-in with `DUMP_GENERATIONS=true`.
