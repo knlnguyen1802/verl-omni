@@ -1070,7 +1070,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # The delta engine owns the sync state machine (seed vs steady,
                 # snapshot prime), so it drives the training engine itself.
                 # Full-weight only: the engine's shard export raises under LoRA.
-                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                with RLInsightLogger.trace_state("update_weights", state_lane_id=f"rank_{self.rank}"):
+                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 return metrics or {}
 
             actor_module = getattr(self.actor.engine, "module", None)

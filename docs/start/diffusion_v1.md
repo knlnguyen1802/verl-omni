@@ -172,6 +172,13 @@ bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_v1_separate_async_delta.
 
 This backend is covered by CPU unit tests only so far; the sparsity preflight
 and a bit-exact GPU smoke against the `nccl` backend are pending (RFC #38).
+The same recipe doubles as the A/B harness: `CKPT_BACKEND=nccl` runs the
+identical full-weight configuration over a full broadcast.
+
+```bash
+CKPT_BACKEND=nccl bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_v1_separate_async_delta.sh
+```
+
 Watch `checkpoint_engine/changed_ratio` and `checkpoint_engine/payload_mbytes`
 in the trainer metrics to confirm the sparsity premise holds for a given model
 and optimizer before relying on the speedup.

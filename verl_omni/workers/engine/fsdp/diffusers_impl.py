@@ -981,11 +981,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
     def get_per_tensor_param_shard(self, **kwargs):
         """Like :meth:`get_per_tensor_param`, but yields each rank's *local* shard
-        ``(name, local_flat_shard_bf16, ShardSpec)`` instead of all-gathering full
+        ``(name, local_flat_shard, ShardSpec)`` instead of all-gathering full
         tensors. Consumed by the ``delta_sharded`` checkpoint engine, which byte-diffs
         each rank's shard against a pinned snapshot; non-LoRA base path only. Names
         match the full export (``convert_weight_keys`` plus the ``transformer.``
-        prefix) so HF coordinates are what the rollout pipelines already load.
+        prefix) so HF coordinates are what the rollout pipelines already load, and
+        the cast rule matches too (DTensors bf16, plain tensors native) so the
+        pinned diff base is bit-identical to the seed sync's full export.
         """
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):
@@ -1011,7 +1013,11 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             for name, param in params.items():
                 spec = ShardSpec.from_param(param)
                 p = param.to(device, non_blocking=True)
-                if p.is_floating_point():
+                # Same cast rule as the full export: DTensors bf16, plain tensors
+                # native dtype. The pinned diff base must be bit-identical to what
+                # the seed (full) export sent the rollout, or steady deltas drift
+                # from the nccl path on FSDP1 / non-DTensor entries.
+                if isinstance(param, DTensor) and p.is_floating_point():
                     p = p.to(torch.bfloat16, non_blocking=True)
                 local = p.to_local() if hasattr(p, "to_local") else p
                 yield f"transformer.{name}", local.reshape(-1), spec

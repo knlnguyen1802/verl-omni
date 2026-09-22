@@ -920,6 +920,7 @@ class TestDeltaShardExportGate:
         assert spec.full_shape == (2, 3)
         assert torch.equal(local, engine.module.weight.reshape(-1).to(torch.bfloat16))
 
+
 def _fsdp2_engine(omni_impl, module, ignored_names, strategy="fsdp2"):
     """A bare engine whose adapter returns ``ignored_names`` from the model-base hook."""
     engine = object.__new__(omni_impl.OmniFSDPEngine)

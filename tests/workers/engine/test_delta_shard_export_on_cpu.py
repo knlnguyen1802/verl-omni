@@ -73,10 +73,12 @@ def _patch_sync_helpers(monkeypatch):
     monkeypatch.setattr(diffusers_impl, "get_device_id", lambda: torch.device("cpu"))
 
 
-def _full_export_bf16(engine) -> dict:
+def _full_export(engine) -> dict:
     full, _ = engine.get_per_tensor_param()
-    # The delta engine's seed cast: every floating tensor ships in the rollout dtype.
-    return {name: (t.to(torch.bfloat16) if t.is_floating_point() else t) for name, t in full}
+    # Raw full export: DTensors ship bf16, plain tensors keep their native dtype.
+    # The shard export must mirror exactly this cast rule, or the pinned diff base
+    # diverges from what the seed sync sent the rollout.
+    return dict(full)
 
 
 def test_shard_export_matches_full_export_names_and_values(monkeypatch):
@@ -85,14 +87,15 @@ def test_shard_export_matches_full_export_names_and_values(monkeypatch):
     _patch_sync_helpers(monkeypatch)
     engine = _make_engine(module)
 
-    full = _full_export_bf16(engine)
+    full = _full_export(engine)
     shards = list(engine.get_per_tensor_param_shard()[0])
 
     assert [name for name, _, _ in shards] == list(full.keys())
     for name, local, spec in shards:
         # conversion mapping applied, then the rollout-facing prefix
         assert name.startswith("transformer.transformer_blocks.")
-        assert local.dtype == torch.bfloat16
+        # plain fp32 params keep their native dtype in both exports (cast parity)
+        assert local.dtype == torch.float32
         assert spec.full_shape == tuple(full[name].shape)
         # unsharded (no process group): the local shard is the whole flat tensor
         assert torch.equal(local, full[name].reshape(-1))
@@ -105,7 +108,7 @@ def test_shard_coverage_reassembles_full_tensor(monkeypatch):
     _patch_sync_helpers(monkeypatch)
     engine = _make_engine(_ToyDiT())
 
-    full = _full_export_bf16(engine)
+    full = _full_export(engine)
     for name, local, spec in engine.get_per_tensor_param_shard()[0]:
         place, contributes, group = derive_dtensor_placement(spec)
         assert contributes and group is None
@@ -128,7 +131,7 @@ def test_delta_round_trip_bit_exact(monkeypatch):
     engine = _make_engine(module)
 
     # Seed: the rollout loads the full export; the engine pins its shard snapshots.
-    rollout_state = {name: t.clone() for name, t in _full_export_bf16(engine).items()}
+    rollout_state = {name: t.clone() for name, t in _full_export(engine).items()}
     engine.prime_delta_snapshots()
 
     # Perturb two elements, as an optimizer step would.
@@ -139,7 +142,8 @@ def test_delta_round_trip_bit_exact(monkeypatch):
     shipped = 0
     deltas, _ = engine.get_per_tensor_param_delta_shard()
     for slots, dtype_str, counts, hf_idx, hf_val, gather_group in deltas:
-        assert dtype_str == "bfloat16" and gather_group is None
+        # fp32 plain params ship native; the wire dtype follows the export
+        assert dtype_str == "float32" and gather_group is None
         off = 0
         for (name, shape), count in zip(slots, counts.tolist(), strict=True):
             if count:
@@ -149,9 +153,9 @@ def test_delta_round_trip_bit_exact(monkeypatch):
             off += count
     assert shipped == 2
 
-    reference = _full_export_bf16(engine)
+    reference = _full_export(engine)
     for name, ref in reference.items():
-        assert torch.equal(rollout_state[name].view(torch.int16), ref.view(torch.int16)), name
+        assert torch.equal(rollout_state[name], ref), name
 
     # The snapshot refreshes on every export: a second delta ships nothing.
     deltas, _ = engine.get_per_tensor_param_delta_shard()

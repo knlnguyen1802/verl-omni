@@ -58,6 +58,10 @@ class VLLMOmniServerAdapter(ServerAdapter):
         def _flatten(flushes):
             # Every rank must iterate the flush generator to the end: the receive
             # loop's collective broadcasts deadlock otherwise.
+            # Dropping the per-flush is_last is safe: DeltaFlushReceiver keys flush
+            # boundaries off the sentinel protocol, and the bucketed channel marks
+            # its final bucket is_last after this generator is drained, which is
+            # what triggers DeltaFlushReceiver.finish().
             for named, _is_last in flushes:
                 yield from named
 
