@@ -169,9 +169,19 @@ def test_separate_async_refuses_to_pad_invalid_local_batch(batch_size, dp_size, 
         trainer._balance_batch(data, {})
 
 
+class _SyncTrainerStub(PolicyGradientDiffusionTrainerV1):
+    """Concrete stub: object.__new__ rejects the ABC since on_step_end/on_sample_end went abstract."""
+
+    def on_step_end(self):
+        pass
+
+    def on_sample_end(self):
+        pass
+
+
 def test_sync_balance_batch_zeros_duplicated_pad_row_advantages():
     """Duplicated pad rows from _balance_batch must not feed the loss (#561)."""
-    trainer = object.__new__(PolicyGradientDiffusionTrainerV1)
+    trainer = object.__new__(_SyncTrainerStub)
     trainer.trainer_mode = "sync"
     trainer.actor_rollout_wg = SimpleNamespace(_query_dispatch_info=lambda _mesh_name: [0, 1, 2, 3])
     trainer.config = OmegaConf.create(

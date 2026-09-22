@@ -1190,6 +1190,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if is_pad is None or not is_pad.any():
             return data
         advantages = data.batch["advantages"]
+        is_pad = torch.from_numpy(is_pad).to(advantages.device)
         advantages[is_pad] = 0.0
         return data
 
