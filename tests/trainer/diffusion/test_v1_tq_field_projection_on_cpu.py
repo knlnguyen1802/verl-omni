@@ -97,6 +97,7 @@ def test_metrics_fetches_only_metric_fields_and_preserves_outputs(monkeypatch, c
         tokenizer=SimpleNamespace(pad_token_id=7),
         _get_n_gpus_for_throughput=lambda: 2,
         _is_direct_preference=not policy_gradient,
+        _pending_metric_data=[],
     )
     batch_meta = SimpleNamespace(
         keys=["prompt_0_0", "prompt_1_0"],
@@ -174,6 +175,7 @@ def test_metrics_keeps_training_when_response_shape_telemetry_is_unavailable(mon
         tokenizer=SimpleNamespace(pad_token_id=0),
         _get_n_gpus_for_throughput=lambda: 1,
         _is_direct_preference=True,
+        _pending_metric_data=[],
     )
     tags = []
     for response_shape in response_shapes:
@@ -218,6 +220,7 @@ def test_metrics_ignores_padding_without_response_shape(monkeypatch, caplog):
         tokenizer=SimpleNamespace(pad_token_id=0),
         _get_n_gpus_for_throughput=lambda: 1,
         _is_direct_preference=True,
+        _pending_metric_data=[],
     )
     batch_meta = SimpleNamespace(
         keys=["sample_0_0", "padding_0_0"],
@@ -247,3 +250,124 @@ def test_metrics_ignores_padding_without_response_shape(monkeypatch, caplog):
     assert metrics["training/tq_response_shape_unavailable"] == 0.0
     assert "response_shape telemetry is unavailable" not in caplog.text
     assert "2 trajectories, 1 real images, responses shape=(1, 3, 256, 256)" in caplog.text
+
+
+def _metric_cache_trainer(pending_metric_data, pad_token_id=7):
+    return SimpleNamespace(
+        tokenizer=SimpleNamespace(pad_token_id=pad_token_id),
+        _get_n_gpus_for_throughput=lambda: 2,
+        _is_direct_preference=False,
+        _pending_metric_data=pending_metric_data,
+    )
+
+
+def _metric_cache_batch_meta(n_keys):
+    return SimpleNamespace(
+        keys=[f"prompt_{index}_0" for index in range(n_keys)],
+        tags=[{"is_padding": False, "min_global_steps": 1, "max_global_steps": 1} for _ in range(n_keys)],
+        partition_id="train",
+    )
+
+
+def test_metrics_reuses_cached_training_data_without_tq_fetch(monkeypatch):
+    data = DataProto.from_dict(
+        tensors={
+            "sample_level_rewards": torch.tensor([[1.0, 1.0], [3.0, 3.0]]),
+            "sample_level_scores": torch.tensor([[1.0], [3.0]]),
+            "advantages": torch.tensor([[1.0, -1.0], [2.0, -2.0]]),
+            "returns": torch.tensor([[0.5, -0.5], [1.5, -1.5]]),
+        },
+        non_tensors={"uid": np.array(["prompt", "prompt"], dtype=object)},
+    )
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("metrics must not re-read TransferQueue when trained rows are cached")
+
+    monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", fail_fetch)
+    trainer = _metric_cache_trainer([data])
+    metrics = {}
+
+    trainer_base_module.PolicyGradientDiffusionTrainerV1._compute_metrics(
+        trainer,
+        _metric_cache_batch_meta(2),
+        metrics,
+        {"step": 2.0, "gen": 1.0},
+        global_steps=2,
+        epoch=0,
+    )
+
+    assert metrics["critic/rewards/mean"] == pytest.approx(2.0)
+    assert metrics["critic/advantages/mean"] == pytest.approx(0.0)
+    assert metrics["perf/total_num_images"] == 2
+    assert trainer._pending_metric_data == []
+
+
+def test_metrics_concatenates_cached_data_across_parameter_sync_triggers(monkeypatch):
+    first = DataProto.from_dict(
+        tensors={
+            "sample_level_rewards": torch.tensor([[1.0], [2.0]]),
+            "sample_level_scores": torch.tensor([[1.0], [2.0]]),
+        }
+    )
+    second = DataProto.from_dict(
+        tensors={
+            "sample_level_rewards": torch.tensor([[3.0], [4.0]]),
+            "sample_level_scores": torch.tensor([[3.0], [4.0]]),
+        }
+    )
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("metrics must not re-read TransferQueue when trained rows are cached")
+
+    monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", fail_fetch)
+    trainer = _metric_cache_trainer([first, second])
+    metrics = {}
+
+    trainer_base_module.PolicyGradientDiffusionTrainerV1._compute_metrics(
+        trainer,
+        _metric_cache_batch_meta(4),
+        metrics,
+        {"step": 2.0},
+        global_steps=2,
+        epoch=0,
+    )
+
+    assert metrics["critic/rewards/mean"] == pytest.approx(2.5)
+    assert metrics["perf/total_num_images"] == 4
+    assert trainer._pending_metric_data == []
+
+
+def test_metrics_refetches_transfer_queue_when_cached_rows_mismatch(monkeypatch, caplog):
+    stale = DataProto.from_dict(
+        tensors={
+            "sample_level_rewards": torch.zeros(1, 2),
+            "sample_level_scores": torch.zeros(1, 1),
+        }
+    )
+    fallback = DataProto.from_dict(
+        tensors={
+            "sample_level_rewards": torch.ones(2, 2),
+            "sample_level_scores": torch.ones(2, 1),
+        }
+    )
+
+    def get_data(batch_meta, pad_token_id, select_fields):
+        return fallback
+
+    monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", get_data)
+    trainer = _metric_cache_trainer([stale])
+    metrics = {}
+
+    with caplog.at_level(logging.WARNING, logger=trainer_base_module.logger.name):
+        trainer_base_module.PolicyGradientDiffusionTrainerV1._compute_metrics(
+            trainer,
+            _metric_cache_batch_meta(2),
+            metrics,
+            {"step": 1.0},
+            global_steps=1,
+            epoch=0,
+        )
+
+    assert metrics["critic/rewards/mean"] == pytest.approx(1.0)
+    assert "re-reading TransferQueue" in caplog.text
+    assert trainer._pending_metric_data == []
