@@ -186,6 +186,7 @@ Set `TRAIN_FILES` and `VAL_FILES` to use different parquet files.
 | `PICKSCORE_OFFLOAD` | `true` | Custom-function PickScore only: `true` moves the scorer to the host between scoring batches and spreads reward workers across GPUs, so colocated rollout weights plus scoring fit on one card; `false` keeps one resident scorer per reward worker. |
 | `PPO_MICRO_BATCH_PER_GPU` | `16` (≥8 GPUs), `8` (fewer) | Actor training micro-batch per GPU. Fewer GPUs double the per-rank FSDP shard while activations stay per-rank, so the default halves below 8 GPUs; override when tuning memory. |
 | `LOGPROB_MICRO_BATCH_PER_GPU` | `32` (≥8 GPUs), `16` (fewer) | Actor and reference log-probability micro-batch per GPU; same scaling rule. |
+| `DUMP_GENERATIONS` | `false` | `true` passes `trainer.rollout_data_dir` / `trainer.validation_data_dir`, writing per-step rollout and validation images to JSONL under the output log dir (the `Dumped generations` files). Off by default: per-step serialization adds CPU and disk load beside the rollout workers. |
 
 The launcher configures `reward.models.pickscore.backend=native`; the same-name
 `reward.reward_functions.pickscore` entry binds automatically. Native workers
@@ -302,5 +303,6 @@ checkpoint. A successful run ends with:
 FlowGRPO Qwen-Image-Edit e2e test passed (training completed successfully).
 ```
 
-Training logs and generated validation images are written below
-`$WORKSPACE/outputs/qwen_image_edit_lora/` by the full example launcher.
+Training logs are written below `$WORKSPACE/outputs/qwen_image_edit_lora/` by
+the full example launcher. Per-step rollout and validation image JSONL dumps
+are opt-in with `DUMP_GENERATIONS=true`.

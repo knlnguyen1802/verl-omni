@@ -44,6 +44,12 @@ run_timestamp=$(date +"%Y%m%d_%H%M")
 log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
 rollout_data_dir=$output_dir/logs/$run_timestamp/rollout_images
 val_data_dir=$output_dir/logs/$run_timestamp/val_images
+# Per-step rollout/validation image dumps are opt-in: serializing each step's
+# images to JSONL adds CPU and disk load beside the rollout workers.
+dump_args=()
+if [ "${DUMP_GENERATIONS:-false}" = "true" ]; then
+    dump_args+=("+trainer.rollout_data_dir=$rollout_data_dir" "+trainer.validation_data_dir=$val_data_dir")
+fi
 mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
 exec > >(tee -a "$log_file") 2>&1
 echo "Logging to $log_file"
@@ -101,8 +107,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.project_name=flow_grpo \
     trainer.experiment_name=qwen_image_edit_lora_pickscore \
     trainer.default_local_dir=$checkpoint_dir \
-    +trainer.rollout_data_dir=$rollout_data_dir \
-    +trainer.validation_data_dir=$val_data_dir \
+    "${dump_args[@]}" \
     trainer.log_val_generations=8 \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
