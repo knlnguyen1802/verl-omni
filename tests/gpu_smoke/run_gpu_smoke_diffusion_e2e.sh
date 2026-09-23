@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ci-e2e-diffusion GPU smoke tests (4-GPU): end-to-end diffusion training paths.
-# Models with a landed v1 recipe run on the V1 sync trainer (FlowGRPO, online
-# DPO, DiffusionNFT, MiniMax-H3 T2VA) and the async V1 trainers keep their
-# dedicated tests (FlowGRPO separate_async, two-teacher OPD). Qwen-Image-Edit
-# and Bagel PickScore stay on v0 until their v1 recipes land (#499, #511); the
-# v0 sync-separate smoke keeps shipped-default v0 distributed coverage — its v1
-# counterpart is the separate_async test.
+# Models with a landed v1 recipe run on the V1 sync trainer (Qwen-Image-Edit,
+# FlowGRPO, online DPO, DiffusionNFT, MiniMax-H3 T2VA) and the async V1
+# trainers keep their dedicated tests (FlowGRPO separate_async, two-teacher
+# OPD). Bagel PickScore stays on v0 until its v1 recipe lands (#511); the
+# sync-separate smoke keeps the deprecated v0 distributed path covered
+# (pinned trainer.use_v1=false) — its v1 counterpart is the separate_async test.
 
 set -euo pipefail
 
@@ -35,7 +35,7 @@ run_qwen_image_edit_flowgrpo_e2e() {
         bash tests/special_e2e/run_flowgrpo_qwen_image_edit.sh "${diffusion_trainer_args[@]}"
 }
 
-run_test 0 "Qwen-Image-Edit FlowGRPO trainer e2e" \
+run_test 0 "Qwen-Image-Edit FlowGRPO v1 sync trainer e2e" \
     run_qwen_image_edit_flowgrpo_e2e
 
 run_test 1 "FlowGRPO v1 sync trainer e2e" \
