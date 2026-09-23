@@ -2,9 +2,10 @@
 # ci-e2e-diffusion GPU smoke tests (4-GPU): end-to-end diffusion training paths.
 # Models with a landed v1 recipe run on the V1 sync trainer (FlowGRPO, online
 # DPO, DiffusionNFT, MiniMax-H3 T2VA) and the async V1 trainers keep their
-# dedicated tests (FlowGRPO separate_async, two-teacher OPD). Qwen-Image-Edit,
-# Bagel PickScore, and the v0 synchronous separate layout stay on v0 until
-# their v1 recipes land.
+# dedicated tests (FlowGRPO separate_async, two-teacher OPD). Qwen-Image-Edit
+# and Bagel PickScore stay on v0 until their v1 recipes land (#499, #511); the
+# v0 sync-separate smoke keeps shipped-default v0 distributed coverage — its v1
+# counterpart is the separate_async test.
 
 set -euo pipefail
 
