@@ -395,7 +395,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-tp", type=int, default=int(os.environ.get("ROLLOUT_TP", 1)))
     parser.add_argument("--text-encoder-tp", type=int, default=1)
     parser.add_argument("--total-steps", type=int, default=int(os.environ.get("TOTAL_TRAINING_STEPS", 2)))
-    parser.add_argument("--ray-num-cpus", type=int, default=int(os.environ.get("RAY_NUM_CPUS", 16)))
+    # Ray CPU budget: the V1 trainer force-enables TransferQueue (1 controller
+    # + 8 SimpleStorageUnit actors, num_cpus=1 each) before the placement group
+    # is created, and that group reserves num_gpus * max_colocate_count(=3)
+    # CPUs. With 4 GPUs the floor is 1 (runner) + 9 (transfer queue) + 12
+    # (placement group) = 22 CPUs; 16 left pg.ready() unsatisfiable forever.
+    parser.add_argument("--ray-num-cpus", type=int, default=int(os.environ.get("RAY_NUM_CPUS", 40)))
     # H3 requires 4-15 output seconds; 97 frames at 24 fps is 4.04 seconds.
     parser.add_argument("--height", type=int, default=160)
     parser.add_argument("--width", type=int, default=288)
