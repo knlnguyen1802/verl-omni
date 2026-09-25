@@ -8,6 +8,9 @@
 #   - actor_rollout_ref.rollout.nnodes > 0  (standalone rollout on dedicated GPUs)
 #   - actor_rollout_ref.rollout.checkpoint_engine.backend != naive
 #   - data.train_batch_size == parameter_sync_step * actor.ppo_mini_batch_size.
+#   - actor offload stays off: the trainer pool is dedicated, so offload would
+#     only add CPU<->GPU swap time, and CPU-resident parameters feed the
+#     decoupled-PPO snapshot dance (verl-project/verl-omni#645).
 #
 # Data preparation (run once):
 #   pip install math-verify
@@ -63,8 +66,8 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=true \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+    actor_rollout_ref.actor.fsdp_config.param_offload=false \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.nnodes=1 \
     actor_rollout_ref.rollout.n_gpus_per_node=2 \
