@@ -1,17 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3-Omni Thinker GSPO + LoRA training on MMK12 with the omni separate-async V1 trainer.
-# 4 GPUs: 2 for the FSDP trainer, 2 for one standalone TP=2 rollout replica.
-# Generation runs one batch ahead of training; weights sync to the standalone
-# replicas every trainer.v1.separate_async.parameter_sync_step steps.
-#
-# Requirements:
-#   - actor_rollout_ref.rollout.nnodes > 0  (standalone rollout on dedicated GPUs)
-#   - actor_rollout_ref.rollout.checkpoint_engine.backend != naive
-#   - data.train_batch_size == parameter_sync_step * actor.ppo_mini_batch_size.
-#   - actor offload stays off: the trainer pool is dedicated, so offload would
-#     only add CPU<->GPU swap time, and CPU-resident parameters feed the
-#     decoupled-PPO snapshot dance (verl-project/verl-omni#645).
-#
+# Qwen3-Omni Thinker GSPO + LoRA training on MMK12 with omni V1 colocate-async trainer.
 # Data preparation (run once):
 #   pip install math-verify
 #   python examples/gspo_trainer/data_process/mmk12.py \
@@ -27,12 +15,9 @@ set -x
 # Make verl_omni available to Ray workers
 export VERL_USE_EXTERNAL_MODULES=verl_omni
 
-# Set WORKSPACE to any writable directory; defaults to $HOME
-WORKSPACE=${WORKSPACE:-$HOME}
-
-MODEL_PATH=${MODEL_PATH:-"$WORKSPACE/models/Qwen/Qwen3-Omni-30B-A3B-Instruct"}
-TRAIN_FILE=${TRAIN_FILE:-"$WORKSPACE/data/mmk12/train.parquet"}
-VAL_FILE=${VAL_FILE:-"$WORKSPACE/data/mmk12/test.parquet"}
+MODEL_PATH=${MODEL_PATH:-"$HOME/models/Qwen/Qwen3-Omni-30B-A3B-Instruct"}
+TRAIN_FILE=${TRAIN_FILE:-"$HOME/data/mmk12/train.parquet"}
+VAL_FILE=${VAL_FILE:-"$HOME/data/mmk12/test.parquet"}
 
 python3 -m verl_omni.trainer.main_omni \
     data.train_files="${TRAIN_FILE}" \
@@ -46,7 +31,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=64 \
     actor_rollout_ref.model.lora_dtype=float32 \
-    actor_rollout_ref.model.lora.merge=False \
+    actor_rollout_ref.model.lora.merge=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.exclude_modules=".*talker.*|.*code2wav.*|.*code_predictor.*|.*visual.*|.*audio_tower.*" \
@@ -66,13 +51,10 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=false \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
+    actor_rollout_ref.actor.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.n=16 \
-    actor_rollout_ref.rollout.nnodes=1 \
-    actor_rollout_ref.rollout.n_gpus_per_node=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=nccl \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.prompt_length=4160 \
@@ -81,6 +63,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.output_mode="ar" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name="qwen3_omni_moe" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.mm_processor_cache_gb=0 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
@@ -94,16 +77,15 @@ python3 -m verl_omni.trainer.main_omni \
     reward.reward_manager.name=naive \
     reward.custom_reward_function.path=verl_omni/utils/reward_score/mmk12_reward.py \
     reward.custom_reward_function.name=compute_score \
-    trainer.v1.trainer_mode=omni_separate_async \
-    trainer.v1.separate_async.num_warmup_batches=1 \
-    trainer.v1.separate_async.parameter_sync_step=8 \
     trainer.val_before_train=false \
     trainer.balance_batch=True \
     trainer.critic_warmup=0 \
+    trainer.v1.trainer_mode=omni_colocate_async \
+    trainer.v1.colocate_async.num_warmup_batches=2 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=gspo \
-    trainer.experiment_name=qwen3_omni_thinker_lora_mmk12_separate_async \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name=qwen3_omni_thinker_lora_mmk12_colocate_async \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \

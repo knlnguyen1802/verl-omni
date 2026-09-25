@@ -43,6 +43,30 @@ def validate_config(config: Any) -> None:
     if resume_mode == "resume_path" and not _select(config, "trainer.resume_from_path"):
         raise ValueError("trainer.resume_from_path must be set when trainer.resume_mode='resume_path'.")
 
+    # Decoupled-PPO snapshot aliasing (verl-project/verl-omni#645): with
+    # param_offload=true the shards are CPU-resident when the snapshot dance
+    # runs, and verl's fsdp2_sharded_save_to_cpu returns storage-sharing views,
+    # so restore_model_from_cpu(0) rewrites the slot of the current step and
+    # every local update resets to the cycle-start policy — training silently
+    # freezes. Only omni_separate_async routes through OmniDetachActorWorker,
+    # which clones aliased slots; the plain separate_async mode (diffusion v1)
+    # uses verl's DetachActorWorker with the raw helpers and cannot honor this
+    # combination. fsdp1's save helper already copies, so it is exempt.
+    if (
+        _select(config, "trainer.v1.trainer_mode") == "separate_async"
+        and _select(config, "trainer.v1.separate_async.parameter_sync_step", 1) > 1
+        and _select(config, "actor_rollout_ref.actor.fsdp_config.param_offload", False)
+        and _select(config, "actor_rollout_ref.actor.strategy") in ("fsdp2", "veomni")
+    ):
+        raise ValueError(
+            "trainer.v1.trainer_mode='separate_async' with parameter_sync_step>1 cannot use "
+            "actor.fsdp_config.param_offload=true on fsdp2/veomni: the decoupled-PPO CPU "
+            "snapshots would alias the live (offloaded) parameters and silently reset every "
+            "local update to the cycle-start policy. Set param_offload=false (the trainer "
+            "GPUs are dedicated in separate-async), or for omni models use "
+            "trainer_mode='omni_separate_async', whose worker owns snapshot storage."
+        )
+
     total_steps = _select(config, "trainer.total_training_steps")
     if total_steps is not None:
         try:

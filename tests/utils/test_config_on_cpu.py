@@ -60,3 +60,34 @@ def test_validate_config_no_sync_gradient_accumulation(strategy, enabled):
             validate_config(config)
     else:
         validate_config(config)
+
+
+def _separate_async_config(param_offload, sync_step, strategy="fsdp2", trainer_mode="separate_async"):
+    config = _config()
+    config.trainer.v1 = {"trainer_mode": trainer_mode, "separate_async": {"parameter_sync_step": sync_step}}
+    config.actor_rollout_ref = {"actor": {"strategy": strategy, "fsdp_config": {"param_offload": param_offload}}}
+    return config
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni", "megatron"])
+@pytest.mark.parametrize("param_offload", [False, True])
+@pytest.mark.parametrize("sync_step", [1, 8])
+def test_validate_config_rejects_offloaded_decoupled_ppo_snapshots(param_offload, sync_step, strategy):
+    # verl-project/verl-omni#645: the plain separate_async mode runs the
+    # decoupled-PPO snapshot dance on verl's raw DetachActorWorker, whose
+    # fsdp2 save helper returns storage-sharing views for offloaded
+    # (CPU-resident) shards — training silently freezes at
+    # parameter_sync_step>1. omni_separate_async is exempt (its worker
+    # clones aliased slots) and so is fsdp1 (its save helper already copies).
+    config = _separate_async_config(param_offload, sync_step, strategy)
+    if param_offload and sync_step > 1 and strategy in ("fsdp2", "veomni"):
+        with pytest.raises(ValueError, match="silently reset every"):
+            validate_config(config)
+    else:
+        validate_config(config)
+
+
+def test_validate_config_allows_omni_separate_async_offload():
+    # The omni worker owns snapshot storage, so offload stays a valid (if
+    # slower) choice there.
+    validate_config(_separate_async_config(True, 8, trainer_mode="omni_separate_async"))
