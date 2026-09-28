@@ -230,7 +230,17 @@ class ARStrategy(OmniStrategyBase):
             engine_args["compilation_config"] = _drop_none_mapping_values(engine_args["compilation_config"])
 
     def collective_rpc_stage_ids(self, method: Any) -> list[int] | None:
-        if method in {"set_pending_lora_peft_config", "update_weights_from_ipc"}:
+        # The delta names are verl's ServerAdapter._update_delta_weights protocol;
+        # broadcasting a delta receive to non-weight-sync stages would block on a
+        # ZMQ handle nobody sends to.
+        if method in {
+            "set_pending_lora_peft_config",
+            "update_weights_from_ipc",
+            "init_weight_transfer_engine",
+            "start_weight_update",
+            "update_verl_delta_weights",
+            "finish_weight_update",
+        }:
             return self._weight_sync_stage_ids
         return None
 

@@ -63,10 +63,10 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
 class OmniCheckpointEngineWorker(CheckpointEngineWorker):
     """``CheckpointEngineWorker`` that admits ``delta_sharded`` for the vllm_omni rollout.
 
-    verl gates the delta backend to sglang at construction because its sparse apply
-    rides sglang's custom-weight-loader hook; verl-omni applies deltas in the
-    vllm-omni worker extension (``update_weights_from_ipc``), so the gate is widened
-    here. Other backends use the parent construction unchanged.
+    verl gates the delta backend to sglang at construction because its vLLM consumer
+    rides the vLLM weight-transfer engine; verl-omni applies deltas in the vllm-omni
+    worker extension (verl's ``update_verl_delta_weights`` protocol), so the gate is
+    widened here. Other backends use the parent construction unchanged.
     """
 
     def __init__(self, rollout_config, model_config, server_adapter=None, *args, **kwargs):

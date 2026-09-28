@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 import time
@@ -37,6 +38,15 @@ def _model_has_fused_moe(model) -> bool:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
     return any(isinstance(layer, RoutedExperts) for layer in model.modules())
+
+
+def _is_dense_seed(payload: list) -> bool:
+    """Whether one received delta flush is the delta engine's full-weight dense seed."""
+    for name, tensor in payload:
+        if name == "__delta_spec__":
+            spec = json.loads(bytes(tensor.cpu().numpy().tobytes()).decode())
+            return spec["encoding"] == "dense" and not spec.get("verify")
+    return False
 
 
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
@@ -107,7 +117,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         base_sync_done=False,
         use_shm: bool = False,
         zmq_update_id: str | None = None,
-        delta_flush: bool = False,
     ):
         """Update the weights of the rollout model.
 
@@ -115,9 +124,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         atomically via a single ``add_lora`` call, avoiding per-bucket partial loading.
         For full-weight updates, weights are streamed bucket-by-bucket via
         ``load_weights`` to keep GPU memory usage bounded.
-        With ``delta_flush=True`` (the ``delta_sharded`` checkpoint engine), the stream
-        carries per-flush sparse payloads: the dense seed loads through the same
-        ``load_weights`` path, steady deltas apply in place by HF coordinate.
         """
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
@@ -127,12 +133,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             base_sync_done = True
             # Consume the stash so a subsequent full-weight sync isn't misrouted.
             self._pending_lora_peft_config = None
-
-        if delta_flush and peft_config is not None:
-            raise ValueError(
-                "delta_sharded weight sync does not apply LoRA adapters; "
-                "run full-weight training or use a non-delta checkpoint engine backend."
-            )
 
         if self.device is None:
             raise RuntimeError("Worker device is not set.")
@@ -144,10 +144,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             device=self.device,
             use_shm=use_shm,
         )
-
-        if delta_flush:
-            self._update_weights_from_delta_ipc(receiver)
-            return
 
         if peft_config and base_sync_done:
             # In async mode, make sure the old lora is removed before adding the new one
@@ -277,15 +273,34 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                     raise RuntimeError("Diffusion pipeline worker has no load_weights-capable pipeline")
                 receiver.receive_weights(on_bucket_received=lambda weights, *args, **kwargs: load_fn(weights))
 
-    def _update_weights_from_delta_ipc(self, receiver) -> None:
-        """Receive ``delta_sharded`` flushes and apply them in place.
+    # verl's ``ServerAdapter._update_delta_weights`` RPC protocol
+    # (checkpoint_engine.backend="delta_sharded", wire_format="delta_flush").
+    # verl's own vLLM consumer rides the vLLM weight-transfer engine, which needs
+    # the checkpoint-patch API the pinned vllm-omni stack does not ship, so the
+    # receive/apply is implemented here: one flush per ``update_verl_delta_weights``
+    # RPC, applied through verl's shared ``delta_loader.apply_delta``.
 
-        The dense seed flush decodes to full tensors and loads through the same
-        ``load_weights`` path as the bucketed full-weight sync (plus the AR-side
-        post-load processing pass); steady flushes apply sparse updates into the
-        live weights. See :mod:`verl_omni.workers.rollout.vllm_rollout.delta_apply`.
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Delta sync handshake: the omni apply needs no transfer engine."""
+
+    def start_weight_update(self) -> None:
+        """Delta sync handshake: every flush applies in place, nothing to arm."""
+
+    def finish_weight_update(self) -> None:
+        """Delta sync handshake: sparse patches need no post-update finalize."""
+
+    def update_verl_delta_weights(self, update_info: dict) -> None:
+        """Receive and apply one ``delta_sharded`` flush from the actor.
+
+        verl's server adapter posts one RPC per flush and streams that flush's
+        sentinel tensors (``__delta_spec__`` / ``__positions__`` / ``__values__``)
+        over this worker's ZMQ channel; a flush may span several buckets and the
+        receiver reuses its IPC buffer, so the payload is retained privately until
+        the whole flush is decoded and applied.
         """
-        from verl_omni.workers.rollout.vllm_rollout.delta_apply import DeltaFlushReceiver
+        from verl.workers.rollout.sglang_rollout.delta_loader import apply_delta
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
         from verl_omni.workers.rollout.vllm_rollout.npu_utils import _is_npu_platform
 
         if _is_npu_platform():
@@ -316,9 +331,16 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             else:
                 raise RuntimeError("Diffusion pipeline worker has no load_weights-capable pipeline")
 
-        applier = DeltaFlushReceiver(load_target)
-        receiver.receive_weights(on_bucket_received=applier.on_bucket)
-        if applier.saw_seed and standard is not None:
+        payload: list[tuple[str, torch.Tensor]] = []
+        receiver = BucketedWeightReceiver(zmq_handle=self._get_zmq_handle(), device=self.device, use_shm=False)
+        receiver.receive_weights(
+            on_bucket_received=lambda weights, *args, **kwargs: payload.extend(
+                (name, tensor.clone()) for name, tensor in weights
+            )
+        )
+        dense_seed = _is_dense_seed(payload)
+        apply_delta(load_target, payload)
+        if dense_seed and standard is not None:
             # The seed is a full load through load_weights; run the same single
             # post-load processing pass as the bucketed full-weight path.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
