@@ -62,8 +62,15 @@ class VLLMOmniServerAdapter(ServerAdapter):
             # boundaries off the sentinel protocol, and the bucketed channel marks
             # its final bucket is_last after this generator is drained, which is
             # what triggers DeltaFlushReceiver.finish().
-            for named, _is_last in flushes:
-                yield from named
+            # Sentinels are suffixed with the flush index: BucketedWeightSender
+            # keys each IPC bucket's metadata dict by tensor name, and several
+            # flushes share one bucket (sentinels are small), so a repeated
+            # canonical name would overwrite the earlier flush's metadata entry
+            # while its bytes stay unreferenced in the buffer. DeltaFlushReceiver
+            # parses the suffix back off.
+            for flush_idx, (named, _is_last) in enumerate(flushes):
+                for name, tensor in named:
+                    yield f"{name}#{flush_idx}", tensor
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(

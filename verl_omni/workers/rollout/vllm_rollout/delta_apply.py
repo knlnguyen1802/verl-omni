@@ -38,6 +38,8 @@ SPEC_NAME = "__delta_spec__"
 POSITIONS_NAME = "__positions__"
 VALUES_NAME = "__values__"
 
+_SENTINEL_NAMES = (SPEC_NAME, POSITIONS_NAME, VALUES_NAME)
+
 
 class DeltaFlushReceiver:
     """Accumulate bucketed sentinel tensors into whole delta flushes and apply them.
@@ -60,20 +62,29 @@ class DeltaFlushReceiver:
         self.applied_flushes = 0
 
     def on_bucket(self, weights: list, is_last: bool = False) -> None:
-        """Consume one bucket of the delta stream; applies every flush it completes."""
+        """Consume one bucket of the delta stream; applies every flush it completes.
+
+        Sentinel names may carry a ``#<flush_index>`` suffix: the bucketed sender
+        keys each IPC bucket's metadata dict by tensor name, so the server adapter
+        uniquifies each flush's sentinels to keep same-name entries from separate
+        flushes sharing a bucket from overwriting each other. The suffix carries no
+        protocol meaning here -- flush boundaries stay keyed off the sentinel
+        ordering -- it only has to parse back to the canonical name.
+        """
         for name, tensor in weights:
-            if name == SPEC_NAME:
+            base, hash_, suffix = name.partition("#")
+            if base not in _SENTINEL_NAMES or (hash_ and not suffix.isdigit()):
+                raise ValueError(f"delta stream: unexpected tensor {name!r}")
+            if base == SPEC_NAME:
                 if self._spec_tensor is not None:
                     raise RuntimeError("delta stream: a new flush spec arrived before the previous flush's values")
                 self._spec_tensor = tensor.clone()
-            elif name == POSITIONS_NAME:
+            elif base == POSITIONS_NAME:
                 if self._positions is not None:
                     raise RuntimeError("delta stream: duplicate positions blob within one flush")
                 self._positions = tensor.clone()
-            elif name == VALUES_NAME:
+            elif base == VALUES_NAME:
                 self._apply(tensor)
-            else:
-                raise ValueError(f"delta stream: unexpected tensor {name!r}")
         if is_last:
             self.finish()
 

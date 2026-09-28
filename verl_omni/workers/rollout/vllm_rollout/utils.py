@@ -32,6 +32,13 @@ def _split_visible_devices(value: str) -> list[str]:
     return [entry.strip() for entry in value.split(",") if entry.strip()]
 
 
+def _model_has_fused_moe(model) -> bool:
+    """Whether the rollout model contains vLLM ``RoutedExperts`` (fused-MoE) modules."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    return any(isinstance(layer, RoutedExperts) for layer in model.modules())
+
+
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
     The class for vLLM-Omni's worker to inherit from, in the colocate setting.
@@ -228,11 +235,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                 # Dense omni loaders may copy auxiliary encoder buffers and
                 # derive runtime tensors inside load_weights; turning those
                 # tensors into meta placeholders breaks their loading contract.
-                has_moe = False
-                if not is_npu:
-                    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-                    has_moe = any(isinstance(layer, RoutedExperts) for layer in model.modules())
+                has_moe = not is_npu and _model_has_fused_moe(model)
                 if is_npu or not has_moe:
                     if is_npu:
                         restore_moe_param_layout(model, model_config.hf_text_config.hidden_size)
@@ -293,11 +296,16 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         standard = self._get_standard_weight_model_and_config()
         if standard is not None:
             model, model_config = standard
-            # Same FusedMoE weight_loader patch as the bucketed full-weight path, so
-            # delta entries for HF expert names route into the fused params.
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-
-            patch_vllm_moe_model_weight_loader(model)
+            # The full-weight path runs fused-MoE rollouts through the checkpoint
+            # layout reload dance around load_weights; the sparse in-place delta
+            # apply does not reproduce it, so HF-coordinate expert updates would
+            # land on runtime-layout fused storage. Fail closed until that path
+            # exists (e.g. the Qwen3-Omni thinker).
+            if _model_has_fused_moe(model):
+                raise NotImplementedError(
+                    "delta_sharded weight sync does not support fused-MoE rollout models yet; "
+                    "use a non-delta checkpoint engine backend for this model."
+                )
             load_target = model
         else:
             pipeline = getattr(getattr(self, "model_runner", None), "pipeline", None)

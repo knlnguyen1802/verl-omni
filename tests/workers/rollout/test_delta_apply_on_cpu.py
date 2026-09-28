@@ -259,6 +259,64 @@ def test_flush_split_across_buckets(monkeypatch):
         assert torch.equal(target.state[name], ref), name
 
 
+def test_two_flushes_share_one_bucket(monkeypatch):
+    """The common steady-state shape: several flushes' sentinels land in one IPC bucket.
+
+    The bucketed sender keys bucket metadata by tensor name, so the adapter must
+    suffix each flush's sentinels -- a repeated canonical name would overwrite the
+    earlier flush's metadata entry and drop or corrupt its payload.
+    """
+    torch.manual_seed(0)
+    module = _ToyDiT()
+    _patch_engine_helpers(monkeypatch)
+    engine = _make_engine(module)
+
+    seed_params = _seed_export(engine)
+    target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
+    _run_delta_ipc(_delta_worker(target), [_encode_dense_flush(seed_params)], monkeypatch)
+    engine.prime_delta_snapshots()
+
+    with torch.no_grad():
+        module.blocks[0].weight.view(-1)[1] += 0.25
+    flush0 = [(f"{name}#0", t) for name, t in _encode_indices_flush(engine.get_per_tensor_param_delta_shard()[0])]
+    with torch.no_grad():
+        module.blocks[1].weight.view(-1)[2] -= 1.0
+    flush1 = [(f"{name}#1", t) for name, t in _encode_indices_flush(engine.get_per_tensor_param_delta_shard()[0])]
+
+    # Both flushes arrive inside a single bucket, interleaved as the flat wire does.
+    _run_delta_ipc(_delta_worker(target), [flush0 + flush1], monkeypatch)
+
+    reference = dict(_seed_export(engine))
+    for name, ref in reference.items():
+        assert torch.equal(target.state[name], ref), name
+
+
+def test_delta_apply_rejects_fused_moe_rollout(monkeypatch):
+    from verl_omni.workers.rollout.vllm_rollout import npu_utils
+    from verl_omni.workers.rollout.vllm_rollout import utils as rollout_utils
+
+    monkeypatch.setattr(npu_utils, "_is_npu_platform", lambda: False)
+
+    class _FakeRoutedExperts(torch.nn.Module):
+        pass
+
+    import vllm.model_executor.layers.fused_moe.routed_experts as routed_experts_module
+
+    monkeypatch.setattr(routed_experts_module, "RoutedExperts", _FakeRoutedExperts)
+    assert not rollout_utils._model_has_fused_moe(torch.nn.Linear(2, 2))
+    model = torch.nn.Module()
+    model.moe = _FakeRoutedExperts()
+    assert rollout_utils._model_has_fused_moe(model)
+
+    worker = SimpleNamespace(
+        device=torch.device("cpu"),
+        _get_zmq_handle=lambda: "ipc:///tmp/test-delta.sock",
+        _get_standard_weight_model_and_config=lambda: (model, SimpleNamespace()),
+    )
+    with pytest.raises(NotImplementedError, match="fused-MoE"):
+        vLLMOmniColocateWorkerExtension._update_weights_from_delta_ipc(worker, MagicMock())
+
+
 def test_checksum_mismatch_raises(monkeypatch):
     torch.manual_seed(0)
     module = _ToyDiT()
@@ -373,7 +431,17 @@ def test_server_adapter_flattens_delta_flushes(monkeypatch):
     asyncio.run(adapter.update_weights(flushes, global_steps=3, wire_format="delta_flush"))
 
     assert calls == [("update_weights_from_ipc", {"use_shm": False, "delta_flush": True})]
-    assert [name for name, _ in sent] == [SPEC_NAME, VALUES_NAME, SPEC_NAME, POSITIONS_NAME, VALUES_NAME]
+    names = [name for name, _ in sent]
+    assert names == [
+        f"{SPEC_NAME}#0",
+        f"{VALUES_NAME}#0",
+        f"{SPEC_NAME}#1",
+        f"{POSITIONS_NAME}#1",
+        f"{VALUES_NAME}#1",
+    ]
+    # The invariant that keeps verl's name-keyed bucket metadata intact: one IPC
+    # bucket may hold several flushes' sentinels, so names must never repeat.
+    assert len(names) == len(set(names))
 
 
 def test_checkpoint_engine_worker_rejects_delta_for_non_vllm_omni():

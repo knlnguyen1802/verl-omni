@@ -75,15 +75,18 @@ checkpoint engine manager).
 last sync instead of the full model: a dense seed sync, then sparse
 (position, value) flushes with a per-flush checksum, applied in place on the
 replicas. It requires full-weight training, so it composes with neither the
-LoRA path above nor QAT; both raise at startup. The omni engine audit behind
-that gate: `OmniFSDPEngine` inherits verl's shard export
-(`state_dict` + `convert_weight_keys`, identity coordinates), which matches
-its own full export only for full-weight, non-QAT runs. The adapter export
-(`collect_lora_params`) and the merged-LoRA export (`normalize_peft_param_name`)
-produce different names, and QAT's `quantize_with_fusion` renames and repacks
-after conversion, so the engine additionally fails closed on those paths.
-Like the diffusion side, the omni delta path is CPU-test-covered but not yet
-GPU-verified.
+LoRA path above nor QAT; both raise at startup. It also raises at the first
+sync on fused-MoE rollout models such as the Qwen3-Omni thinker: the
+full-weight path reloads `RoutedExperts` modules through vLLM's
+checkpoint-layout restore, which the sparse in-place apply does not reproduce.
+The omni engine audit behind the other gates: `OmniFSDPEngine` inherits verl's
+shard export (`state_dict` + `convert_weight_keys`, identity coordinates),
+which matches its own full export only for full-weight, non-QAT runs. The
+adapter export (`collect_lora_params`) and the merged-LoRA export
+(`normalize_peft_param_name`) produce different names, and QAT's
+`quantize_with_fusion` renames and repacks after conversion, so the engine
+additionally fails closed on those paths. Like the diffusion side, the omni
+delta path is CPU-test-covered but not yet GPU-verified.
 
 ## Checkpoint recovery and dynamic GPU lending
 
