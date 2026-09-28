@@ -21,7 +21,6 @@ from typing import Any, Optional
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
-from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
@@ -541,19 +540,10 @@ class vLLMOmniReplica(vLLMReplica):
         )
         self.server_class = ray.remote(vLLMOmniHttpServer)
 
-    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        """Rollout worker actor class: verl-omni's checkpoint engine worker, which
-        admits the ``delta_sharded`` backend for the vllm_omni rollout (verl's worker
-        gates it to sglang)."""
-        from verl_omni.workers.checkpoint_engine import OmniCheckpointEngineWorker
-
-        rollout_worker_actor_cls = ray.remote(OmniCheckpointEngineWorker)
-        return RayClassWithInitArgs(
-            cls=rollout_worker_actor_cls,
-            rollout_config=self.config,
-            model_config=self.model_config,
-            replica_rank=self.replica_rank,
-        )
+    # The rollout worker actor class is verl's default
+    # (ray.remote(CheckpointEngineWorker)): the omni_delta_sharded backend
+    # passes verl's sglang-only "delta_sharded" gate by name and resolves
+    # through CheckpointEngineRegistry like any other backend.
 
     def _get_server_name_prefix(self) -> str:
         return "vllm_omni_"

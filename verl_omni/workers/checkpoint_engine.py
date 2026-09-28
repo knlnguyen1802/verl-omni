@@ -12,8 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ray
-from verl.checkpoint_engine import CheckpointEngineManager, CheckpointEngineWorker
+from verl.checkpoint_engine import CheckpointEngineManager, CheckpointEngineRegistry
 from verl.utils.ray_utils import auto_await
+
+# verl's CheckpointEngineWorker gates the "delta_sharded" backend to sglang
+# rollouts (its own consumer rides the sglang custom weight loader / the vLLM
+# weight-transfer engine of newer pins). verl-omni's vllm_omni rollout consumes
+# the same DeltaFlush wire in its own worker extension, so the identical engine
+# class is registered under a verl-omni name: verl's worker then constructs it
+# through CheckpointEngineRegistry untouched -- no subclass, no gate widening.
+# Importing this module performs the registration (see verl_omni/__init__.py).
+try:
+    from verl.checkpoint_engine import DeltaShardedCheckpointEngine
+
+    if DeltaShardedCheckpointEngine is not None:
+        CheckpointEngineRegistry.register("omni_delta_sharded")(DeltaShardedCheckpointEngine)
+except ImportError:  # verl records the failure; Registry.get reports it on use
+    pass
 
 
 class OmniCheckpointEngineManager(CheckpointEngineManager):
@@ -58,41 +73,3 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
             if result is not None:
                 return result
         return None
-
-
-class OmniCheckpointEngineWorker(CheckpointEngineWorker):
-    """``CheckpointEngineWorker`` that admits ``delta_sharded`` for the vllm_omni rollout.
-
-    verl gates the delta backend to sglang at construction because its vLLM consumer
-    rides the vLLM weight-transfer engine; verl-omni applies deltas in the vllm-omni
-    worker extension (verl's ``update_verl_delta_weights`` protocol), so the gate is
-    widened here. Other backends use the parent construction unchanged.
-    """
-
-    def __init__(self, rollout_config, model_config, server_adapter=None, *args, **kwargs):
-        backend = rollout_config.checkpoint_engine.backend
-        if backend != "delta_sharded" or rollout_config.name == "sglang":
-            super().__init__(rollout_config, model_config, server_adapter, *args, **kwargs)
-            return
-        if rollout_config.name != "vllm_omni":
-            raise NotImplementedError(
-                f"checkpoint_engine.backend='delta_sharded' currently supports only the vllm_omni "
-                f"rollout (got rollout.name={rollout_config.name!r}): the sparse apply lives in "
-                "the vllm-omni worker extension."
-            )
-        # Run the parent construction body with a gate-inert backend so Worker init,
-        # the rollout construction, and the process group stay verl's single source of
-        # truth, then swap in the delta engine. `backend` is the one field
-        # CheckpointEngineConfig lists in _mutable_fields.
-        from verl.checkpoint_engine import CheckpointEngineRegistry
-        from verl.utils.import_utils import import_external_libs
-
-        rollout_config.checkpoint_engine.backend = "naive"
-        try:
-            super().__init__(rollout_config, model_config, server_adapter, *args, **kwargs)
-        finally:
-            rollout_config.checkpoint_engine.backend = "delta_sharded"
-        bucket_size = rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
-        engine_kwargs = rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
-        import_external_libs(rollout_config.checkpoint_engine.custom_backend_module or None)
-        self.checkpoint_engine = CheckpointEngineRegistry.new(backend, bucket_size=bucket_size, **engine_kwargs)

@@ -292,12 +292,15 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                     raise RuntimeError("Diffusion pipeline worker has no load_weights-capable pipeline")
                 receiver.receive_weights(on_bucket_received=lambda weights, *args, **kwargs: load_fn(weights))
 
-    # verl's ``ServerAdapter._update_delta_weights`` RPC protocol
-    # (checkpoint_engine.backend="delta_sharded", wire_format="delta_flush").
-    # verl's own vLLM consumer rides the vLLM weight-transfer engine, which needs
-    # the checkpoint-patch API the pinned vllm-omni stack does not ship, so the
-    # receive/apply is implemented here: one flush per ``update_verl_delta_weights``
-    # RPC, applied through verl's shared ``delta_loader.apply_delta``.
+    # ``ServerAdapter._update_delta_weights`` RPC protocol
+    # (checkpoint_engine.backend="omni_delta_sharded", wire_format="delta_flush").
+    # At this verl pin the send loop lives in verl-omni's VLLMOmniServerAdapter
+    # (the pin predates verl#7227); the protocol is identical, so this receive
+    # side needs no change when the pin advances. verl's own vLLM consumer rides
+    # the vLLM weight-transfer engine, which needs the checkpoint-patch API the
+    # pinned vllm-omni stack does not ship, so the receive/apply is implemented
+    # here: one flush per ``update_verl_delta_weights`` RPC, applied through
+    # verl's shared ``delta_loader.apply_delta``.
 
     def init_weight_transfer_engine(self, init_info: dict) -> None:
         """Delta sync handshake: the omni apply needs no transfer engine."""

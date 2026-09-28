@@ -168,11 +168,11 @@ class OmniFSDPEngine(FSDPEngineWithLMHead):
         share names and coordinates), so fail closed.
         """
         if getattr(self, "_qat_enabled", False):
-            raise NotImplementedError("delta_sharded shard export does not support QAT exports.")
+            raise NotImplementedError("omni_delta_sharded shard export does not support QAT exports.")
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):
             raise NotImplementedError(
-                "delta_sharded shard export supports full-weight training only (no LoRA adapters)."
+                "omni_delta_sharded shard export supports full-weight training only (no LoRA adapters)."
             )
         return super().get_per_tensor_param_shard(**kwargs)
 

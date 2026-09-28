@@ -982,7 +982,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def get_per_tensor_param_shard(self, **kwargs):
         """Like :meth:`get_per_tensor_param`, but yields each rank's *local* shard
         ``(name, local_flat_shard, ShardSpec)`` instead of all-gathering full
-        tensors. Consumed by the ``delta_sharded`` checkpoint engine, which byte-diffs
+        tensors. Consumed by the ``omni_delta_sharded`` checkpoint engine, which byte-diffs
         each rank's shard against a pinned snapshot; non-LoRA base path only. Names
         match the full export (``convert_weight_keys`` plus the ``transformer.``
         prefix) so HF coordinates are what the rollout pipelines already load, and
@@ -992,7 +992,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):
             raise NotImplementedError(
-                "delta_sharded shard export supports full-weight training only; LoRA runs "
+                "omni_delta_sharded shard export supports full-weight training only; LoRA runs "
                 "keep the adapter (merge=false) or merged full-weight (merge=true) sync paths."
             )
 

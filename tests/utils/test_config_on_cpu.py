@@ -51,16 +51,23 @@ def test_validate_config_timestep_staging(enabled, sp_size, as_dict):
 
 
 def _delta_config(**overrides):
-    """A minimal delta_sharded config that passes the gates; overrides merge on top."""
+    """A minimal omni_delta_sharded config that passes the gates; overrides merge on top."""
     base = {
         "trainer": {"resume_mode": "disable", "use_v1": True, "v1": {"trainer_mode": "separate_async"}},
         "actor_rollout_ref": {
             "model": {"lora": {"rank": 0}},
             "actor": {"fsdp_config": {"qat": {"enable": False}}},
-            "rollout": {"checkpoint_engine": {"backend": "delta_sharded"}},
+            "rollout": {"checkpoint_engine": {"backend": "omni_delta_sharded"}},
         },
     }
     return OmegaConf.merge(OmegaConf.create(base), OmegaConf.create(overrides))
+
+
+def test_raw_delta_sharded_backend_is_rejected_with_guidance():
+    """verl gates the raw delta_sharded name to sglang; point users at the omni name."""
+    config = _delta_config(actor_rollout_ref={"rollout": {"checkpoint_engine": {"backend": "delta_sharded"}}})
+    with pytest.raises(ValueError, match="omni_delta_sharded"):
+        validate_config(config)
 
 
 def test_delta_sharded_admitted_for_full_weight_separate_async():

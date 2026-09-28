@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU checks for the rollout side of ``delta_sharded`` weight sync.
+"""CPU checks for the rollout side of ``omni_delta_sharded`` weight sync.
 
-The wire is verl's: ``ServerAdapter.update_weights(wire_format="delta_flush")``
-posts one ``update_verl_delta_weights`` RPC per flush and streams that flush's
-sentinel tensors. These tests drive the omni worker extension's
-``update_verl_delta_weights`` end to end on CPU: the diffusers engine's shard
-export (seed + steady deltas) is encoded into wire flushes exactly as the delta
-checkpoint engine encodes them (``verl.checkpoint_engine.delta_sync.encode``),
-then applied through the extension and verl's delta loader into a toy rollout
-model whose ``load_weights`` lands on ``param.copy_`` like vllm's loaders.
-Only the ZMQ/NCCL transport is faked.
+The wire is verl's ``ServerAdapter._update_delta_weights`` protocol: one
+``update_verl_delta_weights`` RPC per flush, streaming that flush's sentinel
+tensors. At this verl pin the send loop lives in verl-omni's
+``VLLMOmniServerAdapter`` (the pin predates verl#7227); these tests drive both
+ends on CPU. The diffusers engine's shard export (seed + steady deltas) is
+encoded into wire flushes exactly as the delta checkpoint engine encodes them
+(``verl.checkpoint_engine.delta_sync.encode``), then sent through the adapter's
+loop and applied through the extension and verl's delta loader into a toy
+rollout model whose ``load_weights`` lands on ``param.copy_`` like vllm's
+loaders. Only the ZMQ/NCCL transport is faked.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -319,12 +321,32 @@ def test_delta_apply_rejects_npu_platform(monkeypatch):
         vLLMOmniColocateWorkerExtension.update_verl_delta_weights(_delta_worker(_ToyRolloutModel({})), {})
 
 
-def test_registry_keeps_verl_server_adapter():
-    """The delta wire is verl's ServerAdapter; omni registers no substitute."""
+def test_registry_resolves_omni_server_adapter():
+    """The delta wire needs the omni adapter at this pin; it must stay a thin
+    subclass of verl's ServerAdapter so the named_tensors path is verl's."""
     from verl.workers.rollout.base import get_rollout_class
     from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 
-    assert get_rollout_class("vllm_omni", "async") is ServerAdapter
+    from verl_omni.workers.rollout.vllm_rollout.server_adapter import VLLMOmniServerAdapter
+
+    rollout_cls = get_rollout_class("vllm_omni", "async")
+    assert rollout_cls is VLLMOmniServerAdapter
+    assert issubclass(rollout_cls, ServerAdapter)
+
+
+def test_omni_delta_sharded_registers_verl_delta_engine():
+    """The omni backend is an alias of verl's own DeltaShardedCheckpointEngine,
+    so verl's unmodified CheckpointEngineWorker constructs it through the
+    registry (no subclass, no sglang-gate widening). The alias tracks verl's
+    own backend: without the transport deps (e.g. CPU envs without cupy) both
+    names are absent and asking for either fails closed."""
+    from verl.checkpoint_engine import CheckpointEngineRegistry, DeltaShardedCheckpointEngine
+
+    if DeltaShardedCheckpointEngine is None:
+        with pytest.raises(ValueError, match="not registered"):
+            CheckpointEngineRegistry.get("omni_delta_sharded")
+    else:
+        assert CheckpointEngineRegistry.get("omni_delta_sharded") is DeltaShardedCheckpointEngine
 
 
 def test_extension_implements_verl_delta_protocol():
@@ -344,12 +366,103 @@ def test_ar_strategy_routes_delta_protocol_to_weight_sync_stages():
         assert ARStrategy.collective_rpc_stage_ids(strategy, name) == [2], name
 
 
-def test_checkpoint_engine_worker_rejects_delta_for_non_vllm_omni():
-    from verl_omni.workers.checkpoint_engine import OmniCheckpointEngineWorker
+# ---------------------------------------------------------------------------
+# Sender side: VLLMOmniServerAdapter._update_delta_weights (verl's RPC protocol)
+# ---------------------------------------------------------------------------
 
-    rollout_config = SimpleNamespace(
-        checkpoint_engine=SimpleNamespace(backend="delta_sharded"),
-        name="vllm",
-    )
-    with pytest.raises(NotImplementedError, match="vllm_omni"):
-        OmniCheckpointEngineWorker(rollout_config, model_config=SimpleNamespace())
+
+def _send_loop_adapter(worker, monkeypatch, calls, sent_buckets, apply_flushes=True):
+    from verl_omni.workers.rollout.vllm_rollout.server_adapter import VLLMOmniServerAdapter
+
+    adapter = object.__new__(VLLMOmniServerAdapter)
+    adapter.use_shm = False
+    adapter.zmq_handle = "ipc:///tmp/test-delta.sock"
+    adapter.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=64))
+    adapter._delta_weight_transfer_engine_initialized = False
+    adapter.replica_rank = 0
+    adapter.rollout_rank = 0
+    adapter._has_server = False
+
+    class _FakeSender:
+        def __init__(self, zmq_handle, bucket_size_mb, use_shm):
+            assert use_shm is False, "delta flushes must stream over CUDA IPC, not shm"
+
+        async def async_send_weights(self, tensors):
+            sent_buckets.append(list(tensors))
+
+    monkeypatch.setattr(bucketed_weight_transfer, "BucketedWeightSender", _FakeSender)
+
+    async def _execute_method(method, non_block=False, timeout=None, args=(), kwargs=None):
+        calls.append(method)
+        if method == "update_verl_delta_weights" and apply_flushes:
+
+            async def _apply():
+                # Runs when the sender awaits the RPC future, i.e. after this
+                # flush's buckets were delivered -- one bucket per fake flush.
+                _run_delta_flush(worker, [sent_buckets[-1]], monkeypatch)
+
+            return _apply()
+        return None
+
+    adapter._execute_method = _execute_method
+    adapter._ensure_server_handle = lambda: False
+    return adapter
+
+
+def test_adapter_send_loop_applies_seed_then_delta(monkeypatch):
+    """Seed and delta streams both ride the per-flush RPC protocol; the init
+    handshake fires once across syncs and the rollout state ends bit-exact."""
+    torch.manual_seed(0)
+    module = _ToyDiT()
+    _patch_engine_helpers(monkeypatch)
+    engine = _make_engine(module)
+
+    seed_params = _seed_export(engine)
+    target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
+    calls, sent = [], []
+    adapter = _send_loop_adapter(_delta_worker(target), monkeypatch, calls, sent)
+
+    asyncio.run(adapter._update_delta_weights([(_encode_dense_flush(seed_params), True)], global_steps=1))
+    assert calls == [
+        "init_weight_transfer_engine",
+        "start_weight_update",
+        "update_verl_delta_weights",
+        "finish_weight_update",
+    ]
+    engine.prime_delta_snapshots()
+
+    with torch.no_grad():
+        module.blocks[0].weight.view(-1)[3] += 0.5
+    deltas, _ = engine.get_per_tensor_param_delta_shard()
+    calls.clear()
+    asyncio.run(adapter._update_delta_weights([(_encode_indices_flush(deltas), True)], global_steps=2))
+    # Second sync: no re-init handshake; one RPC per flush.
+    assert calls == ["start_weight_update", "update_verl_delta_weights", "finish_weight_update"]
+    assert len(sent) == 2, "one bucketed stream per flush, never a shared one"
+
+    reference = dict(_seed_export(engine))
+    for name, ref in reference.items():
+        assert torch.equal(target.state[name].view(torch.int16), ref.view(torch.int16)), name
+
+
+def test_adapter_send_loop_empty_stream_skips_protocol(monkeypatch):
+    calls, sent = [], []
+    adapter = _send_loop_adapter(_delta_worker(_ToyRolloutModel({})), monkeypatch, calls, sent)
+    asyncio.run(adapter._update_delta_weights([], global_steps=1))
+    assert calls == [] and sent == []
+
+
+def test_adapter_send_loop_rejects_data_after_is_last(monkeypatch):
+    calls, sent = [], []
+    adapter = _send_loop_adapter(_delta_worker(_ToyRolloutModel({})), monkeypatch, calls, sent, apply_flushes=False)
+    first = [("__dummy__", torch.zeros(1))]
+    with pytest.raises(ValueError, match="data after is_last"):
+        asyncio.run(adapter._update_delta_weights([(first, True), (first, False)], global_steps=1))
+
+
+def test_adapter_send_loop_rejects_stream_without_is_last(monkeypatch):
+    calls, sent = [], []
+    adapter = _send_loop_adapter(_delta_worker(_ToyRolloutModel({})), monkeypatch, calls, sent, apply_flushes=False)
+    first = [("__dummy__", torch.zeros(1))]
+    with pytest.raises(ValueError, match="ended without is_last"):
+        asyncio.run(adapter._update_delta_weights([(first, False)], global_steps=1))

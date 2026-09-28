@@ -164,14 +164,21 @@ overlap.
 Separate-async mode requires a non-naive
 `actor_rollout_ref.rollout.checkpoint_engine.backend` for the trainer ->
 standalone rollout weight sync. `nccl` (the default in the recipes above)
-broadcasts the full model every sync. `delta_sharded` instead broadcasts only
-the weights that changed since the last sync: the first (seed) sync streams the
-full export, steady syncs ship sparse (position, value) updates, and the
-rollout verifies a per-flush checksum and applies them in place. RL updates
-are highly sparse in BF16, so steady-state payloads shrink to the per-step
-changed ratio while the rollout weights stay bit-identical to a full broadcast.
+broadcasts the full model every sync. `omni_delta_sharded` instead broadcasts
+only the weights that changed since the last sync: the first (seed) sync
+streams the full export, steady syncs ship sparse (position, value) updates,
+and the rollout verifies a per-flush checksum and applies them in place. RL
+updates are highly sparse in BF16, so steady-state payloads shrink to the
+per-step changed ratio while the rollout weights stay bit-identical to a full
+broadcast.
 
-`delta_sharded` is gated: it requires `separate_async` mode and full-weight
+The backend is verl's `DeltaShardedCheckpointEngine` registered under a
+verl-omni name: verl gates the raw `delta_sharded` name to sglang rollouts, so
+`omni_delta_sharded` resolves through verl's `CheckpointEngineRegistry` and
+its flushes are applied by the vllm-omni worker extension instead of verl's
+vLLM weight-transfer consumer.
+
+`omni_delta_sharded` is gated: it requires `separate_async` mode and full-weight
 training (LoRA configs raise at startup, since adapter sync is already small),
 QAT exports are refused, and fused-MoE rollout models raise at the first sync
 (the sparse in-place apply does not reproduce their checkpoint-layout reload).

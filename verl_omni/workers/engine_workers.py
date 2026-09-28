@@ -1075,7 +1075,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            if effective_mode == "delta_sharded":
+            if effective_mode == "omni_delta_sharded":
                 # The delta engine owns the sync state machine (seed vs steady,
                 # snapshot prime), so it drives the training engine itself.
                 # Full-weight only: the engine's shard export raises under LoRA.

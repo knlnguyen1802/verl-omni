@@ -58,7 +58,7 @@ FSDP LoRA remains the default. Key overrides:
 |---|---|---|
 | `trainer.v1.separate_async.num_warmup_batches` | 4 | prompt batches submitted before the first step |
 | `trainer.v1.separate_async.parameter_sync_step` | 4 | push weights to standalone replicas every N steps |
-| `actor_rollout_ref.rollout.checkpoint_engine.backend` | — | must be non-naive (`nccl`, `nixl`, `mooncake`, `delta_sharded`) |
+| `actor_rollout_ref.rollout.checkpoint_engine.backend` | — | must be non-naive (`nccl`, `nixl`, `mooncake`, `omni_delta_sharded`) |
 | `trainer.v1.separate_async.hybrid_rollout.enable_switch` | false | lend colocated trainer GPUs to generation when the replay buffer is short |
 
 Constraints enforced at startup: rollout GPUs > 0, a non-naive checkpoint
@@ -71,8 +71,10 @@ LoRA recipes should set `actor_rollout_ref.model.lora.merge=False` so weight
 sync ships only adapter tensors (applied on the replicas via the LoRA-aware
 checkpoint engine manager).
 
-`delta_sharded` (RFC #38) broadcasts only the weights that changed since the
-last sync instead of the full model: a dense seed sync, then sparse
+`omni_delta_sharded` (RFC #38) broadcasts only the weights that changed since
+the last sync instead of the full model (verl's `DeltaShardedCheckpointEngine`
+registered under a verl-omni name; verl gates the raw `delta_sharded` name to
+sglang rollouts): a dense seed sync, then sparse
 (position, value) flushes with a per-flush checksum, applied in place on the
 replicas. It requires full-weight training, so it composes with neither the
 LoRA path above nor QAT; both raise at startup. It also raises at the first

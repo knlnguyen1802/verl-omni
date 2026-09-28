@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU checks for the diffusers engine's delta shard export (``delta_sharded`` backend).
+"""CPU checks for the diffusers engine's delta shard export (``omni_delta_sharded`` backend).
 
 Drives the real ``DiffusersFSDPEngine`` export methods with verl's own delta machinery
 (``prime_delta_snapshots`` / ``hf_delta_export``, the same helpers verl's
