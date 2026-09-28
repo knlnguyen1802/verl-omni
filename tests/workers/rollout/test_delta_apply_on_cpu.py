@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,19 +13,19 @@
 # limitations under the License.
 """CPU checks for the rollout side of ``omni_delta_sharded`` weight sync.
 
-The wire is verl's ``ServerAdapter._update_delta_weights`` protocol: one
-``update_verl_delta_weights`` RPC per flush, streaming that flush's sentinel
-tensors. At this verl pin the send loop lives in verl-omni's
-``VLLMOmniServerAdapter`` (the pin predates verl#7227); these tests drive both
-ends on CPU. The diffusers engine's shard export (seed + steady deltas) is
+The wire is verl's stock ``named_tensors`` bucketed channel end to end (verl's
+unmodified vLLM ServerAdapter drives it): the omni engine subclass flattens
+each delta flush's sentinel tensors (``__delta_spec__`` / ``__positions__`` /
+``__values__``) into the stream with a ``#<flush>`` suffix, and the omni worker
+extension routes the stream by sniffing the first bucket. These tests drive
+both ends on CPU: the diffusers engine's shard export (seed + steady deltas) is
 encoded into wire flushes exactly as the delta checkpoint engine encodes them
-(``verl.checkpoint_engine.delta_sync.encode``), then sent through the adapter's
-loop and applied through the extension and verl's delta loader into a toy
-rollout model whose ``load_weights`` lands on ``param.copy_`` like vllm's
-loaders. Only the ZMQ/NCCL transport is faked.
+(``verl.checkpoint_engine.delta_sync.encode``), then applied through the
+extension and verl's delta loader into a toy rollout model whose
+``load_weights`` lands on ``param.copy_`` like vllm's loaders. Only the
+ZMQ/NCCL transport is faked.
 """
 
-import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -43,15 +43,6 @@ from verl_omni.workers.rollout.vllm_rollout.utils import vLLMOmniColocateWorkerE
 SPEC_NAME = "__delta_spec__"
 POSITIONS_NAME = "__positions__"
 VALUES_NAME = "__values__"
-
-# verl's ServerAdapter._update_delta_weights RPC protocol: the method names it
-# collective_rpcs on the rollout worker, in call order.
-DELTA_PROTOCOL_METHODS = (
-    "init_weight_transfer_engine",
-    "start_weight_update",
-    "update_verl_delta_weights",
-    "finish_weight_update",
-)
 
 # ---------------------------------------------------------------------------
 # Trainer side: real diffusers engine export over a toy DiT
@@ -180,8 +171,13 @@ def _encode_indices_flush(deltas) -> list:
     return [(SPEC_NAME, _spec_tensor(spec)), (POSITIONS_NAME, positions), (VALUES_NAME, values)]
 
 
-def _run_delta_flush(worker, buckets: list, monkeypatch):
-    """Drive one update_verl_delta_weights RPC with a fake bucketed receiver."""
+def _suffix(flush: list, flush_idx: int) -> list:
+    """The engine-side flatten: every tensor name gains its flush index."""
+    return [(f"{name}#{flush_idx}", tensor) for name, tensor in flush]
+
+
+def _run_ipc(worker, buckets: list, monkeypatch, delta_flush=True):
+    """Drive one ``update_weights_from_ipc`` call with a fake bucketed receiver."""
 
     class _FakeReceiver:
         def __init__(self, zmq_handle, device, use_shm):
@@ -192,12 +188,22 @@ def _run_delta_flush(worker, buckets: list, monkeypatch):
                 on_bucket_received(bucket, i == len(buckets) - 1)
 
     monkeypatch.setattr(bucketed_weight_transfer, "BucketedWeightReceiver", _FakeReceiver)
-    vLLMOmniColocateWorkerExtension.update_verl_delta_weights(worker, {})
+    vLLMOmniColocateWorkerExtension.update_weights_from_ipc(worker, delta_flush=delta_flush)
+
+
+def _as_worker(**attrs):
+    """A namespace standing in for ``self``: the delta helpers are bound onto it so
+    the unbound ``update_weights_from_ipc(worker, ...)`` call style works."""
+    worker = SimpleNamespace(**attrs)
+    for name in ("_apply_delta_bucket", "_finish_delta_stream"):
+        setattr(worker, name, vLLMOmniColocateWorkerExtension.__dict__[name].__get__(worker))
+    return worker
 
 
 def _delta_worker(target):
-    return SimpleNamespace(
+    return _as_worker(
         device=torch.device("cpu"),
+        _pending_lora_peft_config=None,
         _get_zmq_handle=lambda: "ipc:///tmp/test-delta.sock",
         _get_standard_weight_model_and_config=lambda: None,
         model_runner=SimpleNamespace(pipeline=target),
@@ -219,7 +225,7 @@ def test_seed_plus_two_deltas_bit_exact(monkeypatch):
     # Session 1: the seed streams the full export values-only into dummy weights.
     seed_params = _seed_export(engine)
     target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
-    _run_delta_flush(_delta_worker(target), [_encode_dense_flush(seed_params)], monkeypatch)
+    _run_ipc(_delta_worker(target), [_suffix(_encode_dense_flush(seed_params), 0)], monkeypatch)
     for name, tensor in seed_params:
         assert torch.equal(target.state[name], tensor), name
     engine.prime_delta_snapshots()
@@ -228,13 +234,13 @@ def test_seed_plus_two_deltas_bit_exact(monkeypatch):
     with torch.no_grad():
         module.blocks[0].weight.view(-1)[3] += 0.5
     deltas, _ = engine.get_per_tensor_param_delta_shard()
-    _run_delta_flush(_delta_worker(target), [_encode_indices_flush(deltas)], monkeypatch)
+    _run_ipc(_delta_worker(target), [_suffix(_encode_indices_flush(deltas), 0)], monkeypatch)
 
     # Session 3: perturb again, export delta round 2, apply.
     with torch.no_grad():
         module.blocks[1].weight.view(-1)[7] -= 1.0
     deltas, _ = engine.get_per_tensor_param_delta_shard()
-    _run_delta_flush(_delta_worker(target), [_encode_indices_flush(deltas)], monkeypatch)
+    _run_ipc(_delta_worker(target), [_suffix(_encode_indices_flush(deltas), 0)], monkeypatch)
 
     reference = dict(_seed_export(engine))
     for name, ref in reference.items():
@@ -250,19 +256,95 @@ def test_flush_split_across_buckets(monkeypatch):
 
     seed_params = _seed_export(engine)
     target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
-    _run_delta_flush(_delta_worker(target), [_encode_dense_flush(seed_params)], monkeypatch)
+    _run_ipc(_delta_worker(target), [_suffix(_encode_dense_flush(seed_params), 0)], monkeypatch)
     engine.prime_delta_snapshots()
 
     with torch.no_grad():
         module.blocks[0].weight.view(-1)[1] += 0.25
     deltas, _ = engine.get_per_tensor_param_delta_shard()
-    spec, positions, values = _encode_indices_flush(deltas)
+    (_sn, spec_t), (_pn, pos_t), (_vn, val_t) = _encode_indices_flush(deltas)
 
-    _run_delta_flush(_delta_worker(target), [[spec, positions], [values]], monkeypatch)
+    _run_ipc(
+        _delta_worker(target),
+        [[(f"{SPEC_NAME}#0", spec_t), (f"{POSITIONS_NAME}#0", pos_t)], [(f"{VALUES_NAME}#0", val_t)]],
+        monkeypatch,
+    )
 
     reference = dict(_seed_export(engine))
     for name, ref in reference.items():
         assert torch.equal(target.state[name], ref), name
+
+
+def test_two_flushes_sharing_one_bucket_both_apply(monkeypatch):
+    """The bucketed sender keys each bucket's metadata by tensor name, which is why
+    the engine suffixes sentinels with the flush index; two whole flushes landing in
+    one bucket must still apply independently (review round-2 regression)."""
+    torch.manual_seed(0)
+    module = _ToyDiT()
+    _patch_engine_helpers(monkeypatch)
+    engine = _make_engine(module)
+
+    seed_params = _seed_export(engine)
+    target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
+    _run_ipc(_delta_worker(target), [_suffix(_encode_dense_flush(seed_params), 0)], monkeypatch)
+    engine.prime_delta_snapshots()
+
+    with torch.no_grad():
+        module.blocks[0].weight.view(-1)[3] += 0.5
+    deltas_a, _ = engine.get_per_tensor_param_delta_shard()
+    with torch.no_grad():
+        module.blocks[1].weight.view(-1)[7] -= 1.0
+    deltas_b, _ = engine.get_per_tensor_param_delta_shard()
+
+    one_bucket = [*_suffix(_encode_indices_flush(deltas_a), 0), *_suffix(_encode_indices_flush(deltas_b), 1)]
+    _run_ipc(_delta_worker(target), [one_bucket], monkeypatch)
+
+    reference = dict(_seed_export(engine))
+    for name, ref in reference.items():
+        assert torch.equal(target.state[name].view(torch.int16), ref.view(torch.int16)), name
+
+
+def test_sniffed_stream_routes_by_first_bucket(monkeypatch):
+    """``delta_flush=None`` (the stock ServerAdapter path, which passes no flag)
+    must route sentinel-led streams to the delta apply and dense-named streams to
+    the ordinary bucketed load."""
+    torch.manual_seed(0)
+    module = _ToyDiT()
+    _patch_engine_helpers(monkeypatch)
+    engine = _make_engine(module)
+
+    seed_params = _seed_export(engine)
+    target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
+
+    # Dense names through the same worker: loads through the pipeline's load_weights.
+    _run_ipc(_delta_worker(target), [list(seed_params)], monkeypatch, delta_flush=None)
+    for name, tensor in seed_params:
+        assert torch.equal(target.state[name], tensor), name
+
+    # Sentinel-led stream: applies through the delta receiver instead.
+    engine.prime_delta_snapshots()
+    with torch.no_grad():
+        module.blocks[0].weight.view(-1)[2] += 0.5
+    deltas, _ = engine.get_per_tensor_param_delta_shard()
+    _run_ipc(_delta_worker(target), [_suffix(_encode_indices_flush(deltas), 0)], monkeypatch, delta_flush=None)
+
+    reference = dict(_seed_export(engine))
+    for name, ref in reference.items():
+        assert torch.equal(target.state[name].view(torch.int16), ref.view(torch.int16)), name
+
+
+def test_explicit_delta_flush_rejects_lora():
+    worker = _delta_worker(_ToyRolloutModel({}))
+    with pytest.raises(ValueError, match="does not apply LoRA adapters"):
+        vLLMOmniColocateWorkerExtension.update_weights_from_ipc(worker, peft_config={"r": 8}, delta_flush=True)
+
+
+def test_partial_flush_at_stream_end_raises(monkeypatch):
+    """A stream ending between a spec and its values is corrupt; fail closed."""
+    spec_entry = _encode_indices_flush([])[0]
+    worker = _delta_worker(_ToyRolloutModel({}))
+    with pytest.raises(RuntimeError, match="partial flush"):
+        _run_ipc(worker, [[(f"{SPEC_NAME}#0", spec_entry[1])]], monkeypatch)
 
 
 def test_delta_apply_rejects_fused_moe_rollout(monkeypatch):
@@ -282,13 +364,14 @@ def test_delta_apply_rejects_fused_moe_rollout(monkeypatch):
     model.moe = _FakeRoutedExperts()
     assert rollout_utils._model_has_fused_moe(model)
 
-    worker = SimpleNamespace(
+    worker = _as_worker(
         device=torch.device("cpu"),
+        _pending_lora_peft_config=None,
         _get_zmq_handle=lambda: "ipc:///tmp/test-delta.sock",
         _get_standard_weight_model_and_config=lambda: (model, SimpleNamespace()),
     )
     with pytest.raises(NotImplementedError, match="fused-MoE"):
-        vLLMOmniColocateWorkerExtension.update_verl_delta_weights(worker, {})
+        _run_ipc(worker, [[(f"{SPEC_NAME}#0", torch.zeros(1, dtype=torch.uint8))]], monkeypatch)
 
 
 def test_checksum_mismatch_raises(monkeypatch):
@@ -299,170 +382,82 @@ def test_checksum_mismatch_raises(monkeypatch):
 
     seed_params = _seed_export(engine)
     target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
-    _run_delta_flush(_delta_worker(target), [_encode_dense_flush(seed_params)], monkeypatch)
+    _run_ipc(_delta_worker(target), [_suffix(_encode_dense_flush(seed_params), 0)], monkeypatch)
     engine.prime_delta_snapshots()
 
     with torch.no_grad():
         module.blocks[0].weight.view(-1)[2] += 0.5
     deltas, _ = engine.get_per_tensor_param_delta_shard()
-    spec, positions, values = _encode_indices_flush(deltas)
-    corrupted = values[1].clone()
+    (_sn, spec_t), (_pn, pos_t), (_vn, val_t) = _encode_indices_flush(deltas)
+    corrupted = val_t.clone()
     corrupted[0] = 42.0
 
     with pytest.raises(RuntimeError, match="checksum mismatch"):
-        _run_delta_flush(_delta_worker(target), [[spec, positions, (VALUES_NAME, corrupted)]], monkeypatch)
+        _run_ipc(
+            _delta_worker(target),
+            [[(f"{SPEC_NAME}#0", spec_t), (f"{POSITIONS_NAME}#0", pos_t), (f"{VALUES_NAME}#0", corrupted)]],
+            monkeypatch,
+        )
 
 
 def test_delta_apply_rejects_npu_platform(monkeypatch):
     from verl_omni.workers.rollout.vllm_rollout import npu_utils
 
     monkeypatch.setattr(npu_utils, "_is_npu_platform", lambda: True)
+    worker = _delta_worker(_ToyRolloutModel({}))
     with pytest.raises(NotImplementedError, match="Ascend NPU"):
-        vLLMOmniColocateWorkerExtension.update_verl_delta_weights(_delta_worker(_ToyRolloutModel({})), {})
+        _run_ipc(worker, [[(f"{SPEC_NAME}#0", torch.zeros(1, dtype=torch.uint8))]], monkeypatch)
 
 
-def test_registry_resolves_omni_server_adapter():
-    """The delta wire needs the omni adapter at this pin; it must stay a thin
-    subclass of verl's ServerAdapter so the named_tensors path is verl's."""
+def test_registry_keeps_verl_server_adapter():
+    """The delta wire rides verl's stock named_tensors bucketed channel, so the
+    rollout class is verl's own ServerAdapter -- no omni subclass at any pin."""
     from verl.workers.rollout.base import get_rollout_class
     from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 
-    from verl_omni.workers.rollout.vllm_rollout.server_adapter import VLLMOmniServerAdapter
-
-    rollout_cls = get_rollout_class("vllm_omni", "async")
-    assert rollout_cls is VLLMOmniServerAdapter
-    assert issubclass(rollout_cls, ServerAdapter)
+    assert get_rollout_class("vllm_omni", "async") is ServerAdapter
 
 
-def test_omni_delta_sharded_registers_verl_delta_engine():
-    """The omni backend is an alias of verl's own DeltaShardedCheckpointEngine,
-    so verl's unmodified CheckpointEngineWorker constructs it through the
-    registry (no subclass, no sglang-gate widening). The alias tracks verl's
-    own backend: without the transport deps (e.g. CPU envs without cupy) both
-    names are absent and asking for either fails closed."""
+def test_omni_delta_sharded_registers_flattening_engine(monkeypatch):
+    """The omni backend is a thin subclass of verl's DeltaShardedCheckpointEngine
+    that re-declares the wire as named_tensors and flattens flushes into
+    sentinel-suffixed pairs, so verl's unmodified worker and ServerAdapter drive
+    the whole sync. Without the transport deps (e.g. CPU envs without cupy) the
+    alias is absent and asking for it fails closed."""
     from verl.checkpoint_engine import CheckpointEngineRegistry, DeltaShardedCheckpointEngine
 
     if DeltaShardedCheckpointEngine is None:
         with pytest.raises(ValueError, match="not registered"):
             CheckpointEngineRegistry.get("omni_delta_sharded")
-    else:
-        assert CheckpointEngineRegistry.get("omni_delta_sharded") is DeltaShardedCheckpointEngine
+        return
+
+    engine_cls = CheckpointEngineRegistry.get("omni_delta_sharded")
+    assert engine_cls is not DeltaShardedCheckpointEngine
+    assert issubclass(engine_cls, DeltaShardedCheckpointEngine)
+    assert engine_cls.wire_format == "named_tensors"
+
+    flushes = [
+        ([(SPEC_NAME, torch.zeros(1)), (VALUES_NAME, torch.zeros(1))], True),
+        ([(SPEC_NAME, torch.zeros(1)), (POSITIONS_NAME, torch.zeros(1)), (VALUES_NAME, torch.zeros(1))], True),
+    ]
+    monkeypatch.setattr(DeltaShardedCheckpointEngine, "receive_weights", lambda self, global_steps=None: iter(flushes))
+    engine = object.__new__(engine_cls)
+    assert list(engine.receive_weights()) == [
+        (f"{SPEC_NAME}#0", flushes[0][1][0][1]),
+        (f"{VALUES_NAME}#0", flushes[0][1][1][1]),
+        (f"{SPEC_NAME}#1", flushes[1][1][0][1]),
+        (f"{POSITIONS_NAME}#1", flushes[1][1][1][1]),
+        (f"{VALUES_NAME}#1", flushes[1][1][2][1]),
+    ]
 
 
-def test_extension_implements_verl_delta_protocol():
-    """verl's adapter RPCs exactly these methods on a delta_flush sync; the omni
-    worker extension (AR and diffusion) must answer every one of them."""
-    for name in DELTA_PROTOCOL_METHODS:
-        assert callable(getattr(vLLMOmniColocateWorkerExtension, name, None)), name
-
-
-def test_ar_strategy_routes_delta_protocol_to_weight_sync_stages():
-    """Broadcasting a delta receive to non-weight-sync AR stages would block on a
-    ZMQ handle nobody sends to; every protocol RPC must hit the sync stages."""
+def test_ar_strategy_routes_only_weight_sync_rpcs():
+    """The delta stream rides ``update_weights_from_ipc``; no other RPC may be
+    broadcast to the weight-sync stages."""
     from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy
 
     strategy = SimpleNamespace(_weight_sync_stage_ids=[2])
-    for name in ("set_pending_lora_peft_config", "update_weights_from_ipc", *DELTA_PROTOCOL_METHODS):
+    for name in ("set_pending_lora_peft_config", "update_weights_from_ipc", "monkey_patch_model"):
         assert ARStrategy.collective_rpc_stage_ids(strategy, name) == [2], name
-
-
-# ---------------------------------------------------------------------------
-# Sender side: VLLMOmniServerAdapter._update_delta_weights (verl's RPC protocol)
-# ---------------------------------------------------------------------------
-
-
-def _send_loop_adapter(worker, monkeypatch, calls, sent_buckets, apply_flushes=True):
-    from verl_omni.workers.rollout.vllm_rollout.server_adapter import VLLMOmniServerAdapter
-
-    adapter = object.__new__(VLLMOmniServerAdapter)
-    adapter.use_shm = False
-    adapter.zmq_handle = "ipc:///tmp/test-delta.sock"
-    adapter.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=64))
-    adapter._delta_weight_transfer_engine_initialized = False
-    adapter.replica_rank = 0
-    adapter.rollout_rank = 0
-    adapter._has_server = False
-
-    class _FakeSender:
-        def __init__(self, zmq_handle, bucket_size_mb, use_shm):
-            assert use_shm is False, "delta flushes must stream over CUDA IPC, not shm"
-
-        async def async_send_weights(self, tensors):
-            sent_buckets.append(list(tensors))
-
-    monkeypatch.setattr(bucketed_weight_transfer, "BucketedWeightSender", _FakeSender)
-
-    async def _execute_method(method, non_block=False, timeout=None, args=(), kwargs=None):
-        calls.append(method)
-        if method == "update_verl_delta_weights" and apply_flushes:
-
-            async def _apply():
-                # Runs when the sender awaits the RPC future, i.e. after this
-                # flush's buckets were delivered -- one bucket per fake flush.
-                _run_delta_flush(worker, [sent_buckets[-1]], monkeypatch)
-
-            return _apply()
-        return None
-
-    adapter._execute_method = _execute_method
-    adapter._ensure_server_handle = lambda: False
-    return adapter
-
-
-def test_adapter_send_loop_applies_seed_then_delta(monkeypatch):
-    """Seed and delta streams both ride the per-flush RPC protocol; the init
-    handshake fires once across syncs and the rollout state ends bit-exact."""
-    torch.manual_seed(0)
-    module = _ToyDiT()
-    _patch_engine_helpers(monkeypatch)
-    engine = _make_engine(module)
-
-    seed_params = _seed_export(engine)
-    target = _ToyRolloutModel({name: torch.zeros_like(t) for name, t in seed_params})
-    calls, sent = [], []
-    adapter = _send_loop_adapter(_delta_worker(target), monkeypatch, calls, sent)
-
-    asyncio.run(adapter._update_delta_weights([(_encode_dense_flush(seed_params), True)], global_steps=1))
-    assert calls == [
-        "init_weight_transfer_engine",
-        "start_weight_update",
-        "update_verl_delta_weights",
-        "finish_weight_update",
-    ]
-    engine.prime_delta_snapshots()
-
-    with torch.no_grad():
-        module.blocks[0].weight.view(-1)[3] += 0.5
-    deltas, _ = engine.get_per_tensor_param_delta_shard()
-    calls.clear()
-    asyncio.run(adapter._update_delta_weights([(_encode_indices_flush(deltas), True)], global_steps=2))
-    # Second sync: no re-init handshake; one RPC per flush.
-    assert calls == ["start_weight_update", "update_verl_delta_weights", "finish_weight_update"]
-    assert len(sent) == 2, "one bucketed stream per flush, never a shared one"
-
-    reference = dict(_seed_export(engine))
-    for name, ref in reference.items():
-        assert torch.equal(target.state[name].view(torch.int16), ref.view(torch.int16)), name
-
-
-def test_adapter_send_loop_empty_stream_skips_protocol(monkeypatch):
-    calls, sent = [], []
-    adapter = _send_loop_adapter(_delta_worker(_ToyRolloutModel({})), monkeypatch, calls, sent)
-    asyncio.run(adapter._update_delta_weights([], global_steps=1))
-    assert calls == [] and sent == []
-
-
-def test_adapter_send_loop_rejects_data_after_is_last(monkeypatch):
-    calls, sent = [], []
-    adapter = _send_loop_adapter(_delta_worker(_ToyRolloutModel({})), monkeypatch, calls, sent, apply_flushes=False)
-    first = [("__dummy__", torch.zeros(1))]
-    with pytest.raises(ValueError, match="data after is_last"):
-        asyncio.run(adapter._update_delta_weights([(first, True), (first, False)], global_steps=1))
-
-
-def test_adapter_send_loop_rejects_stream_without_is_last(monkeypatch):
-    calls, sent = [], []
-    adapter = _send_loop_adapter(_delta_worker(_ToyRolloutModel({})), monkeypatch, calls, sent, apply_flushes=False)
-    first = [("__dummy__", torch.zeros(1))]
-    with pytest.raises(ValueError, match="ended without is_last"):
-        asyncio.run(adapter._update_delta_weights([(first, False)], global_steps=1))
+    for name in ("init_weight_transfer_engine", "update_verl_delta_weights"):
+        assert ARStrategy.collective_rpc_stage_ids(strategy, name) is None, name

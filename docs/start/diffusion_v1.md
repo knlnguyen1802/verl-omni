@@ -172,11 +172,14 @@ updates are highly sparse in BF16, so steady-state payloads shrink to the
 per-step changed ratio while the rollout weights stay bit-identical to a full
 broadcast.
 
-The backend is verl's `DeltaShardedCheckpointEngine` registered under a
-verl-omni name: verl gates the raw `delta_sharded` name to sglang rollouts, so
-`omni_delta_sharded` resolves through verl's `CheckpointEngineRegistry` and
-its flushes are applied by the vllm-omni worker extension instead of verl's
-vLLM weight-transfer consumer.
+The backend is a verl-omni subclass of verl's `DeltaShardedCheckpointEngine`
+(verl gates the raw `delta_sharded` name to sglang rollouts, so
+`omni_delta_sharded` resolves through verl's `CheckpointEngineRegistry`). The
+subclass re-declares the wire as the stock `named_tensors` bucketed stream and
+flattens each flush's sentinel tensors into it, so verl's unmodified
+`CheckpointEngineWorker` and vLLM `ServerAdapter` drive the whole sync; the
+vllm-omni worker extension routes the stream by sniffing the first bucket and
+applies flushes in place through verl's delta loader.
 
 `omni_delta_sharded` is gated: it requires `separate_async` mode and full-weight
 training (LoRA configs raise at startup, since adapter sync is already small),

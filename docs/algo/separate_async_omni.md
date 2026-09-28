@@ -72,8 +72,8 @@ sync ships only adapter tensors (applied on the replicas via the LoRA-aware
 checkpoint engine manager).
 
 `omni_delta_sharded` (RFC #38) broadcasts only the weights that changed since
-the last sync instead of the full model (verl's `DeltaShardedCheckpointEngine`
-registered under a verl-omni name; verl gates the raw `delta_sharded` name to
+the last sync instead of the full model (a verl-omni subclass of verl's
+`DeltaShardedCheckpointEngine`; verl gates the raw `delta_sharded` name to
 sglang rollouts): a dense seed sync, then sparse
 (position, value) flushes with a per-flush checksum, applied in place on the
 replicas. It requires full-weight training, so it composes with neither the
