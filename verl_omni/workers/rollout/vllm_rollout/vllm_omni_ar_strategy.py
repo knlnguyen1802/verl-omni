@@ -236,6 +236,7 @@ class ARStrategy(OmniStrategyBase):
         if method in {
             "set_pending_lora_peft_config",
             "update_weights_from_ipc",
+            "monkey_patch_model",
             "init_weight_transfer_engine",
             "start_weight_update",
             "update_verl_delta_weights",
