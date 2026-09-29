@@ -1,6 +1,6 @@
 # Supported Models
 
-Last updated: 09/21/2026.
+Last updated: 09/29/2026.
 
 VeRL-Omni supports RL post-training for generative models across image, video,
 audio, and omni modalities. This page catalogues every model with a ready-to-run
@@ -239,13 +239,15 @@ For version requirements and detailed setup instructions, see
 | Trainer | Example script | GPU config |
 |---------|---------------|------------|
 | GSPO (text) | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_v1.sh` | 4×H100/H200 80GB |
+| GSPO (full, VeOmni 0.1.12; text/image) | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_veomni.sh` | 2×8 GPU (recipe default) |
 | GSPO (image) | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1.sh` | 4×H100/H200 80GB |
 | GSPO (AVQA, NPU) | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh` | 16×NPU (Atlas 800T A3) |
 | Offline DPO (LoRA) | `examples/dpo_trainer/qwen3_omni/qwen3_omni/run_qwen3_omni_omni_preference_lora.sh` | 4×H800 |
 | [GSPO OPD (image, NPU)](../algo/omni_opd.md) | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1_opd_npu.sh` | 32×NPU (2 x Atlas 800T A3) |
+| GSPO (AudioMCQ, Megatron, separate-async) | `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_megatron_audiomcq_separate_async.sh` | 32×A100 80GB (4 train + 4 rollout GPUs/node). Experimental; not reproducible from the current public pins. See the [AudioMCQ recipe](../../examples/gspo_trainer/qwen3_omni/README.md). |
 
-The GSPO actor (FSDP2, 30B + LoRA r=32 with offloading) and vLLM-Omni rollout (TP=2)
-colocate on the same 4 GPUs. The rollout deploy config is auto-generated from
+The default GSPO actor (FSDP2, 30B + LoRA r=32 with offloading) and vLLM-Omni rollout (TP=2)
+colocate on the same 4 GPUs. Megatron full-parameter is a separate-async variant, not a replacement for FSDP2 LoRA. The rollout deploy config is auto-generated from
 `pipeline_name=qwen3_omni_moe` — tune rollout memory/batching through standard
 verl CLI overrides (e.g. `actor_rollout_ref.rollout.gpu_memory_utilization=0.4`)
 rather than a separate per-stage YAML file. Offline DPO reads Omni-Preference
@@ -319,16 +321,16 @@ trainer's README in `examples/`.
 
 | Algorithm | Qwen-Image | Qwen-Image-Edit | SD3.5 | Wan2.2 | LTX-2.3 | MiniMax-H3 | BAGEL | Qwen3-Omni | Qwen3-TTS |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| GRPO | — | — | — | — | — | — | — | — | ✅ |
-| Flow-GRPO | ✅ | ✅ | ✅ | — | ✅ | WIP | ✅ | — | — |
-| Flow-DPPO | ✅ | — | — | — | — | — | — | — | — |
-| GRPO-Guard | ✅ | — | — | — | — | — | — | — | — |
-| Mix-GRPO | ✅ | — | — | — | — | — | — | — | — |
-| DanceGRPO | — | — | — | ✅ | — | — | — | — | — |
-| DPO | ✅ | — | ✅ | — | — | — | — | ✅ | WIP |
-| DiffusionNFT | ✅ | — | — | — | — | ✅ | — | — | — |
-| [DiffusionOPD](../algo/diffusion_opd.md) (incl. MOPD) | — | — | ✅ | — | — | — | — | — | — |
-| GSPO (incl. OPD) | — | — | — | — | — | — | — | ✅ | WIP |
+| GRPO | — | — | — | — | — | — | — | — | GPU ✅ |
+| Flow-GRPO | NPU ✅<br>GPU ✅ | NPU ✅<br>GPU ✅ | GPU ✅ | — | NPU ✅<br>GPU ✅ | NPU ✅<br>GPU ✅ | NPU ✅<br>GPU ✅ | — | — |
+| Flow-DPPO | GPU ✅ | — | — | — | — | — | — | — | — |
+| GRPO-Guard | NPU ✅<br>GPU ✅ | — | — | — | — | — | — | — | — |
+| Mix-GRPO | NPU ✅<br>GPU ✅ | — | — | — | — | — | — | — | — |
+| DanceGRPO | — | — | — | NPU ✅<br>GPU ✅ | — | — | — | — | — |
+| DPO | NPU ✅<br>GPU ✅ | — | GPU ✅ | — | — | — | — | GPU ✅ | — |
+| DiffusionNFT | NPU ✅<br>GPU ✅ | — | — | — | — | GPU ✅ | — | — | — |
+| [DiffusionOPD](../algo/diffusion_opd.md) (incl. MOPD) | — | — | GPU ✅ | — | — | — | — | — | — |
+| GSPO (incl. OPD) | — | — | — | — | — | — | — | NPU ✅<br>GPU ✅ | — |
 
 HunyuanImage-3.0 (MixGRPO / SRPO) appears on the project README as Planned or
 WIP and does not yet have a ready-to-run recipe, so it is omitted from the
