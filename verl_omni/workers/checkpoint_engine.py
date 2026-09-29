@@ -55,13 +55,24 @@ try:
                 ordering, and the bucketed channel marks its final bucket after this
                 generator is drained, which is what completes the receiver.
                 """
-                for flush_idx, (named, _is_last) in enumerate(super().receive_weights(global_steps)):
-                    for name, tensor in named:
-                        yield f"{name}#{flush_idx}", tensor
+                yield from _flatten_flush_stream(super().receive_weights(global_steps))
 
         CheckpointEngineRegistry.register("omni_delta_sharded")(OmniDeltaShardedCheckpointEngine)
 except ImportError:  # verl records the failure; Registry.get reports it on use
     pass
+
+
+def _flatten_flush_stream(flushes):
+    """Yield ``(name#flush, tensor)`` from ``(named_tensors, is_last)`` flushes.
+
+    ``is_last`` is dropped on purpose: the bucketed sender marks the final
+    bucket after this generator is drained, and that is what completes the
+    receiver. The suffix keeps same-named sentinels of separate flushes that
+    share a bucket from overwriting each other.
+    """
+    for flush_idx, (named, _is_last) in enumerate(flushes):
+        for name, tensor in named:
+            yield f"{name}#{flush_idx}", tensor
 
 
 class OmniCheckpointEngineManager(CheckpointEngineManager):

@@ -333,6 +333,45 @@ def test_sniffed_stream_routes_by_first_bucket(monkeypatch):
         assert torch.equal(target.state[name].view(torch.int16), ref.view(torch.int16)), name
 
 
+def test_empty_terminal_bucket_is_noop(monkeypatch):
+    """A zero-flush sync arrives as one empty is_last bucket. Sniffing that as a
+    dense load calls diffusion load_weights([]) and, on AR, reruns
+    process_weights_after_loading."""
+    from verl_omni.workers.rollout.vllm_rollout import npu_utils
+
+    monkeypatch.setattr(npu_utils, "_is_npu_platform", lambda: False)
+
+    diffusion_calls = []
+    target = _ToyRolloutModel({})
+    target.load_weights = lambda weights: diffusion_calls.append(list(weights))
+    _run_ipc(_delta_worker(target), [[]], monkeypatch, delta_flush=None)
+    assert diffusion_calls == []
+
+    class _AR(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(1, 1)
+            self.loads = []
+
+        def load_weights(self, weights):
+            self.loads.append(list(weights))
+
+    model = _AR()
+    post = []
+    import vllm.model_executor.model_loader.utils as loader_utils
+
+    monkeypatch.setattr(loader_utils, "process_weights_after_loading", lambda *args, **kwargs: post.append(args))
+    worker = _as_worker(
+        device=torch.device("cpu"),
+        _pending_lora_peft_config=None,
+        _get_zmq_handle=lambda: "ipc:///tmp/test-delta.sock",
+        _get_standard_weight_model_and_config=lambda: (model, SimpleNamespace()),
+    )
+    _run_ipc(worker, [[]], monkeypatch, delta_flush=None)
+    assert model.loads == []
+    assert post == []
+
+
 def test_explicit_delta_flush_rejects_lora():
     worker = _delta_worker(_ToyRolloutModel({}))
     with pytest.raises(ValueError, match="does not apply LoRA adapters"):
@@ -370,8 +409,26 @@ def test_delta_apply_rejects_fused_moe_rollout(monkeypatch):
         _get_zmq_handle=lambda: "ipc:///tmp/test-delta.sock",
         _get_standard_weight_model_and_config=lambda: (model, SimpleNamespace()),
     )
+    import vllm.model_executor.model_loader.reload as reload_mod
+
+    started = []
+    monkeypatch.setattr(reload_mod, "initialize_layerwise_reload", lambda model: started.append("init"))
+    monkeypatch.setattr(reload_mod, "finalize_layerwise_reload", lambda *args, **kwargs: started.append("fin"))
+    # delta_flush=None is the stock ServerAdapter path. The explicit True path
+    # never calls initialize_layerwise_reload, so it cannot catch this bug.
     with pytest.raises(NotImplementedError, match="fused-MoE"):
-        _run_ipc(worker, [[(f"{SPEC_NAME}#0", torch.zeros(1, dtype=torch.uint8))]], monkeypatch)
+        _run_ipc(
+            worker,
+            [[(f"{SPEC_NAME}#0", torch.zeros(1, dtype=torch.uint8))]],
+            monkeypatch,
+            delta_flush=None,
+        )
+    assert started == []
+
+    # A real dense bucket on the same path still reloads, after the sniff.
+    model.load_weights = lambda weights: None
+    _run_ipc(worker, [[("blocks.0.weight", torch.zeros(1))]], monkeypatch, delta_flush=None)
+    assert started == ["init", "fin"]
 
 
 def test_checksum_mismatch_raises(monkeypatch):
@@ -418,13 +475,36 @@ def test_registry_keeps_verl_server_adapter():
     assert get_rollout_class("vllm_omni", "async") is ServerAdapter
 
 
+def _flattened_pairs(flushes):
+    """Expected ``(name#flush, tensor)`` pairs. ``flushes[i]`` is ``(named, is_last)``;
+    the tensor is ``flushes[i][0][j][1]``, not the ``is_last`` bool at ``[i][1]``."""
+    return [
+        (f"{name}#{flush_idx}", tensor) for flush_idx, (named, _is_last) in enumerate(flushes) for name, tensor in named
+    ]
+
+
+def _assert_flattened(got, expected):
+    assert [(name, tensor.tolist()) for name, tensor in got] == [(name, tensor.tolist()) for name, tensor in expected]
+
+
 def test_omni_delta_sharded_registers_flattening_engine(monkeypatch):
     """The omni backend is a thin subclass of verl's DeltaShardedCheckpointEngine
     that re-declares the wire as named_tensors and flattens flushes into
     sentinel-suffixed pairs, so verl's unmodified worker and ServerAdapter drive
     the whole sync. Without the transport deps (e.g. CPU envs without cupy) the
-    alias is absent and asking for it fails closed."""
+    alias is absent and asking for it fails closed. The flatten itself still runs
+    here: the parent class is what needs cupy, not the suffix loop."""
     from verl.checkpoint_engine import CheckpointEngineRegistry, DeltaShardedCheckpointEngine
+
+    from verl_omni.workers.checkpoint_engine import _flatten_flush_stream
+
+    flushes = [
+        ([(SPEC_NAME, torch.zeros(1)), (VALUES_NAME, torch.zeros(1))], True),
+        ([(SPEC_NAME, torch.zeros(1)), (POSITIONS_NAME, torch.zeros(1)), (VALUES_NAME, torch.zeros(1))], True),
+    ]
+    expected = _flattened_pairs(flushes)
+    # Always executed, including the CPU path where the parent engine is None.
+    _assert_flattened(list(_flatten_flush_stream(flushes)), expected)
 
     if DeltaShardedCheckpointEngine is None:
         with pytest.raises(ValueError, match="not registered"):
@@ -436,19 +516,9 @@ def test_omni_delta_sharded_registers_flattening_engine(monkeypatch):
     assert issubclass(engine_cls, DeltaShardedCheckpointEngine)
     assert engine_cls.wire_format == "named_tensors"
 
-    flushes = [
-        ([(SPEC_NAME, torch.zeros(1)), (VALUES_NAME, torch.zeros(1))], True),
-        ([(SPEC_NAME, torch.zeros(1)), (POSITIONS_NAME, torch.zeros(1)), (VALUES_NAME, torch.zeros(1))], True),
-    ]
     monkeypatch.setattr(DeltaShardedCheckpointEngine, "receive_weights", lambda self, global_steps=None: iter(flushes))
     engine = object.__new__(engine_cls)
-    assert list(engine.receive_weights()) == [
-        (f"{SPEC_NAME}#0", flushes[0][1][0][1]),
-        (f"{VALUES_NAME}#0", flushes[0][1][1][1]),
-        (f"{SPEC_NAME}#1", flushes[1][1][0][1]),
-        (f"{POSITIONS_NAME}#1", flushes[1][1][1][1]),
-        (f"{VALUES_NAME}#1", flushes[1][1][2][1]),
-    ]
+    _assert_flattened(list(engine.receive_weights()), expected)
 
 
 def test_ar_strategy_routes_only_weight_sync_rpcs():

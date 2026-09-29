@@ -265,11 +265,17 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             def _route_bucket(weights, is_last=False, *args, **kwargs):
                 # delta_ctx carries the sniffed routing flag and, once delta is
                 # detected, the lazy applier state (see _apply_delta_bucket).
+                # A zero-flush sync still delivers one empty terminal bucket; that
+                # must stay a no-op, not a dense load_weights([]) / post-load pass.
+                # Once a delta stream has started, an empty trailing bucket still
+                # has to reach the applier so is_last can close the flush.
                 if delta_ctx["delta"] is None:
+                    if not weights:
+                        return
                     delta_ctx["delta"] = _bucket_is_delta_flush(weights)
                 if delta_ctx["delta"]:
                     self._apply_delta_bucket(weights, delta_ctx, is_last=is_last)
-                else:
+                elif weights:
                     dense_on_bucket(weights)
 
             standard = self._get_standard_weight_model_and_config()
@@ -303,7 +309,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                     receiver.receive_weights(on_bucket_received=_route_bucket)
                     if delta_ctx["delta"]:
                         self._finish_delta_stream(delta_ctx)
-                    else:
+                    elif delta_ctx["delta"] is False:
                         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
                         process_weights_after_loading(model, model_config, self.device)
@@ -312,22 +318,30 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                     # model. Restore those layouts before loading, then copy
                     # processed weights back into the original kernel storage.
                     # A delta stream into a fused-MoE model raises fail-closed
-                    # on its first bucket (see _apply_delta_bucket).
+                    # on its first bucket (see _apply_delta_bucket). Start the
+                    # reload only after the sniff says dense, so that raise does
+                    # not leave the replica inside initialize_layerwise_reload.
                     from vllm.model_executor.model_loader.reload import (
                         finalize_layerwise_reload,
                         initialize_layerwise_reload,
                     )
 
-                    initialize_layerwise_reload(model)
+                    moe_reload = {"started": False}
 
                     # Layerwise loaders can retain tensors across buckets. The
                     # receiver reuses its IPC buffer, so retained weights must
                     # own their storage until the layer is ready to process.
                     def dense_on_bucket(weights):
+                        if not moe_reload["started"]:
+                            initialize_layerwise_reload(model)
+                            moe_reload["started"] = True
                         model.load_weights([(name, tensor.clone()) for name, tensor in weights])
 
                     receiver.receive_weights(on_bucket_received=_route_bucket)
-                    finalize_layerwise_reload(model, model_config)
+                    if delta_ctx["delta"]:
+                        self._finish_delta_stream(delta_ctx)
+                    elif delta_ctx["delta"] is False:
+                        finalize_layerwise_reload(model, model_config)
             else:
                 # Diffusion pipeline worker: load via the pipeline. vllm-omni
                 # 0.26 removed DiffusionWorker/DiffusionModelRunner.load_weights;
