@@ -56,6 +56,7 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
 from verl_omni.trainer.omni.omni_algos import (
     get_omni_loss_fn,
 )
+from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.dataset.offline_mllm_dpo_dataset import get_batch_modality
 from verl_omni.utils.metrics_utils import GroupedMetricMean
 from verl_omni.workers.config import OmniModelConfig
@@ -144,11 +145,7 @@ class OmniDirectPreferenceRayTrainer:
             self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler, val_sampler)
 
     def _infer_ref_in_actor(self) -> bool:
-        model_cfg = self.config.actor_rollout_ref.model
-        lora_rank = model_cfg.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = model_cfg.get("lora_rank", 0)
-        return lora_rank > 0 or model_cfg.get("lora_adapter_path") is not None
+        return resolve_lora_config(self.config.actor_rollout_ref.model).enabled
 
     def _create_dataloader(
         self,

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -72,3 +73,122 @@ def _validate_dynamic_resource_scheduling(config: Any) -> None:
         "main_diffusion / main_diffusion_v1. For v1 separate_async, set "
         "trainer.v1.separate_async.hybrid_rollout.enable_switch=true instead."
     )
+
+
+# ---------------------------------------------------------------------------
+# LoRA config surface
+# ---------------------------------------------------------------------------
+
+# The only nested model.lora keys verl-omni reads. Everything else nested is
+# either Megatron grammar (below) or a mistake.
+NESTED_LORA_READ_KEYS = frozenset({"rank", "merge"})
+
+# Nested model.lora keys that verl's pinned default config tree injects into
+# every composed config (origin: verl/trainer/config/model/hf_model.yaml).
+# They are Megatron grammar no FSDP engine here reads; they are
+# tolerated-but-unread until a verl pin bump prunes them at the source.
+MEGATRON_PINNED_LORA_KEYS = frozenset(
+    {
+        "type",
+        "alpha",
+        "dropout",
+        "target_modules",
+        "exclude_modules",
+        "dropout_position",
+        "lora_A_init_method",
+        "lora_B_init_method",
+        "a2a_experimental",
+        "dtype",
+        "adapter_path",
+        "freeze_vision_model",
+        "freeze_vision_projection",
+        "freeze_language_model",
+    }
+)
+
+KNOWN_POLICY_STATES = ("default", "old", "reference")
+
+
+class LoraConfigConflictError(ValueError):
+    """Raised when the flat and nested LoRA key spellings disagree."""
+
+
+class UnknownLoraKeyError(ValueError):
+    """Raised for nested model.lora keys no engine in verl-omni reads."""
+
+
+@dataclass(frozen=True)
+class LoRASettings:
+    """Normalized LoRA policy resolved from ``actor_rollout_ref.model``.
+
+    The single authority for LoRA configuration: trainer entry points and
+    engines read this instead of re-deriving the flat vs nested spellings.
+    """
+
+    rank: int  # effective rank; nested lora.rank wins over flat lora_rank when flat is 0
+    alpha: int  # flat lora_alpha (the nested alpha key is Megatron-only, unread)
+    adapter_path: str | None  # flat lora_adapter_path
+    merge: bool  # nested lora.merge: fuse adapters into base weights before sync
+    adapters: tuple[str, ...]  # normalized policy_state_adapters, "default" forced first
+    enabled: bool  # rank > 0 or adapter_path is not None
+
+
+def resolve_lora_config(model_config: Any) -> LoRASettings:
+    """Resolve the flat and nested LoRA keys into one validated settings object.
+
+    Accepts an OmegaConf node or the instantiated model config dataclass.
+    Fail-closed: conflicting spellings raise ``LoraConfigConflictError``,
+    unread nested keys raise ``UnknownLoraKeyError``.
+    """
+    nested = _select(model_config, "lora", None) or {}
+    if not hasattr(nested, "keys"):
+        raise ValueError(f"actor_rollout_ref.model.lora must be a mapping, got {type(nested).__name__}.")
+    allowed_keys = NESTED_LORA_READ_KEYS | MEGATRON_PINNED_LORA_KEYS
+    for key in nested.keys():
+        if key not in allowed_keys:
+            raise UnknownLoraKeyError(
+                f"actor_rollout_ref.model.lora.{key!r} is not read by any verl-omni engine. "
+                "Remove the override; if the key comes from a newer verl default config, "
+                "this build needs a verl pin bump."
+            )
+
+    flat_rank = _select(model_config, "lora_rank", 0) or 0
+    nested_rank = nested.get("rank", 0) or 0
+    if flat_rank > 0 and nested_rank > 0 and flat_rank != nested_rank:
+        raise LoraConfigConflictError(
+            f"actor_rollout_ref.model.lora.rank={nested_rank} conflicts with "
+            f"actor_rollout_ref.model.lora_rank={flat_rank}; set only one spelling."
+        )
+    rank = nested_rank if nested_rank > 0 else flat_rank
+
+    adapter_path = _select(model_config, "lora_adapter_path", None) or None
+    nested_adapter_path = nested.get("adapter_path")
+    if adapter_path and nested_adapter_path and adapter_path != nested_adapter_path:
+        raise LoraConfigConflictError(
+            f"actor_rollout_ref.model.lora.adapter_path={nested_adapter_path!r} conflicts with "
+            f"actor_rollout_ref.model.lora_adapter_path={adapter_path!r}; set only one spelling."
+        )
+
+    return LoRASettings(
+        rank=int(rank),
+        alpha=int(_select(model_config, "lora_alpha", 0) or 0),
+        adapter_path=adapter_path,
+        merge=bool(nested.get("merge", False)),
+        adapters=_normalize_policy_state_adapters(_select(model_config, "policy_state_adapters", ("default",))),
+        enabled=rank > 0 or adapter_path is not None,
+    )
+
+
+def _normalize_policy_state_adapters(value: Any) -> tuple[str, ...]:
+    """Dedupe policy states, validate names, and force "default" first.
+
+    "default" is the trained policy and must be the primary adapter; a config
+    listing e.g. ["old", "default"] must not silently promote "old" to primary.
+    """
+    adapters: list[str] = []
+    for adapter in value or ():
+        if adapter not in KNOWN_POLICY_STATES:
+            raise ValueError(f"Unknown policy state adapter {adapter!r}; expected one of {list(KNOWN_POLICY_STATES)}.")
+        if adapter not in adapters:
+            adapters.append(adapter)
+    return ("default", *(adapter for adapter in adapters if adapter != "default"))

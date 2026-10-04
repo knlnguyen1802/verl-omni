@@ -186,6 +186,26 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.fsdp_layer_prefixes`: FSDP layer name prefixes for LoRA layered summon (default `["transformer_blocks."]`).
 - `actor_rollout_ref.model.pipeline` / `algo`: Mirrored from `actor_rollout_ref.rollout.pipeline` / `algo` via `oc.select`; prefer overriding the rollout copies.
 
+#### LoRA config resolution
+
+`verl_omni.utils.config.resolve_lora_config` is the single authority for LoRA
+configuration; trainer entry points and engines read its `LoRASettings` instead of
+the raw keys. Resolution rules:
+
+- The effective rank is the nested `actor_rollout_ref.model.lora.rank` when it is
+  `> 0`, otherwise the flat `actor_rollout_ref.model.lora_rank`. Setting both
+  spellings to different positive values raises `LoraConfigConflictError`.
+- `merge` is read only from the nested `actor_rollout_ref.model.lora.merge`.
+- `actor_rollout_ref.model.lora_adapter_path` (flat) is the pre-trained adapter
+  path. The nested `lora.adapter_path` Megatron key is tolerated but unread;
+  setting both to different paths raises `LoraConfigConflictError`.
+- Nested `model.lora` keys beyond `merge`/`rank` are Megatron grammar that verl's
+  default config tree injects into every composed config. They are
+  tolerated-but-unread; any other nested key raises `UnknownLoraKeyError` — remove
+  the override, or bump the verl pin if the key comes from a newer verl default.
+- `actor_rollout_ref.model.policy_state_adapters` accepts only `default`, `old`,
+  and `reference`; `default` is always forced first because it is the trained policy.
+
 ### `actor_rollout_ref.actor` — diffusion actor / loss
 
 ```yaml
