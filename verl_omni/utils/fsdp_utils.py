@@ -18,7 +18,7 @@ FSDP utilities for verl-omni
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import ExitStack, contextmanager
 from functools import partial
 from pathlib import Path
@@ -436,32 +436,6 @@ def _collect_lora_params_non_layered(module, peft_model, adapter_name: str, base
     return lora_params
 
 
-def _collect_lora_params_with_adapter(
-    module,
-    layered_summon: bool,
-    base_sync_done: bool,
-    adapter_name: str,
-    layered_summon_fn: Callable,
-) -> OrderedDict:
-    """Verl-style LoRA collection with explicit ``adapter_name`` for PEFT state."""
-    peft_model = getattr(module, "_fsdp_wrapped_module", module)
-    if fsdp_version(module) > 0:
-        if layered_summon:
-            if not base_sync_done:
-                raise ValueError(
-                    "To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let "
-                    "rollout.load_format=safetensors"
-                )
-            if layered_summon_fn is _upstream_layered_summon_lora_params:
-                return layered_summon_fn(module)
-            return layered_summon_fn(module, adapter_name=adapter_name)
-        return _collect_lora_params_non_layered(module, peft_model, adapter_name, base_sync_done)
-
-    if base_sync_done:
-        return _peft_lora_params_to_cpu(peft_model, adapter_name)
-    return _collect_base_weights_to_cpu(peft_model)
-
-
 def _layered_summon_lora_params_diffusers(
     fsdp_module, adapter_name: str = "default", layer_prefixes: Sequence[str] = ("transformer_blocks.",)
 ) -> OrderedDict:
@@ -569,6 +543,13 @@ def collect_lora_params(
     Raises ``RuntimeError`` when no parameters were collected
     (e.g. mismatched ``layer_prefixes``).
 
+    # DIFF vs upstream (verl.utils.fsdp_utils.collect_lora_params): this wrapper
+    # adds an explicit ``adapter_name`` (named policy adapters), the diffusers
+    # layered walker with ``layer_prefixes``, and FSDP wrapper-token name
+    # cleaning. The upstream fast path survives only for the default adapter on
+    # non-diffusers-layered, non-FSDP2 modules; everything else flows through
+    # the adapter-aware implementation below.
+
     Args:
         module: The FSDP-wrapped or plain module.
         layered_summon: Summon one FSDP unit at a time instead of the full model.
@@ -588,13 +569,25 @@ def collect_lora_params(
         )
     else:
         layered_summon_fn = _upstream_layered_summon_lora_params
-    lora_params = _collect_lora_params_with_adapter(
-        module,
-        layered_summon=layered_summon,
-        base_sync_done=base_sync_done,
-        adapter_name=adapter_name,
-        layered_summon_fn=layered_summon_fn,
-    )
+
+    peft_model = getattr(module, "_fsdp_wrapped_module", module)
+    if fsdp_version(module) > 0:
+        if layered_summon:
+            if not base_sync_done:
+                raise ValueError(
+                    "To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let "
+                    "rollout.load_format=safetensors"
+                )
+            if layered_summon_fn is _upstream_layered_summon_lora_params:
+                lora_params = layered_summon_fn(module)
+            else:
+                lora_params = layered_summon_fn(module, adapter_name=adapter_name)
+        else:
+            lora_params = _collect_lora_params_non_layered(module, peft_model, adapter_name, base_sync_done)
+    elif base_sync_done:
+        lora_params = _peft_lora_params_to_cpu(peft_model, adapter_name)
+    else:
+        lora_params = _collect_base_weights_to_cpu(peft_model)
     # Prefix walker only visits ``transformer_blocks.<i>``. Same fallback as
     # verl (full summon + PEFT dump); name-scan if tuner prefixes still miss.
     if not lora_params and layered_summon and base_sync_done:
