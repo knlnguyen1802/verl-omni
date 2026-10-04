@@ -9,8 +9,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from omegaconf import OmegaConf
+
 
 def _select(config: Any, path: str, default: Any = None) -> Any:
+    """Read a dotted path from an OmegaConf node or a plain config object.
+
+    OmegaConf (hydra) nodes go through ``OmegaConf.select`` so struct flags and
+    interpolations behave exactly as in the composed trainer config;
+    instantiated dataclasses fall back to attribute access. A ``None`` result
+    collapses to ``default`` either way.
+    """
+    if OmegaConf.is_config(config):
+        value = OmegaConf.select(config, path, default=default)
+        return default if value is None else value
     value = config
     for part in path.split("."):
         if value is None:
@@ -163,14 +175,6 @@ MEGATRON_PINNED_LORA_KEYS = frozenset(
 KNOWN_POLICY_STATES = ("default", "old", "reference")
 
 
-class LoraConfigConflictError(ValueError):
-    """Raised when the flat and nested LoRA key spellings disagree."""
-
-
-class UnknownLoraKeyError(ValueError):
-    """Raised for nested model.lora keys no engine in verl-omni reads."""
-
-
 @dataclass(frozen=True)
 class LoRASettings:
     """Normalized LoRA policy resolved from ``actor_rollout_ref.model``.
@@ -191,8 +195,7 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
     """Resolve the flat and nested LoRA keys into one validated settings object.
 
     Accepts an OmegaConf node or the instantiated model config dataclass.
-    Fail-closed: conflicting spellings raise ``LoraConfigConflictError``,
-    unread nested keys raise ``UnknownLoraKeyError``.
+    Fail-closed: conflicting spellings and unread nested keys raise ``ValueError``.
     """
     nested = _select(model_config, "lora", None) or {}
     if not hasattr(nested, "keys"):
@@ -200,7 +203,7 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
     allowed_keys = NESTED_LORA_READ_KEYS | MEGATRON_PINNED_LORA_KEYS
     for key in nested.keys():
         if key not in allowed_keys:
-            raise UnknownLoraKeyError(
+            raise ValueError(
                 f"actor_rollout_ref.model.lora.{key!r} is not read by any verl-omni engine. "
                 "Remove the override; if the key comes from a newer verl default config, "
                 "this build needs a verl pin bump."
@@ -209,7 +212,7 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
     flat_rank = _select(model_config, "lora_rank", 0) or 0
     nested_rank = nested.get("rank", 0) or 0
     if flat_rank > 0 and nested_rank > 0 and flat_rank != nested_rank:
-        raise LoraConfigConflictError(
+        raise ValueError(
             f"actor_rollout_ref.model.lora.rank={nested_rank} conflicts with "
             f"actor_rollout_ref.model.lora_rank={flat_rank}; set only one spelling."
         )
@@ -218,7 +221,7 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
     adapter_path = _select(model_config, "lora_adapter_path", None) or None
     nested_adapter_path = nested.get("adapter_path")
     if adapter_path and nested_adapter_path and adapter_path != nested_adapter_path:
-        raise LoraConfigConflictError(
+        raise ValueError(
             f"actor_rollout_ref.model.lora.adapter_path={nested_adapter_path!r} conflicts with "
             f"actor_rollout_ref.model.lora_adapter_path={adapter_path!r}; set only one spelling."
         )

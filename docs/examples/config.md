@@ -194,14 +194,14 @@ the raw keys. Resolution rules:
 
 - The effective rank is the nested `actor_rollout_ref.model.lora.rank` when it is
   `> 0`, otherwise the flat `actor_rollout_ref.model.lora_rank`. Setting both
-  spellings to different positive values raises `LoraConfigConflictError`.
+  spellings to different positive values raises a `ValueError`.
 - `merge` is read only from the nested `actor_rollout_ref.model.lora.merge`.
 - `actor_rollout_ref.model.lora_adapter_path` (flat) is the pre-trained adapter
   path. The nested `lora.adapter_path` Megatron key is tolerated but unread;
-  setting both to different paths raises `LoraConfigConflictError`.
+  setting both to different paths raises a `ValueError`.
 - Nested `model.lora` keys beyond `merge`/`rank` are Megatron grammar that verl's
   default config tree injects into every composed config. They are
-  tolerated-but-unread; any other nested key raises `UnknownLoraKeyError` — remove
+  tolerated-but-unread; any other nested key raises a `ValueError` — remove
   the override, or bump the verl pin if the key comes from a newer verl default.
 - `actor_rollout_ref.model.policy_state_adapters` accepts only `default`, `old`,
   and `reference`; `default` is always forced first because it is the trained policy.

@@ -20,12 +20,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import verl_omni
-from verl_omni.utils.config import (
-    LoraConfigConflictError,
-    LoRASettings,
-    UnknownLoraKeyError,
-    resolve_lora_config,
-)
+from verl_omni.utils.config import LoRASettings, resolve_lora_config
 
 _CONFIG_DIR = Path(verl_omni.__file__).parent / "trainer" / "config"
 
@@ -67,7 +62,7 @@ def test_equal_rank_in_both_spellings_is_accepted():
 
 
 def test_conflicting_rank_spellings_raise():
-    with pytest.raises(LoraConfigConflictError, match="lora_rank=32"):
+    with pytest.raises(ValueError, match="lora_rank=32"):
         resolve_lora_config(_model_config(lora_rank=32, lora={"rank": 16, "merge": False}))
 
 
@@ -77,12 +72,12 @@ def test_merge_is_read_from_nested_block_only():
 
 
 def test_adapter_path_conflict_raises():
-    with pytest.raises(LoraConfigConflictError, match="adapter_path"):
+    with pytest.raises(ValueError, match="adapter_path"):
         resolve_lora_config(_model_config(lora_adapter_path="/a", lora={"merge": False, "adapter_path": "/b"}))
 
 
 def test_unknown_nested_key_raises():
-    with pytest.raises(UnknownLoraKeyError, match="does_not_exist"):
+    with pytest.raises(ValueError, match="does_not_exist"):
         resolve_lora_config(_model_config(lora={"merge": False, "does_not_exist": 1}))
 
 
