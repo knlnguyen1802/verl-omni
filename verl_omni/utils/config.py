@@ -66,16 +66,14 @@ def _validate_delta_sharded(config: Any) -> None:
         )
 
     model_key = "actor_rollout_ref.model"
-    lora_rank = _select(config, f"{model_key}.lora.rank", 0) or 0
-    legacy_lora_rank = _select(config, f"{model_key}.lora_rank", 0) or 0
-    lora_adapter_path = _select(config, f"{model_key}.lora_adapter_path")
-    if lora_rank > 0 or legacy_lora_rank > 0 or lora_adapter_path is not None:
+    settings = resolve_lora_config(_select(config, model_key))
+    if settings.enabled:
         raise ValueError(
             "checkpoint_engine.backend='omni_delta_sharded' requires full-weight training; LoRA is "
             "refused in either merge mode because the shard export's names and values differ "
             "from the adapter (merge=false) and merged (merge=true) full exports. "
-            f"Got {model_key}.lora.rank={lora_rank}, {model_key}.lora_rank={legacy_lora_rank}, "
-            f"{model_key}.lora_adapter_path={lora_adapter_path}."
+            f"Resolved LoRA settings for {model_key}: rank={settings.rank}, "
+            f"adapter_path={settings.adapter_path!r}, merge={settings.merge}."
         )
 
     for qat_path in ("actor_rollout_ref.actor.fsdp_config.qat.enable", "actor_rollout_ref.actor.megatron.qat.enable"):
@@ -183,9 +181,9 @@ class LoRASettings:
     engines read this instead of re-deriving the flat vs nested spellings.
     """
 
-    rank: int  # effective rank; nested lora.rank wins over flat lora_rank when flat is 0
+    rank: int  # effective rank; nested lora.rank is adopted when flat lora_rank is 0
     alpha: int  # flat lora_alpha (the nested alpha key is Megatron-only, unread)
-    adapter_path: str | None  # flat lora_adapter_path
+    adapter_path: str | None  # effective path; nested lora.adapter_path is adopted when flat is unset
     merge: bool  # nested lora.merge: fuse adapters into base weights before sync
     adapters: tuple[str, ...]  # normalized policy_state_adapters, "default" forced first
     enabled: bool  # rank > 0 or adapter_path is not None
@@ -196,6 +194,17 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
 
     Accepts an OmegaConf node or the instantiated model config dataclass.
     Fail-closed: conflicting spellings and unread nested keys raise ``ValueError``.
+
+    - rank: nested ``lora.rank`` when ``> 0``, else flat ``lora_rank``; both set
+      to different positive values raises.
+    - adapter_path: flat ``lora_adapter_path`` when set, else nested
+      ``lora.adapter_path`` (same adoption rule as rank); both set to different
+      paths raises.
+    - alpha: flat ``lora_alpha`` only. The nested ``lora.alpha`` key is Megatron
+      grammar and is never read: every composed omni config still carries
+      ``lora.alpha: 32`` next to ``lora_alpha: 16`` (both injected from verl's
+      default tree), so a disagreeing nested alpha is ignored until one of
+      those two defaults changes.
     """
     nested = _select(model_config, "lora", None) or {}
     if not hasattr(nested, "keys"):
@@ -225,6 +234,8 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
             f"actor_rollout_ref.model.lora.adapter_path={nested_adapter_path!r} conflicts with "
             f"actor_rollout_ref.model.lora_adapter_path={adapter_path!r}; set only one spelling."
         )
+    if adapter_path is None:
+        adapter_path = nested_adapter_path or None
 
     return LoRASettings(
         rank=int(rank),

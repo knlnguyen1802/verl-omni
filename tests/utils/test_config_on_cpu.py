@@ -106,6 +106,13 @@ def test_delta_sharded_rejects_lora(model_override):
         validate_config(_delta_config(actor_rollout_ref={"model": model_override}))
 
 
+def test_delta_sharded_surfaces_lora_rank_conflict():
+    """The LoRA gate reads through resolve_lora_config, so a conflicting
+    flat/nested rank raises the resolver's conflict error, not the delta message."""
+    with pytest.raises(ValueError, match="conflicts with"):
+        validate_config(_delta_config(actor_rollout_ref={"model": {"lora": {"rank": 8}, "lora_rank": 16}}))
+
+
 @pytest.mark.parametrize(
     "actor_override",
     [

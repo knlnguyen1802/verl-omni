@@ -196,9 +196,14 @@ the raw keys. Resolution rules:
   `> 0`, otherwise the flat `actor_rollout_ref.model.lora_rank`. Setting both
   spellings to different positive values raises a `ValueError`.
 - `merge` is read only from the nested `actor_rollout_ref.model.lora.merge`.
-- `actor_rollout_ref.model.lora_adapter_path` (flat) is the pre-trained adapter
-  path. The nested `lora.adapter_path` Megatron key is tolerated but unread;
-  setting both to different paths raises a `ValueError`.
+- The effective adapter path is the flat `actor_rollout_ref.model.lora_adapter_path`
+  when it is set; a nested-only `lora.adapter_path` is adopted by the same rule as
+  rank. Setting both spellings to different paths raises a `ValueError`.
+- `alpha` is read only from the flat `actor_rollout_ref.model.lora_alpha`. The
+  nested `lora.alpha` key is Megatron grammar and is unread: composed omni configs
+  currently carry `lora.alpha: 32` next to `lora_alpha: 16` (both injected from
+  verl's default tree), and that disagreement is ignored until one of the two
+  defaults changes.
 - Nested `model.lora` keys beyond `merge`/`rank` are Megatron grammar that verl's
   default config tree injects into every composed config. They are
   tolerated-but-unread; any other nested key raises a `ValueError` — remove

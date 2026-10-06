@@ -20,7 +20,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import verl_omni
-from verl_omni.utils.config import LoRASettings, resolve_lora_config
+from verl_omni.utils.config import MEGATRON_PINNED_LORA_KEYS, NESTED_LORA_READ_KEYS, LoRASettings, resolve_lora_config
 
 _CONFIG_DIR = Path(verl_omni.__file__).parent / "trainer" / "config"
 
@@ -74,6 +74,14 @@ def test_merge_is_read_from_nested_block_only():
 def test_adapter_path_conflict_raises():
     with pytest.raises(ValueError, match="adapter_path"):
         resolve_lora_config(_model_config(lora_adapter_path="/a", lora={"merge": False, "adapter_path": "/b"}))
+
+
+def test_nested_only_adapter_path_is_adopted():
+    """Same rule as rank: the flat key is unset, so the nested-only spelling is honored
+    instead of being silently dropped as a tolerated Megatron key."""
+    settings = resolve_lora_config(_model_config(lora={"merge": False, "adapter_path": "/b"}))
+    assert settings.adapter_path == "/b"
+    assert settings.enabled
 
 
 def test_unknown_nested_key_raises():
@@ -136,20 +144,31 @@ def test_non_mapping_nested_lora_raises():
         resolve_lora_config(_model_config(lora=32))
 
 
-@pytest.mark.parametrize(
-    "generated_yaml",
-    ["_generated_omni_trainer.yaml", "_generated_omni_megatron_trainer.yaml", "_generated_diffusion_trainer.yaml"],
-)
-def test_generated_configs_resolve_with_pinned_megatron_keys(generated_yaml):
-    """Composed trainer configs still carry the Megatron-pinned nested keys (verl
-    injects them via its defaults chain); the resolver must tolerate and read them."""
+@pytest.mark.parametrize("generated_yaml", ["_generated_omni_trainer.yaml", "_generated_omni_megatron_trainer.yaml"])
+def test_generated_omni_configs_carry_exactly_the_pinned_megatron_keys(generated_yaml):
+    """verl's defaults chain injects hf_model.yaml's Megatron lora block into every
+    composed omni config. The nested key set is the resolver allowlist's contract:
+    a compose that dropped a pinned key (or grew a new one) must fail here so the
+    MEGATRON_PINNED_LORA_KEYS / NESTED_LORA_READ_KEYS lists get updated with it."""
     config = OmegaConf.load(_CONFIG_DIR / generated_yaml)
-    settings = resolve_lora_config(config.actor_rollout_ref.model)
+    model = config.actor_rollout_ref.model
+    assert set(model.lora.keys()) == MEGATRON_PINNED_LORA_KEYS | NESTED_LORA_READ_KEYS
+    settings = resolve_lora_config(model)
     assert settings.enabled is False
     assert settings.merge is False
-    assert config.actor_rollout_ref.model.lora_rank == 0
+    assert model.lora_rank == 0
 
 
-def test_omni_model_yaml_nested_block_trims_to_merge():
-    source = OmegaConf.load(_CONFIG_DIR / "omni" / "model" / "omni_model.yaml")
-    assert set(source.lora.keys()) == {"merge"}
+@pytest.mark.parametrize(
+    "generated_yaml", ["_generated_diffusion_trainer.yaml", "_generated_diffusion_veomni_trainer.yaml"]
+)
+def test_generated_diffusion_configs_carry_merge_only_lora_block(generated_yaml):
+    """Diffusion trainer configs do not merge verl's hf_model.yaml, so their nested
+    lora block stays at the single key verl-omni reads."""
+    config = OmegaConf.load(_CONFIG_DIR / generated_yaml)
+    model = config.actor_rollout_ref.model
+    assert set(model.lora.keys()) == {"merge"}
+    settings = resolve_lora_config(model)
+    assert settings.enabled is False
+    assert settings.merge is False
+    assert model.lora_rank == 0
