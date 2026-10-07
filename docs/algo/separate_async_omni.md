@@ -51,7 +51,7 @@ bash examples/gspo_trainer/qwen3_omni/run_qwen3_omni_megatron_audiomcq_separate_
 
 That launcher is Thinker-only, BSHD, PP=CP=1, AudioMCQ. It is experimental and
 not clean-checkout reproducible yet; see
-[`examples/gspo_trainer/qwen3_omni/README.md`](../../examples/gspo_trainer/qwen3_omni/README.md).
+[`examples/gspo_trainer/qwen3_omni/README.md`](../examples/qwen3_omni/gspo_trainer_qwen3_omni.md).
 The same trainer mode also has an image+audio AVQA Megatron launcher using
 shared configuration. Development-environment GPU results and the remaining
 public-dependency limitations are documented in that README.
