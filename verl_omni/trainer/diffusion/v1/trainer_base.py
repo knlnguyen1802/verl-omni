@@ -182,9 +182,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     "`python -m verl_omni.trainer.main_diffusion` (the legacy v0 entrypoint)."
                 )
             self._loss_fn = get_diffusion_loss_fn(loss_mode)
-            self._has_old_adapter = "old" in tuple(
-                config.actor_rollout_ref.model.get("policy_state_adapters", ("default",))
-            )
+            self._has_old_adapter = "old" in resolve_lora_config(config.actor_rollout_ref.model).adapters
             if self._has_old_adapter:
                 self._validate_old_adapter_config()
         else:

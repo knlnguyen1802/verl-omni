@@ -131,9 +131,7 @@ class OmniDirectPreferenceRayTrainer:
         if loss_mode != "dpo":
             raise NotImplementedError("OmniDirectPreferenceRayTrainer currently supports omni_loss.loss_mode=dpo only.")
         self.use_reference_policy = True
-        self._has_old_adapter = "old" in tuple(
-            config.actor_rollout_ref.model.get("policy_state_adapters", ("default",))
-        )
+        self._has_old_adapter = "old" in resolve_lora_config(config.actor_rollout_ref.model).adapters
         if self._has_old_adapter:
             raise NotImplementedError("OmniDirectPreferenceRayTrainer does not support old-policy adapters yet.")
         self._loss_fn = get_omni_loss_fn(loss_mode)

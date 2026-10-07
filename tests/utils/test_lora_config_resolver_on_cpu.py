@@ -50,10 +50,11 @@ def test_flat_rank_enables_lora():
     assert settings.enabled
 
 
-def test_nested_rank_wins_when_flat_is_zero():
-    settings = resolve_lora_config(_model_config(lora={"rank": 32, "merge": False}))
-    assert settings.rank == 32
-    assert settings.enabled
+def test_nested_only_rank_raises_set_the_flat_key():
+    """Every engine gate reads the flat key, so a nested-only rank would let the
+    trainer believe LoRA is enabled while the engine never wraps PEFT."""
+    with pytest.raises(ValueError, match="set actor_rollout_ref.model.lora_rank"):
+        resolve_lora_config(_model_config(lora={"rank": 32, "merge": False}))
 
 
 def test_equal_rank_in_both_spellings_is_accepted():
@@ -76,12 +77,11 @@ def test_adapter_path_conflict_raises():
         resolve_lora_config(_model_config(lora_adapter_path="/a", lora={"merge": False, "adapter_path": "/b"}))
 
 
-def test_nested_only_adapter_path_is_adopted():
-    """Same rule as rank: the flat key is unset, so the nested-only spelling is honored
-    instead of being silently dropped as a tolerated Megatron key."""
-    settings = resolve_lora_config(_model_config(lora={"merge": False, "adapter_path": "/b"}))
-    assert settings.adapter_path == "/b"
-    assert settings.enabled
+def test_nested_only_adapter_path_raises_set_the_flat_key():
+    """Same rule as rank: the flat key is the one the engines gate on, so a
+    nested-only adapter path must fail loudly instead of being silently dropped."""
+    with pytest.raises(ValueError, match="set actor_rollout_ref.model.lora_adapter_path"):
+        resolve_lora_config(_model_config(lora={"merge": False, "adapter_path": "/b"}))
 
 
 def test_unknown_nested_key_raises():

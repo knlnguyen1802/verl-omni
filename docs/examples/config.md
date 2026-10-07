@@ -192,13 +192,15 @@ actor_rollout_ref:
 configuration; trainer entry points and engines read its `LoRASettings` instead of
 the raw keys. Resolution rules:
 
-- The effective rank is the nested `actor_rollout_ref.model.lora.rank` when it is
-  `> 0`, otherwise the flat `actor_rollout_ref.model.lora_rank`. Setting both
-  spellings to different positive values raises a `ValueError`.
+- The rank is the flat `actor_rollout_ref.model.lora_rank`. A nested
+  `model.lora.rank` set without the flat key raises a `ValueError` ("set
+  `lora_rank`"): every engine gate reads the flat spelling, so a nested-only
+  value would silently run full-parameter training where LoRA was intended.
+  Setting both spellings to different positive values also raises.
 - `merge` is read only from the nested `actor_rollout_ref.model.lora.merge`.
-- The effective adapter path is the flat `actor_rollout_ref.model.lora_adapter_path`
-  when it is set; a nested-only `lora.adapter_path` is adopted by the same rule as
-  rank. Setting both spellings to different paths raises a `ValueError`.
+- The adapter path is the flat `actor_rollout_ref.model.lora_adapter_path`,
+  same rule as rank: a nested-only `lora.adapter_path` raises; setting both
+  spellings to different paths raises a `ValueError`.
 - `alpha` is read only from the flat `actor_rollout_ref.model.lora_alpha`. The
   nested `lora.alpha` key is Megatron grammar and is unread: composed omni configs
   currently carry `lora.alpha: 32` next to `lora_alpha: 16` (both injected from

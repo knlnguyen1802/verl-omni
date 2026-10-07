@@ -149,8 +149,10 @@ NESTED_LORA_READ_KEYS = frozenset({"rank", "merge"})
 
 # Nested model.lora keys that verl's pinned default config tree injects into
 # every composed config (origin: verl/trainer/config/model/hf_model.yaml).
-# They are Megatron grammar no FSDP engine here reads; they are
-# tolerated-but-unread until a verl pin bump prunes them at the source.
+# They are Megatron grammar no FSDP engine here reads: none of them is read
+# (rank/merge live in NESTED_LORA_READ_KEYS; adapter_path raises via the
+# resolver when set without its flat twin), and they are tolerated-but-unread
+# until a verl pin bump prunes them at the source.
 MEGATRON_PINNED_LORA_KEYS = frozenset(
     {
         "type",
@@ -181,9 +183,9 @@ class LoRASettings:
     engines read this instead of re-deriving the flat vs nested spellings.
     """
 
-    rank: int  # effective rank; nested lora.rank is adopted when flat lora_rank is 0
+    rank: int  # flat lora_rank (a nested-only lora.rank raises in the resolver)
     alpha: int  # flat lora_alpha (the nested alpha key is Megatron-only, unread)
-    adapter_path: str | None  # effective path; nested lora.adapter_path is adopted when flat is unset
+    adapter_path: str | None  # flat lora_adapter_path (a nested-only adapter_path raises)
     merge: bool  # nested lora.merge: fuse adapters into base weights before sync
     adapters: tuple[str, ...]  # normalized policy_state_adapters, "default" forced first
     enabled: bool  # rank > 0 or adapter_path is not None
@@ -195,11 +197,13 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
     Accepts an OmegaConf node or the instantiated model config dataclass.
     Fail-closed: conflicting spellings and unread nested keys raise ``ValueError``.
 
-    - rank: nested ``lora.rank`` when ``> 0``, else flat ``lora_rank``; both set
-      to different positive values raises.
-    - adapter_path: flat ``lora_adapter_path`` when set, else nested
-      ``lora.adapter_path`` (same adoption rule as rank); both set to different
-      paths raises.
+    - rank: flat ``lora_rank`` only. A nested ``lora.rank`` > 0 without the flat
+      key raises ("set the flat key"): every engine gate still reads the flat
+      spelling, so adopting the nested value would let the trainer believe LoRA
+      is enabled while the engine never wraps PEFT. Nested-only adoption returns
+      when engine gating unifies through this resolver (#685).
+    - adapter_path: flat ``lora_adapter_path`` only, same raise-on-nested-only
+      rule as rank.
     - alpha: flat ``lora_alpha`` only. The nested ``lora.alpha`` key is Megatron
       grammar and is never read: every composed omni config still carries
       ``lora.alpha: 32`` next to ``lora_alpha: 16`` (both injected from verl's
@@ -218,14 +222,19 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
                 "this build needs a verl pin bump."
             )
 
-    flat_rank = _select(model_config, "lora_rank", 0) or 0
+    rank = _select(model_config, "lora_rank", 0) or 0
     nested_rank = nested.get("rank", 0) or 0
-    if flat_rank > 0 and nested_rank > 0 and flat_rank != nested_rank:
+    if rank > 0 and nested_rank > 0 and rank != nested_rank:
         raise ValueError(
             f"actor_rollout_ref.model.lora.rank={nested_rank} conflicts with "
-            f"actor_rollout_ref.model.lora_rank={flat_rank}; set only one spelling."
+            f"actor_rollout_ref.model.lora_rank={rank}; set only one spelling."
         )
-    rank = nested_rank if nested_rank > 0 else flat_rank
+    if nested_rank > 0 and rank <= 0:
+        raise ValueError(
+            f"actor_rollout_ref.model.lora.rank={nested_rank} is Megatron grammar the "
+            "engines do not gate on; set actor_rollout_ref.model.lora_rank instead "
+            "(nested-only adoption returns with engine gating unification, #685)."
+        )
 
     adapter_path = _select(model_config, "lora_adapter_path", None) or None
     nested_adapter_path = nested.get("adapter_path")
@@ -234,8 +243,12 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
             f"actor_rollout_ref.model.lora.adapter_path={nested_adapter_path!r} conflicts with "
             f"actor_rollout_ref.model.lora_adapter_path={adapter_path!r}; set only one spelling."
         )
-    if adapter_path is None:
-        adapter_path = nested_adapter_path or None
+    if nested_adapter_path and not adapter_path:
+        raise ValueError(
+            f"actor_rollout_ref.model.lora.adapter_path={nested_adapter_path!r} is Megatron "
+            "grammar the engines do not gate on; set actor_rollout_ref.model.lora_adapter_path "
+            "instead (nested-only adoption returns with engine gating unification, #685)."
+        )
 
     return LoRASettings(
         rank=int(rank),

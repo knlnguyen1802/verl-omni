@@ -1624,9 +1624,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         loss_mode = config.actor_rollout_ref.actor.diffusion_loss.loss_mode
         # DPO needs trainer-side ref noise preds; DiffusionNFT computes ref in the actor engine.
         self.use_reference_policy = need_reference_policy(self.config) or (loss_mode == "dpo")
-        self._has_old_adapter = "old" in tuple(
-            config.actor_rollout_ref.model.get("policy_state_adapters", ("default",))
-        )
+        self._has_old_adapter = "old" in resolve_lora_config(config.actor_rollout_ref.model).adapters
         if self._has_old_adapter:
             self._validate_old_adapter_config()
         self._loss_fn = get_diffusion_loss_fn(loss_mode)
