@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from verl import DataProto
 
+from verl_omni.utils.kernels import site_marker
+
 
 def compute_data_metrics_diffusion(batch: DataProto) -> dict[str, Any]:
     """
@@ -43,56 +45,57 @@ def compute_data_metrics_diffusion(batch: DataProto) -> dict[str, Any]:
             - critic/advantages/mean, max, min: Element-wise advantage statistics over B*T, when available
             - critic/returns/mean, max, min: Element-wise return statistics over B*T, when available
     """
-    sample_level_rewards = batch.batch["sample_level_rewards"]
-    if sample_level_rewards.ndim > 1:
-        sequence_reward = sample_level_rewards.mean(dim=1)  # [B]
-    else:
-        sequence_reward = sample_level_rewards  # [B]
+    with site_marker("S11_data_metrics"):
+        sample_level_rewards = batch.batch["sample_level_rewards"]
+        if sample_level_rewards.ndim > 1:
+            sequence_reward = sample_level_rewards.mean(dim=1)  # [B]
+        else:
+            sequence_reward = sample_level_rewards  # [B]
 
-    reward_mean = torch.mean(sequence_reward).detach().item()
-    reward_max = torch.max(sequence_reward).detach().item()
-    reward_min = torch.min(sequence_reward).detach().item()
+        reward_mean = torch.mean(sequence_reward).detach().item()
+        reward_max = torch.max(sequence_reward).detach().item()
+        reward_min = torch.min(sequence_reward).detach().item()
 
-    metrics = {
-        # reward
-        "critic/rewards/mean": reward_mean,
-        "critic/rewards/max": reward_max,
-        "critic/rewards/min": reward_min,
-    }
+        metrics = {
+            # reward
+            "critic/rewards/mean": reward_mean,
+            "critic/rewards/max": reward_max,
+            "critic/rewards/min": reward_min,
+        }
 
-    if "advantages" in batch.batch:
-        # Flatten [B, T] tensors for aggregate statistics across timesteps.
-        advantages = batch.batch["advantages"].flatten()  # [B*T]
-        metrics.update(
-            {
-                "critic/advantages/mean": torch.mean(advantages).detach().item(),
-                "critic/advantages/max": torch.max(advantages).detach().item(),
-                "critic/advantages/min": torch.min(advantages).detach().item(),
-            }
-        )
+        if "advantages" in batch.batch:
+            # Flatten [B, T] tensors for aggregate statistics across timesteps.
+            advantages = batch.batch["advantages"].flatten()  # [B*T]
+            metrics.update(
+                {
+                    "critic/advantages/mean": torch.mean(advantages).detach().item(),
+                    "critic/advantages/max": torch.max(advantages).detach().item(),
+                    "critic/advantages/min": torch.min(advantages).detach().item(),
+                }
+            )
 
-    if "returns" in batch.batch:
-        returns = batch.batch["returns"].flatten()  # [B*T]
-        metrics.update(
-            {
-                "critic/returns/mean": torch.mean(returns).detach().item(),
-                "critic/returns/max": torch.max(returns).detach().item(),
-                "critic/returns/min": torch.min(returns).detach().item(),
-            }
-        )
+        if "returns" in batch.batch:
+            returns = batch.batch["returns"].flatten()  # [B*T]
+            metrics.update(
+                {
+                    "critic/returns/mean": torch.mean(returns).detach().item(),
+                    "critic/returns/max": torch.max(returns).detach().item(),
+                    "critic/returns/min": torch.min(returns).detach().item(),
+                }
+            )
 
-    if "uid" in batch.non_tensor_batch:
-        rewards_np = sequence_reward.cpu().float().numpy()
-        uid_array = np.array(batch.non_tensor_batch["uid"])
-        unique_uids = np.unique(uid_array)
+        if "uid" in batch.non_tensor_batch:
+            rewards_np = sequence_reward.cpu().float().numpy()
+            uid_array = np.array(batch.non_tensor_batch["uid"])
+            unique_uids = np.unique(uid_array)
 
-        per_prompt_stds = np.array([np.std(rewards_np[uid_array == uid]) for uid in unique_uids])
+            per_prompt_stds = np.array([np.std(rewards_np[uid_array == uid]) for uid in unique_uids])
 
-        metrics["critic/rewards/zero_std_ratio"] = float(np.mean(per_prompt_stds == 0))
-        metrics["critic/rewards/std_mean"] = float(np.mean(per_prompt_stds))
-        metrics["critic/rewards/group_size"] = float(len(rewards_np) / len(unique_uids))
+            metrics["critic/rewards/zero_std_ratio"] = float(np.mean(per_prompt_stds == 0))
+            metrics["critic/rewards/std_mean"] = float(np.mean(per_prompt_stds))
+            metrics["critic/rewards/group_size"] = float(len(rewards_np) / len(unique_uids))
 
-    return metrics
+        return metrics
 
 
 def compute_old_policy_metrics(

@@ -68,6 +68,7 @@ from verl_omni.pipelines.utils import (
 )
 from verl_omni.utils.diffusion_compile import _maybe_compile_repeated_blocks
 from verl_omni.utils.fsdp_utils import apply_fsdp2, collect_lora_params
+from verl_omni.utils.kernels import site_marker
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
@@ -1161,17 +1162,21 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
             if micro_batch.get("rollout_is_weights", None) is not None:
                 data["rollout_is_weights"] = micro_batch["rollout_is_weights"][:, step]
 
-            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+            with site_marker("S2_loss_call"):
+                loss, metrics = loss_function(
+                    model_output=model_output, data=data, dp_group=self.get_data_parallel_group()
+                )
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=device_name)
             metrics = {}
 
-        output = {
-            "model_output": model_output,
-            "loss": loss.detach().item(),
-            "metrics": metrics,
-        }
+        with site_marker("S3_engine_loss_item"):
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach().item(),
+                "metrics": metrics,
+            }
 
         return loss, output
 
@@ -1347,17 +1352,21 @@ class DPODiffusersFSDPEngine(DiffusersFSDPEngine):
                 if teacher_noise_pred.ndim == model_output["noise_pred"].ndim + 1 and teacher_noise_pred.shape[1] == 1:
                     teacher_noise_pred = teacher_noise_pred[:, 0]
                 data["teacher_noise_pred"] = teacher_noise_pred
-            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+            with site_marker("S2_loss_call"):
+                loss, metrics = loss_function(
+                    model_output=model_output, data=data, dp_group=self.get_data_parallel_group()
+                )
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=device_name)
             metrics = {}
 
-        output = {
-            "model_output": model_output,
-            "loss": loss.detach().item(),
-            "metrics": metrics,
-        }
+        with site_marker("S3_engine_loss_item"):
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach().item(),
+                "metrics": metrics,
+            }
 
         return loss, output
 
@@ -1476,17 +1485,21 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                 ),
                 sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
             )
-            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+            with site_marker("S2_loss_call"):
+                loss, metrics = loss_function(
+                    model_output=model_output, data=data, dp_group=self.get_data_parallel_group()
+                )
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=x0.device)
             metrics = {}
 
-        output = {
-            "model_output": model_output,
-            "loss": loss.detach().item(),
-            "metrics": metrics,
-        }
+        with site_marker("S3_engine_loss_item"):
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach().item(),
+                "metrics": metrics,
+            }
         return loss, output
 
 

@@ -41,6 +41,7 @@ from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
 from verl_omni.pipelines.utils import build_scheduler, forward_and_sample_previous_step, prepare_model_inputs
+from verl_omni.utils.kernels import site_marker
 from verl_omni.workers.config import (
     DiffusionModelConfig,
     VeOmniDiffusionEngineConfig,
@@ -425,17 +426,21 @@ class VeOmniDiffusionEngine(BaseEngine):
             if micro_batch.get("old_prev_sample_mean", None) is not None:
                 data["old_prev_sample_mean"] = micro_batch["old_prev_sample_mean"][:, step]
 
-            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+            with site_marker("S2_loss_call"):
+                loss, metrics = loss_function(
+                    model_output=model_output, data=data, dp_group=self.get_data_parallel_group()
+                )
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=device_name)
             metrics = {}
 
-        output = {
-            "model_output": model_output,
-            "loss": loss.detach().item(),
-            "metrics": metrics,
-        }
+        with site_marker("S3_engine_loss_item"):
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach().item(),
+                "metrics": metrics,
+            }
 
         return loss, output
 

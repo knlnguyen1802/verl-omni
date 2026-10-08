@@ -27,6 +27,7 @@ from vllm_omni.lora.request import LoRARequest
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+from verl_omni.utils.kernels import site_marker
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 from verl_omni.workers.rollout.replica import DiffusionOutput
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import OmniStrategyBase
@@ -49,11 +50,12 @@ def _pixel_output_to_uint8(output: torch.Tensor) -> torch.Tensor:
     """Quantize a rollout pixel tensor from float ``[0, 1]`` to uint8 once."""
     if output.dtype == torch.uint8:
         return output
-    output = output.detach().to(dtype=torch.float32, copy=True)
-    if not bool(torch.isfinite(output).all()):
-        raise ValueError("Pixel rollout output must contain only finite values")
-    output = output.clamp_(0, 1)
-    return output.mul_(255).round_().to(dtype=torch.uint8)
+    with site_marker("S9_pixel_quantize"):
+        output = output.detach().to(dtype=torch.float32, copy=True)
+        if not bool(torch.isfinite(output).all()):
+            raise ValueError("Pixel rollout output must contain only finite values")
+        output = output.clamp_(0, 1)
+        return output.mul_(255).round_().to(dtype=torch.uint8)
 
 
 def _rollout_metadata_groups(multimodal_output: Any) -> tuple[Mapping[str, Any], ...]:

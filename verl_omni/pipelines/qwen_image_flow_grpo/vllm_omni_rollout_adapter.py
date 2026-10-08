@@ -43,6 +43,7 @@ from verl_omni.pipelines.request_batch import (
 )
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.utils.kernels import site_marker
 
 from .common import QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
 
@@ -101,16 +102,17 @@ class QwenImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMix
             output_hidden_states=True,
         )
         hidden_states = encoder_hidden_states.hidden_states[-1]
-        split_hidden_states = self._extract_masked_hidden(hidden_states, attention_mask)
-        split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
-        max_seq_len = max([e.size(0) for e in split_hidden_states])
-        prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
-        )
-        encoder_attention_mask = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
-        )
+        with site_marker("S6_prompt_embed_pack"):
+            split_hidden_states = self._extract_masked_hidden(hidden_states, attention_mask)
+            split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+            attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+            max_seq_len = max([e.size(0) for e in split_hidden_states])
+            prompt_embeds = torch.stack(
+                [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            )
+            encoder_attention_mask = torch.stack(
+                [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+            )
 
         prompt_embeds = prompt_embeds.to(dtype=dtype)
 
@@ -441,9 +443,10 @@ class QwenImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMix
             if self.interrupt:
                 continue
 
-            for batch_idx, (start, end) in enumerate(windows):
-                if i == start:
-                    all_latents[batch_idx].append(latents[batch_idx].detach().float().clone())
+            with site_marker("S8_trajectory_collect"):
+                for batch_idx, (start, end) in enumerate(windows):
+                    if i == start:
+                        all_latents[batch_idx].append(latents[batch_idx].detach().float().clone())
             levels = [float(noise_level) if start <= i < end else 0.0 for start, end in windows]
             cur_noise_level: float | torch.Tensor = (
                 levels[0]
@@ -502,11 +505,12 @@ class QwenImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMix
 
             # Save fp32 trajectory BEFORE casting to model dtype, so the
             # trainer recomputes log-probs on full-precision latents.
-            for batch_idx, (start, end) in enumerate(windows):
-                if start <= i < end:
-                    all_latents[batch_idx].append(latents[batch_idx].detach().to(torch.float32).clone())
-                    all_log_probs[batch_idx].append(None if log_prob is None else log_prob[batch_idx])
-                    all_timesteps[batch_idx].append(timestep_value)
+            with site_marker("S8_trajectory_collect"):
+                for batch_idx, (start, end) in enumerate(windows):
+                    if start <= i < end:
+                        all_latents[batch_idx].append(latents[batch_idx].detach().to(torch.float32).clone())
+                        all_log_probs[batch_idx].append(None if log_prob is None else log_prob[batch_idx])
+                        all_timesteps[batch_idx].append(timestep_value)
 
         all_latents_t = torch.stack([torch.stack(traj, dim=0) for traj in all_latents], dim=0)
         if all_log_probs and all_log_probs[0] and all_log_probs[0][0] is not None:

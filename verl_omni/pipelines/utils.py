@@ -23,6 +23,7 @@ from diffusers.training_utils import compute_density_for_timestep_sampling
 from tensordict import TensorDict
 from verl.utils.device import get_device_name
 
+from verl_omni.utils.kernels import site_marker
 from verl_omni.workers.config import DiffusionModelConfig
 
 from .model_base import DiffusionI2IModelBase, DiffusionModelBase
@@ -170,15 +171,16 @@ def _validate_adjacent_pair_values(values: torch.Tensor, name: str) -> None:
 
 def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32):
     """Gather scheduler sigmas for the requested timesteps and output rank."""
-    sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
-    schedule_timesteps = noise_scheduler.timesteps.to(device)
-    timesteps = timesteps.to(device)
-    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+    with site_marker("S4_get_sigmas"):
+        sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = noise_scheduler.timesteps.to(device)
+        timesteps = timesteps.to(device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
-    sigma = sigmas[step_indices].flatten()
-    while len(sigma.shape) < n_dim:
-        sigma = sigma.unsqueeze(-1)
-    return sigma
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
 
 
 def prepare_noisy_latents(

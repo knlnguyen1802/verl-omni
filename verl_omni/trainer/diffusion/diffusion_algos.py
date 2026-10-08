@@ -27,6 +27,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.utils import tensordict_utils as tu
 
+from verl_omni.utils.kernels import site_marker
 from verl_omni.workers.config import DiffusionActorConfig
 
 
@@ -225,44 +226,45 @@ def compute_flow_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = sample_level_rewards.clone()
-    assert scores.ndim == 2
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
+    with site_marker("S5_flowgrpo_advantage"):
+        scores = sample_level_rewards.clone()
+        assert scores.ndim == 2
+        id2score = defaultdict(list)
+        id2mean = {}
+        id2std = {}
 
-    with torch.no_grad():
-        if global_std:
-            batch_std = torch.std(scores)
-        else:
-            batch_std = None
-
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = id2score[idx][0]
-                if global_std:
-                    id2std[idx] = batch_std
-                else:
-                    id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                if global_std:
-                    id2std[idx] = batch_std
-                else:
-                    id2std[idx] = torch.std(scores_tensor)
+        with torch.no_grad():
+            if global_std:
+                batch_std = torch.std(scores)
             else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
+                batch_std = None
 
-    return scores, scores
+            bsz = scores.shape[0]
+            for i in range(bsz):
+                id2score[index[i]].append(scores[i])
+            for idx in id2score:
+                if len(id2score[idx]) == 1:
+                    id2mean[idx] = id2score[idx][0]
+                    if global_std:
+                        id2std[idx] = batch_std
+                    else:
+                        id2std[idx] = torch.tensor(1.0)
+                elif len(id2score[idx]) > 1:
+                    scores_tensor = torch.stack(id2score[idx])
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    if global_std:
+                        id2std[idx] = batch_std
+                    else:
+                        id2std[idx] = torch.std(scores_tensor)
+                else:
+                    raise ValueError(f"no score in prompt index: {idx}")
+            for i in range(bsz):
+                if norm_adv_by_std_in_grpo:
+                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                else:
+                    scores[i] = scores[i] - id2mean[index[i]]
+
+        return scores, scores
 
 
 @register_diffusion_loss("flow_grpo")
@@ -303,43 +305,44 @@ class FlowGRPOLoss(DiffusionLossFn):
                 the per-element policy loss is multiplied by these (detached) weights before
                 the mean reduction.
         """
-        assert config is not None, "config is required for FlowGRPOLoss!"
-        loss_cfg = config.diffusion_loss
-        advantages = torch.clamp(
-            advantages,
-            -loss_cfg.adv_clip_max,
-            loss_cfg.adv_clip_max,
-        )
-        log_ratio = log_prob - old_log_prob
-        ratio = torch.exp(log_ratio)
-        unclipped_loss = -advantages * ratio
-        clipped_loss = -advantages * torch.clamp(
-            ratio,
-            1.0 - loss_cfg.clip_ratio,
-            1.0 + loss_cfg.clip_ratio,
-        )
-        per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
-        if rollout_is_weights is not None:
-            per_elem_loss = per_elem_loss * rollout_is_weights.detach()
-        pg_loss = torch.mean(per_elem_loss)
+        with site_marker("S2_loss_flowgrpo"):
+            assert config is not None, "config is required for FlowGRPOLoss!"
+            loss_cfg = config.diffusion_loss
+            advantages = torch.clamp(
+                advantages,
+                -loss_cfg.adv_clip_max,
+                loss_cfg.adv_clip_max,
+            )
+            log_ratio = log_prob - old_log_prob
+            ratio = torch.exp(log_ratio)
+            unclipped_loss = -advantages * ratio
+            clipped_loss = -advantages * torch.clamp(
+                ratio,
+                1.0 - loss_cfg.clip_ratio,
+                1.0 + loss_cfg.clip_ratio,
+            )
+            per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
+            if rollout_is_weights is not None:
+                per_elem_loss = per_elem_loss * rollout_is_weights.detach()
+            pg_loss = torch.mean(per_elem_loss)
 
-        with torch.no_grad():
-            ppo_kl = torch.mean(-log_ratio)
-            pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
-            pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
-            pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
-            ratio_mean = ratio.mean()
-            ratio_std = ratio.std()
+            with torch.no_grad():
+                ppo_kl = torch.mean(-log_ratio)
+                pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
+                pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
+                pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
+                ratio_mean = ratio.mean()
+                ratio_std = ratio.std()
 
-        pg_metrics = {
-            "actor/ppo_kl": ppo_kl.detach().item(),
-            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-            "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
-            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-            "actor/ratio_mean": ratio_mean.detach().item(),
-            "actor/ratio_std": ratio_std.detach().item(),
-        }
-        return pg_loss, pg_metrics
+            pg_metrics = {
+                "actor/ppo_kl": ppo_kl.detach().item(),
+                "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
+                "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                "actor/ratio_mean": ratio_mean.detach().item(),
+                "actor/ratio_std": ratio_std.detach().item(),
+            }
+            return pg_loss, pg_metrics
 
     def __call__(
         self,
@@ -391,56 +394,57 @@ class FlowDPPOLoss(DiffusionLossFn):
         trust-region mask. Updates are masked only when they both exceed the
         divergence threshold and move farther from the old policy.
         """
-        assert config is not None, "config is required for FlowDPPOLoss!"
-        loss_cfg = config.diffusion_loss
-        advantages = advantages.detach()
+        with site_marker("S2_loss_flowdppo"):
+            assert config is not None, "config is required for FlowDPPOLoss!"
+            loss_cfg = config.diffusion_loss
+            advantages = advantages.detach()
 
-        log_ratio = log_prob - old_log_prob
-        ratio = torch.exp(log_ratio)
-        unclipped_loss = -advantages * ratio
+            log_ratio = log_prob - old_log_prob
+            ratio = torch.exp(log_ratio)
+            unclipped_loss = -advantages * ratio
 
-        mean_diff_sq = (prev_sample_mean - old_prev_sample_mean).pow(2)
-        if getattr(loss_cfg, "add_kl_coefficient", True):
-            sigma_t = std_dev_t * cls._broadcast_sqrt_dt(sqrt_dt, std_dev_t)
-            kl_per_elem = mean_diff_sq / (2 * sigma_t.pow(2))
-        else:
-            kl_per_elem = mean_diff_sq / 2
-        if kl_per_elem.ndim > 1:
-            kl_per_sample = kl_per_elem.mean(dim=tuple(range(1, kl_per_elem.ndim)))
-        else:
-            kl_per_sample = kl_per_elem
+            mean_diff_sq = (prev_sample_mean - old_prev_sample_mean).pow(2)
+            if getattr(loss_cfg, "add_kl_coefficient", True):
+                sigma_t = std_dev_t * cls._broadcast_sqrt_dt(sqrt_dt, std_dev_t)
+                kl_per_elem = mean_diff_sq / (2 * sigma_t.pow(2))
+            else:
+                kl_per_elem = mean_diff_sq / 2
+            if kl_per_elem.ndim > 1:
+                kl_per_sample = kl_per_elem.mean(dim=tuple(range(1, kl_per_elem.ndim)))
+            else:
+                kl_per_sample = kl_per_elem
 
-        kl_mask_threshold = loss_cfg.kl_mask_threshold
-        high_kl_mask = kl_per_sample >= kl_mask_threshold
-        pos_rm_mask = high_kl_mask & (ratio > 1.0) & (advantages > 0)
-        neg_rm_mask = high_kl_mask & (ratio < 1.0) & (advantages < 0)
-        rm_mask = pos_rm_mask | neg_rm_mask
-        keep_mask = (~rm_mask).detach()
+            kl_mask_threshold = loss_cfg.kl_mask_threshold
+            high_kl_mask = kl_per_sample >= kl_mask_threshold
+            pos_rm_mask = high_kl_mask & (ratio > 1.0) & (advantages > 0)
+            neg_rm_mask = high_kl_mask & (ratio < 1.0) & (advantages < 0)
+            rm_mask = pos_rm_mask | neg_rm_mask
+            keep_mask = (~rm_mask).detach()
 
-        zero = torch.zeros((), dtype=unclipped_loss.dtype, device=unclipped_loss.device)
-        per_elem_loss = torch.where(keep_mask, unclipped_loss, zero)
-        if rollout_is_weights is not None:
-            per_elem_loss = per_elem_loss * rollout_is_weights.detach()
-        pg_loss = torch.mean(per_elem_loss)
+            zero = torch.zeros((), dtype=unclipped_loss.dtype, device=unclipped_loss.device)
+            per_elem_loss = torch.where(keep_mask, unclipped_loss, zero)
+            if rollout_is_weights is not None:
+                per_elem_loss = per_elem_loss * rollout_is_weights.detach()
+            pg_loss = torch.mean(per_elem_loss)
 
-        with torch.no_grad():
-            ratio_std = ratio.std(unbiased=False)
-            pg_metrics = {
-                "actor/ppo_kl": torch.mean(-log_ratio).detach().item(),
-                "actor/approx_kl": (0.5 * log_ratio.pow(2)).mean().detach().item(),
-                "actor/ratio_mean": ratio.mean().detach().item(),
-                "actor/ratio_std": ratio_std.detach().item(),
-                "actor/ratio_min": ratio.min().detach().item(),
-                "actor/ratio_max": ratio.max().detach().item(),
-                "actor/kl_new_old_mean": kl_per_sample.mean().detach().item(),
-                "actor/kl_new_old_max": kl_per_sample.max().detach().item(),
-                "actor/kl_mask_fraction": high_kl_mask.float().mean().detach().item(),
-                "actor/pos_rm_fraction": pos_rm_mask.float().mean().detach().item(),
-                "actor/neg_rm_fraction": neg_rm_mask.float().mean().detach().item(),
-                "actor/masked_fraction": rm_mask.float().mean().detach().item(),
-                "actor/unmasked_fraction": keep_mask.float().mean().detach().item(),
-            }
-        return pg_loss, pg_metrics
+            with torch.no_grad():
+                ratio_std = ratio.std(unbiased=False)
+                pg_metrics = {
+                    "actor/ppo_kl": torch.mean(-log_ratio).detach().item(),
+                    "actor/approx_kl": (0.5 * log_ratio.pow(2)).mean().detach().item(),
+                    "actor/ratio_mean": ratio.mean().detach().item(),
+                    "actor/ratio_std": ratio_std.detach().item(),
+                    "actor/ratio_min": ratio.min().detach().item(),
+                    "actor/ratio_max": ratio.max().detach().item(),
+                    "actor/kl_new_old_mean": kl_per_sample.mean().detach().item(),
+                    "actor/kl_new_old_max": kl_per_sample.max().detach().item(),
+                    "actor/kl_mask_fraction": high_kl_mask.float().mean().detach().item(),
+                    "actor/pos_rm_fraction": pos_rm_mask.float().mean().detach().item(),
+                    "actor/neg_rm_fraction": neg_rm_mask.float().mean().detach().item(),
+                    "actor/masked_fraction": rm_mask.float().mean().detach().item(),
+                    "actor/unmasked_fraction": keep_mask.float().mean().detach().item(),
+                }
+            return pg_loss, pg_metrics
 
     def __call__(
         self,
@@ -517,54 +521,55 @@ class GRPOGuardLoss(DiffusionLossFn):
                 the per-element policy loss is multiplied by these (detached) weights before
                 the mean reduction.
         """
-        loss_cfg = config.diffusion_loss
-        advantages = torch.clamp(
-            advantages,
-            -loss_cfg.adv_clip_max,
-            loss_cfg.adv_clip_max,
-        )
+        with site_marker("S2_loss_grpo_guard"):
+            loss_cfg = config.diffusion_loss
+            advantages = torch.clamp(
+                advantages,
+                -loss_cfg.adv_clip_max,
+                loss_cfg.adv_clip_max,
+            )
 
-        sigma_t = std_dev_t.mean()
-        sqrt_dt_mean = sqrt_dt.mean()
-        scale = sqrt_dt_mean * sigma_t  # shared per-step scalar
+            sigma_t = std_dev_t.mean()
+            sqrt_dt_mean = sqrt_dt.mean()
+            scale = sqrt_dt_mean * sigma_t  # shared per-step scalar
 
-        # mean over all non-batch dimensions: (B, ...) -> (B,)
-        mean_diff_sq = (prev_sample_mean - old_prev_sample_mean).pow(2)
-        if mean_diff_sq.ndim > 1:
-            mean_diff_sq = mean_diff_sq.mean(dim=tuple(range(1, mean_diff_sq.ndim)))
-        ratio_mean_bias = mean_diff_sq / (2 * scale**2)
+            # mean over all non-batch dimensions: (B, ...) -> (B,)
+            mean_diff_sq = (prev_sample_mean - old_prev_sample_mean).pow(2)
+            if mean_diff_sq.ndim > 1:
+                mean_diff_sq = mean_diff_sq.mean(dim=tuple(range(1, mean_diff_sq.ndim)))
+            ratio_mean_bias = mean_diff_sq / (2 * scale**2)
 
-        log_ratio = log_prob - old_log_prob
-        ratio = torch.exp((log_ratio + ratio_mean_bias) * scale)
+            log_ratio = log_prob - old_log_prob
+            ratio = torch.exp((log_ratio + ratio_mean_bias) * scale)
 
-        unclipped_loss = -advantages * ratio
-        clipped_loss = -advantages * torch.clamp(
-            ratio,
-            1.0 - loss_cfg.clip_ratio,
-            1.0 + loss_cfg.clip_ratio,
-        )
-        per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
-        if rollout_is_weights is not None:
-            per_elem_loss = per_elem_loss * rollout_is_weights.detach()
-        pg_loss = torch.mean(per_elem_loss) / (sqrt_dt_mean**2)
+            unclipped_loss = -advantages * ratio
+            clipped_loss = -advantages * torch.clamp(
+                ratio,
+                1.0 - loss_cfg.clip_ratio,
+                1.0 + loss_cfg.clip_ratio,
+            )
+            per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
+            if rollout_is_weights is not None:
+                per_elem_loss = per_elem_loss * rollout_is_weights.detach()
+            pg_loss = torch.mean(per_elem_loss) / (sqrt_dt_mean**2)
 
-        with torch.no_grad():
-            ppo_kl = torch.mean(-log_ratio)
-            pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
-            pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
-            pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
-            ratio_mean = ratio.mean()
-            ratio_std = ratio.std()
+            with torch.no_grad():
+                ppo_kl = torch.mean(-log_ratio)
+                pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
+                pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
+                pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
+                ratio_mean = ratio.mean()
+                ratio_std = ratio.std()
 
-        pg_metrics = {
-            "actor/ppo_kl": ppo_kl.detach().item(),
-            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-            "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
-            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-            "actor/ratio_mean": ratio_mean.detach().item(),
-            "actor/ratio_std": ratio_std.detach().item(),
-        }
-        return pg_loss, pg_metrics
+            pg_metrics = {
+                "actor/ppo_kl": ppo_kl.detach().item(),
+                "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
+                "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                "actor/ratio_mean": ratio_mean.detach().item(),
+                "actor/ratio_std": ratio_std.detach().item(),
+            }
+            return pg_loss, pg_metrics
 
     def __call__(
         self,
@@ -715,49 +720,52 @@ class DPOLoss(DiffusionLossFn):
         """Compute DPO loss from adjacent ``chosen, rejected`` sample pairs.
         Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/dpo/loss.py
         """
-        assert config is not None
-        assert isinstance(config, DiffusionActorConfig)
+        with site_marker("S2_loss_dpo"):
+            assert config is not None
+            assert isinstance(config, DiffusionActorConfig)
 
-        scores = sample_level_rewards.squeeze(-1) if sample_level_rewards.ndim > 1 else sample_level_rewards
-        if scores.shape[0] < 2 or scores.shape[0] % 2 != 0:
-            raise ValueError("DPO loss expects an even batch of adjacent chosen/rejected pairs.")
-        if index is not None:
-            n = int(scores.shape[0])
-            if not cls._dpo_adjacent_pairs_share_prompt_uid(index, n):
-                raise ValueError("DPO loss expects each adjacent chosen/rejected pair to share the same prompt uid.")
+            scores = sample_level_rewards.squeeze(-1) if sample_level_rewards.ndim > 1 else sample_level_rewards
+            if scores.shape[0] < 2 or scores.shape[0] % 2 != 0:
+                raise ValueError("DPO loss expects an even batch of adjacent chosen/rejected pairs.")
+            if index is not None:
+                n = int(scores.shape[0])
+                if not cls._dpo_adjacent_pairs_share_prompt_uid(index, n):
+                    raise ValueError(
+                        "DPO loss expects each adjacent chosen/rejected pair to share the same prompt uid."
+                    )
 
-        chosen_scores = scores[0::2]
-        rejected_scores = scores[1::2]
-        if torch.any(chosen_scores < rejected_scores).item():
-            raise ValueError("DPO loss expects each chosen sample reward to be >= its rejected pair reward.")
+            chosen_scores = scores[0::2]
+            rejected_scores = scores[1::2]
+            if torch.any(chosen_scores < rejected_scores).item():
+                raise ValueError("DPO loss expects each chosen sample reward to be >= its rejected pair reward.")
 
-        beta = config.diffusion_loss.dpo_beta
-        target = noise.float() - latent.float()
-        model_err = ((model_noise_pred.float() - target) ** 2).flatten(1).mean(dim=1)
-        ref_err = ((ref_noise_pred.float() - target) ** 2).flatten(1).mean(dim=1)
+            beta = config.diffusion_loss.dpo_beta
+            target = noise.float() - latent.float()
+            model_err = ((model_noise_pred.float() - target) ** 2).flatten(1).mean(dim=1)
+            ref_err = ((ref_noise_pred.float() - target) ** 2).flatten(1).mean(dim=1)
 
-        model_w_err = model_err[0::2]
-        model_l_err = model_err[1::2]
-        ref_w_err = ref_err[0::2]
-        ref_l_err = ref_err[1::2]
-        w_diff = model_w_err - ref_w_err
-        l_diff = model_l_err - ref_l_err
-        inside_term = -0.5 * beta * (w_diff - l_diff)
-        implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
-        dpo_loss = -F.logsigmoid(inside_term).mean()
+            model_w_err = model_err[0::2]
+            model_l_err = model_err[1::2]
+            ref_w_err = ref_err[0::2]
+            ref_l_err = ref_err[1::2]
+            w_diff = model_w_err - ref_w_err
+            l_diff = model_l_err - ref_l_err
+            inside_term = -0.5 * beta * (w_diff - l_diff)
+            implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
+            dpo_loss = -F.logsigmoid(inside_term).mean()
 
-        with torch.no_grad():
-            implicit_reward_chosen = -0.5 * beta * w_diff
-            implicit_reward_rejected = -0.5 * beta * l_diff
-            reward_margins = implicit_reward_chosen - implicit_reward_rejected
-            metrics = {
-                "actor/dpo_loss": dpo_loss.detach().item(),
-                "actor/implicit_acc": implicit_acc.detach().item(),
-                "rewards/chosen": implicit_reward_chosen.mean().detach().item(),
-                "rewards/rejected": implicit_reward_rejected.mean().detach().item(),
-                "rewards/margins": reward_margins.mean().detach().item(),
-            }
-        return dpo_loss, metrics
+            with torch.no_grad():
+                implicit_reward_chosen = -0.5 * beta * w_diff
+                implicit_reward_rejected = -0.5 * beta * l_diff
+                reward_margins = implicit_reward_chosen - implicit_reward_rejected
+                metrics = {
+                    "actor/dpo_loss": dpo_loss.detach().item(),
+                    "actor/implicit_acc": implicit_acc.detach().item(),
+                    "rewards/chosen": implicit_reward_chosen.mean().detach().item(),
+                    "rewards/rejected": implicit_reward_rejected.mean().detach().item(),
+                    "rewards/margins": reward_margins.mean().detach().item(),
+                }
+            return dpo_loss, metrics
 
     def __call__(
         self,
@@ -806,56 +814,59 @@ class DiffusionNFTLoss(DiffusionLossFn):
         config: DiffusionActorConfig,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the DiffusionNFT policy loss and auxiliary metrics."""
-        loss_cfg = config.diffusion_loss
-        beta = loss_cfg.mix_beta
+        with site_marker("S2_loss_nft"):
+            loss_cfg = config.diffusion_loss
+            beta = loss_cfg.mix_beta
 
-        old_prediction = old_prediction.detach()
-        ref_forward_prediction = ref_forward_prediction.detach()
-        reward_weight = reward_prob
-        if reward_weight.ndim > 1:
-            reward_weight = reward_weight.flatten(1).mean(dim=1)
-        reward_weight = reward_weight.to(device=x0.device, dtype=x0.dtype)
+            old_prediction = old_prediction.detach()
+            ref_forward_prediction = ref_forward_prediction.detach()
+            reward_weight = reward_prob
+            if reward_weight.ndim > 1:
+                reward_weight = reward_weight.flatten(1).mean(dim=1)
+            reward_weight = reward_weight.to(device=x0.device, dtype=x0.dtype)
 
-        reduce_dims = tuple(range(1, x0.ndim))
-        positive_prediction = beta * forward_prediction + (1.0 - beta) * old_prediction
-        implicit_negative_prediction = (1.0 + beta) * old_prediction - beta * forward_prediction
+            reduce_dims = tuple(range(1, x0.ndim))
+            positive_prediction = beta * forward_prediction + (1.0 - beta) * old_prediction
+            implicit_negative_prediction = (1.0 + beta) * old_prediction - beta * forward_prediction
 
-        x0_prediction = xt - t_expanded * positive_prediction
-        negative_x0_prediction = xt - t_expanded * implicit_negative_prediction
+            x0_prediction = xt - t_expanded * positive_prediction
+            negative_x0_prediction = xt - t_expanded * implicit_negative_prediction
 
-        with torch.no_grad():
-            positive_weight = (
-                torch.abs(x0_prediction.double() - x0.double())
-                .mean(dim=reduce_dims, keepdim=True)
-                .clip(min=loss_cfg.adaptive_weight_min)
-                .to(dtype=x0_prediction.dtype)
+            with torch.no_grad():
+                positive_weight = (
+                    torch.abs(x0_prediction.double() - x0.double())
+                    .mean(dim=reduce_dims, keepdim=True)
+                    .clip(min=loss_cfg.adaptive_weight_min)
+                    .to(dtype=x0_prediction.dtype)
+                )
+                negative_weight = (
+                    torch.abs(negative_x0_prediction.double() - x0.double())
+                    .mean(dim=reduce_dims, keepdim=True)
+                    .clip(min=loss_cfg.adaptive_weight_min)
+                    .to(dtype=negative_x0_prediction.dtype)
+                )
+
+            positive_loss = ((x0_prediction - x0) ** 2 / positive_weight).mean(dim=reduce_dims)
+            negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight).mean(dim=reduce_dims)
+            policy_loss_per_sample = (reward_weight * positive_loss / beta) + (
+                (1.0 - reward_weight) * negative_loss / beta
             )
-            negative_weight = (
-                torch.abs(negative_x0_prediction.double() - x0.double())
-                .mean(dim=reduce_dims, keepdim=True)
-                .clip(min=loss_cfg.adaptive_weight_min)
-                .to(dtype=negative_x0_prediction.dtype)
-            )
+            policy_loss = (policy_loss_per_sample * loss_cfg.adv_clip_max).mean()
 
-        positive_loss = ((x0_prediction - x0) ** 2 / positive_weight).mean(dim=reduce_dims)
-        negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight).mean(dim=reduce_dims)
-        policy_loss_per_sample = (reward_weight * positive_loss / beta) + ((1.0 - reward_weight) * negative_loss / beta)
-        policy_loss = (policy_loss_per_sample * loss_cfg.adv_clip_max).mean()
+            ref_kl_loss = ((forward_prediction - ref_forward_prediction) ** 2).mean(dim=reduce_dims).mean()
+            loss = policy_loss + loss_cfg.ref_kl_coef * ref_kl_loss
 
-        ref_kl_loss = ((forward_prediction - ref_forward_prediction) ** 2).mean(dim=reduce_dims).mean()
-        loss = policy_loss + loss_cfg.ref_kl_coef * ref_kl_loss
-
-        with torch.no_grad():
-            metrics = {
-                "actor/policy_loss": policy_loss.detach().item(),
-                "actor/positive_loss": positive_loss.mean().detach().item(),
-                "actor/negative_loss": negative_loss.mean().detach().item(),
-                "actor/ref_kl_loss": ref_kl_loss.detach().item(),
-                "actor/old_deviate": ((forward_prediction - old_prediction) ** 2).mean().detach().item(),
-                "actor/reward_prob_mean": reward_weight.mean().detach().item(),
-                "actor/total_loss": loss.detach().item(),
-            }
-        return loss, metrics
+            with torch.no_grad():
+                metrics = {
+                    "actor/policy_loss": policy_loss.detach().item(),
+                    "actor/positive_loss": positive_loss.mean().detach().item(),
+                    "actor/negative_loss": negative_loss.mean().detach().item(),
+                    "actor/ref_kl_loss": ref_kl_loss.detach().item(),
+                    "actor/old_deviate": ((forward_prediction - old_prediction) ** 2).mean().detach().item(),
+                    "actor/reward_prob_mean": reward_weight.mean().detach().item(),
+                    "actor/total_loss": loss.detach().item(),
+                }
+            return loss, metrics
 
     def __call__(
         self,
@@ -899,31 +910,32 @@ class DiffusionNFTLoss(DiffusionLossFn):
         Optimality reward: r = 1/2 + 1/2 * clip(r_norm / Z_c, -1, 1)  (clip/map in
         ``_advantage_to_reward_prob``). ``reward_prob`` weights the forward-process loss.
         """
-        rewards = rewards.detach().float()
-        advantages = rewards.clone()
-        id2score: dict[Any, list[torch.Tensor]] = defaultdict(list)
-        batch_std = torch.std(rewards) if global_std else None
+        with site_marker("S5_nft_group_advantage"):
+            rewards = rewards.detach().float()
+            advantages = rewards.clone()
+            id2score: dict[Any, list[torch.Tensor]] = defaultdict(list)
+            batch_std = torch.std(rewards) if global_std else None
 
-        for idx, group_id in enumerate(uid):
-            id2score[group_id].append(rewards[idx])
+            for idx, group_id in enumerate(uid):
+                id2score[group_id].append(rewards[idx])
 
-        id2mean: dict[Any, torch.Tensor] = {}
-        id2std: dict[Any, torch.Tensor] = {}
-        for group_id, group_scores in id2score.items():
-            scores_tensor = torch.stack(group_scores)
-            id2mean[group_id] = scores_tensor.mean()
-            if global_std:
-                id2std[group_id] = batch_std
-            elif len(group_scores) > 1:
-                id2std[group_id] = scores_tensor.std()
-            else:
-                id2std[group_id] = torch.tensor(1.0, device=rewards.device)
+            id2mean: dict[Any, torch.Tensor] = {}
+            id2std: dict[Any, torch.Tensor] = {}
+            for group_id, group_scores in id2score.items():
+                scores_tensor = torch.stack(group_scores)
+                id2mean[group_id] = scores_tensor.mean()
+                if global_std:
+                    id2std[group_id] = batch_std
+                elif len(group_scores) > 1:
+                    id2std[group_id] = scores_tensor.std()
+                else:
+                    id2std[group_id] = torch.tensor(1.0, device=rewards.device)
 
-        for idx, group_id in enumerate(uid):
-            advantages[idx] = rewards[idx] - id2mean[group_id]
-            if norm_by_std:
-                advantages[idx] = advantages[idx] / (id2std[group_id] + epsilon)
-        return advantages
+            for idx, group_id in enumerate(uid):
+                advantages[idx] = rewards[idx] - id2mean[group_id]
+                if norm_by_std:
+                    advantages[idx] = advantages[idx] / (id2std[group_id] + epsilon)
+            return advantages
 
     @staticmethod
     def _advantage_to_reward_prob(
@@ -949,19 +961,20 @@ class DiffusionNFTLoss(DiffusionLossFn):
         timestep_fraction: float,
         seed: int | None = None,
     ) -> torch.Tensor:
-        if train_timesteps.ndim != 2:
-            raise ValueError(f"`train_timesteps` must have shape [B, T], got {train_timesteps.shape}.")
-        num_timesteps = train_timesteps.shape[1]
-        num_train = max(1, int(num_timesteps * timestep_fraction))
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device=train_timesteps.device)
-            generator.manual_seed(int(seed))
-        permuted = []
-        for row in train_timesteps:
-            perm = torch.randperm(num_timesteps, device=train_timesteps.device, generator=generator)
-            permuted.append(row[perm[:num_train]])
-        return torch.stack(permuted, dim=0).long()
+        with site_marker("S12_select_timesteps"):
+            if train_timesteps.ndim != 2:
+                raise ValueError(f"`train_timesteps` must have shape [B, T], got {train_timesteps.shape}.")
+            num_timesteps = train_timesteps.shape[1]
+            num_train = max(1, int(num_timesteps * timestep_fraction))
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=train_timesteps.device)
+                generator.manual_seed(int(seed))
+            permuted = []
+            for row in train_timesteps:
+                perm = torch.randperm(num_timesteps, device=train_timesteps.device, generator=generator)
+                permuted.append(row[perm[:num_train]])
+            return torch.stack(permuted, dim=0).long()
 
     @staticmethod
     def prepare_actor_batch(
