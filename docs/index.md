@@ -105,6 +105,7 @@ examples/minimax_h3/flowgrpo_trainer_minimax_h3.md
 perf/tuning_guide.md
 perf/diffusion_mfu.md
 perf/profiler.md
+perf/kernel_replacement_rfc.md
 ```
 
 ```{toctree}
