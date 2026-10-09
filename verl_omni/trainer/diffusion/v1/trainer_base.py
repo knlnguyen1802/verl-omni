@@ -56,7 +56,6 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl.workers.rollout.llm_server import LLMServerManager
 
 from verl_omni.pipelines.rollout_media import (
     resolve_batch_media_kind,
@@ -73,6 +72,7 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     old_policy_decay,
+    track_nonfinite_grad_streak,
     validate_distillation_config,
     worker_group_port_ranges,
 )
@@ -92,6 +92,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
 )
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
 from verl_omni.trainer.diffusion.v1.tq_utils import (
+    canonicalize_diffusion_tq_meta,
     diffusion_metric_tq_fields,
     diffusion_persisted_tq_fields,
     diffusion_tq_batch_to_dataproto,
@@ -105,6 +106,7 @@ from verl_omni.workers.config.reward import (
     streaming_reward_enabled,
 )
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker, resolve_teacher_infer_micro_batch_size
+from verl_omni.workers.rollout.replica import DiffusionLLMServerManager as LLMServerManager
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 logger = logging.getLogger(__name__)
@@ -207,6 +209,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.global_steps = 0
         # Local update index within the parameter-sync cycle.
         self.local_trigger_step = 0
+        self._nonfinite_grad_streak = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -218,6 +221,15 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 raise ValueError("max_incomplete_group_refill_rounds must be a positive integer")
 
         replay_buffer_cls = ReplayBufferAsync if self.trainer_mode == "separate_async" else ReplayBuffer
+        # ReplayBuffer.sample() discovers finished groups by sleeping a fixed
+        # poll_interval between tq.kv_list() calls. The upstream 2.0s default
+        # quantizes sync gen: sample() returns only on a poll boundary, so a
+        # rollout finishing mid-sleep idles the trainer for the remainder
+        # (observed +1.15s/step on Qwen-Image FlowGRPO). Sync mode has nothing
+        # to overlap with the wait, so poll fast unless configured otherwise.
+        poll_interval = sampler_config.get("poll_interval", None)
+        if poll_interval is None:
+            poll_interval = 2.0 if self.trainer_mode == "separate_async" else 0.05
         return replay_buffer_cls(
             trainer_mode=self.trainer_mode,
             trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
@@ -225,6 +237,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             max_off_policy_strategy=sampler_config.max_off_policy_strategy,
             sampler_kwargs=sampler_config.sampler_kwargs,
             refill_fn=self._add_prompts_to_generate,
+            poll_interval=float(poll_interval),
         )
 
     def init(self):
@@ -810,6 +823,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             sampler=create_rl_sampler(self.config.data, self.train_dataset),
         )
         self.train_dataloader_it = None
+        # Per-run monotonic generation-batch number; pairs with the batch-local
+        # ``index`` so TQ row ordering survives multi-batch sampling paths.
+        self._gen_batch_seq = 0
         val_batch_size = self.config.data.val_batch_size or len(self.val_dataset)
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
@@ -1044,6 +1060,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+        batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
+        self._gen_batch_seq += 1
         return tu.get_tensordict(batch_dict)
 
     def _generation_batch_size(self) -> int:
@@ -1092,11 +1110,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Use the upstream replay buffer and replace only selected failed groups."""
         sampler_config = self.config.trainer.v1.sampler
         if not sampler_config.get("drop_incomplete_groups", False):
-            return self.replay_buffer.sample(
+            batch_meta, off_policy_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps,
                 partition_id="train",
                 batch_size=batch_size,
             )
+            # Restore the v0 prompt-major row order before any consumer reads
+            # or writes these keys (TQ key order is storage-arbitrary).
+            return canonicalize_diffusion_tq_meta(batch_meta), off_policy_metrics
 
         max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
         remaining_batch_size = batch_size
@@ -1169,7 +1190,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 max_refill_rounds,
             )
 
-        return KVBatchMeta(partition_id="train", keys=keys, tags=tags), {**sampling_metrics, **failure_metrics}
+        return canonicalize_diffusion_tq_meta(KVBatchMeta(partition_id="train", keys=keys, tags=tags)), {
+            **sampling_metrics,
+            **failure_metrics,
+        }
 
     def _submit_batch_to_rollout(self, batch) -> int:
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
@@ -1383,6 +1407,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
             batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+            batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
+            self._gen_batch_seq += 1
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
@@ -1395,6 +1421,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             batch_meta, _ = self.replay_buffer.sample(
                 global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
             )
+            batch_meta = canonicalize_diffusion_tq_meta(batch_meta)
             data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
 
             # Skip empty validation batches (e.g. all trajectories were dropped
@@ -1685,9 +1712,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             for key in keys:
                 reward_extra_infos_dict[key] = [info.get(key) for info in infos]
         metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos_dict))
+        gradient_norm = metrics.get("actor/grad_norm", None)
         if "advantages" in data.batch:
-            gradient_norm = metrics.get("actor/grad_norm", None)
             metrics.update(compute_variance_proxy_metrics(batch=data, gradient_norm=gradient_norm))
+        self._nonfinite_grad_streak = track_nonfinite_grad_streak(self._nonfinite_grad_streak, gradient_norm)
+        metrics["train/nonfinite_grad_steps"] = self._nonfinite_grad_streak
 
         # off-policy staleness metrics (model-version units)
         non_padding = np.array([not tag.get("is_padding", False) for tag in batch_meta.tags], dtype=bool)

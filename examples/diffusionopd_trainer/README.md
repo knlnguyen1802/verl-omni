@@ -11,7 +11,7 @@ Compared with running FlowGRPO again, distillation needs no reward in the loss a
 Follow the [installation guide](../../docs/start/install.md) to set up the base environment, then install the OCR reward dependency:
 
 ```bash
-pip install Levenshtein
+uv pip install -e ".[ocr]"
 ```
 
 The provided script uses a single node with `3` GPUs: 2 for actor + rollout (the frozen teacher shares them), 1 for the reward model server.
@@ -39,7 +39,7 @@ ocr_test_path=$WORKSPACE/data/ocr/sd3/test.parquet
 
 ## Prepare the teacher
 
-The teacher is a full diffusers checkpoint from the same pipeline family as the student, with the same scheduler. The natural way to get one is the [SD3.5 FlowGRPO OCR example](../flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh): train the LoRA, merge it into the base transformer (`peft` `merge_and_unload`), and save the merged pipeline. Any stronger same-family checkpoint works the same way.
+The teacher is a full diffusers checkpoint from the same pipeline family as the student, with the same scheduler. The natural way to get one is the [SD3.5 FlowGRPO OCR example](https://github.com/verl-project/verl-omni/blob/main/examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh): train the LoRA, merge it into the base transformer (`peft` `merge_and_unload`), and save the merged pipeline. Any stronger same-family checkpoint works the same way.
 
 ## Run
 

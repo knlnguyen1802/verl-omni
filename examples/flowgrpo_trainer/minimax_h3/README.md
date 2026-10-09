@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA FlowGRPO
 
-Last updated: 09/14/2026
+Last updated: 09/30/2026
 
 These recipes train `MiniMaxAI/MiniMax-H3` LoRA adapters with FlowGRPO for
 text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -13,34 +13,9 @@ Ref2VA paths target NVIDIA GPUs.
 
 ## Install
 
-Follow the project [installation guide](../../../docs/start/install.md). In
-particular, install the platform backend, the repository-pinned vLLM-Omni
-revision, and the training dependencies in that order. Run the commands below
-from the verl-omni repository root.
-
-For NVIDIA GPU:
-
-```bash
-uv pip install -e ".[gpu]" --torch-backend=auto
-uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
-uv pip install -e ".[train,dev]"
-```
-
-For Ascend NPU:
-
-```bash
-uv pip install vllm==0.28.0
-uv pip install "vllm-ascend @ git+https://github.com/vllm-project/vllm-ascend.git@$(cat .github/vllm_ascend_pin.txt)"
-uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
-uv pip install -e ".[train,dev]"
-```
-
-Install the tested Diffusers revision that provides
-`MiniMaxH3Transformer3DModel`:
-
-```bash
-uv pip install "diffusers @ git+https://github.com/huggingface/diffusers.git@d6726f38a0c5ca6c06a8f227fb7bade3486ed98d"
-```
+Follow the project [installation guide](../../../docs/start/install.md) for
+NVIDIA GPU, or the [NPU installation guide](../../../docs/start/install_npu.md)
+for Ascend NPU.
 
 ## Prepare the checkpoint
 
@@ -179,6 +154,50 @@ measure fidelity to the supplied references.
 
 ## Launch
 
+### Rollout VAE and sequence parallelism
+
+The GPU T2VA launcher exposes `ROLLOUT_USP`/`ROLLOUT_RING` (default `1`),
+`VAE_PATCH_PARALLEL_SIZE` (default `1`), `VAE_PARALLEL_MODE` (default `tile`),
+and `VAE_USE_TILING` (default `False`). Encoder TP defaults to the full
+`ROLLOUT_TP * ROLLOUT_USP * ROLLOUT_RING` group. Existing TP-only defaults remain
+unchanged. For TP=4 with parallel VAE decode, use
+`ROLLOUT_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`.
+
+Pure Ulysses uses `ROLLOUT_TP=1 ROLLOUT_USP=4 ROLLOUT_RING=1`, with
+`TEXT_ENCODER_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`. Local rollout
+subclasses account for SP ranks without patching verl; TP remains the actual
+engine TP degree. GPU acceptance for this topology on the current PR head
+remains pending. H3 requires VAE mode `tile`, VAE parallel size `1` or the full
+DiT group, CFG parallel size `1`, and no hybrid Ulysses x Ring. Encoder TP must
+be `1` or the full DiT group and must divide 8.
+
+Other GPU launchers can use the typed Hydra fields directly, without these
+T2VA environment shortcuts. See the
+[configuration reference](../../../docs/examples/config.md#rollout-sequence-and-vae-parallelism)
+for GPU allocation, encoder-group validation and the small-tile VAE fallback.
+
+### Actor FSDP sequence parallelism
+
+The NVIDIA T2VA, FL2VA, and Ref2VA launchers accept `ACTOR_SP` (default `1`).
+Set it to a divisor of the GPU count to shard each Actor's joint
+text/video/audio sequence with Diffusers Ulysses context parallelism:
+
+```bash
+ACTOR_SP=2 bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
+```
+
+This uses the same standard equal-partition Ulysses path as Qwen-Image and
+changes Actor FSDP data parallelism to `NUM_GPUS / ACTOR_SP`; it does not change
+rollout `ROLLOUT_TP` or text-encoder `TEXT_ENCODER_TP`. `ACTOR_SP` must divide
+the model's attention-head count (56 for the released H3 checkpoint). When a
+packed layout's length is not a multiple of `ACTOR_SP`, the adapter appends
+padding rows and masks them as attention keys; real rows attend exactly as
+without padding and padding outputs are discarded, so arbitrary prompt and
+reference lengths are supported. Use an attention backend that accepts key
+masks under context parallelism (`native`, `flash_varlen_hub`, or
+`_flash_3_varlen_hub`). Keep timestep staging disabled. FlowGRPO micro-batches must still share one packed layout; sequence
+parallelism does not relax that replay contract.
+
 ### NVIDIA GPU
 
 ```bash
@@ -291,7 +310,7 @@ metrics local. Checkpoints and logs are written under
 | --- | --- |
 | Devices | 8 GPU / 16 NPU |
 | Rollout DiT TP | 2 GPU / 4 NPU |
-| Text-encoder TP | Same as rollout TP |
+| Text-encoder TP | Same as rollout TP with SP disabled |
 | Training batch size | 32 |
 | PPO mini-batch / per-device micro-batch | 16 / 1 |
 | Rollouts per prompt | 8 |
@@ -309,13 +328,18 @@ and Actor micro-batch 1. It enables layerwise rollout offload and FSDP2 Actor
 parameter/optimizer offload because reference presentations can be much longer
 than T2VA prompts.
 
-`NUM_GPUS` must be divisible by `ROLLOUT_TP`. `TEXT_ENCODER_TP` defaults to
-`ROLLOUT_TP` and is forwarded as `actor_rollout_ref.rollout.text_encoder_tp_size`
+Without sequence parallelism, `NUM_GPUS` must be divisible by `ROLLOUT_TP`
+and `TEXT_ENCODER_TP` defaults to `ROLLOUT_TP`. The GPU T2VA launcher includes
+sequence parallelism in that default: `ROLLOUT_TP * ROLLOUT_USP * ROLLOUT_RING`.
+`TEXT_ENCODER_TP` is forwarded as `actor_rollout_ref.rollout.text_encoder_tp_size`
 (without `+`), using the same diffusion engine path as NFT. With the pinned
-backend, ETP must be 1 or exactly equal to rollout TP.
-For example, `ROLLOUT_TP=4 TEXT_ENCODER_TP=4` shards the encoder across all four
-DiT ranks, while `TEXT_ENCODER_TP=1` disables encoder sharding. ETP is independent
-of CPU/layerwise offload. This applies to the GPU, V1 sync, and NPU launchers.
+backend, ETP must be `1` or the complete DiT group size
+`ROLLOUT_TP * ROLLOUT_USP * ROLLOUT_RING`, and must divide 8 for H3.
+For example, `ROLLOUT_TP=1 ROLLOUT_USP=4 ROLLOUT_RING=1 TEXT_ENCODER_TP=4`
+shards the encoder across all four DiT ranks. Without SP,
+`ROLLOUT_TP=4 TEXT_ENCODER_TP=4` also uses four ranks; `TEXT_ENCODER_TP=1`
+disables encoder sharding. ETP is independent of CPU/layerwise offload.
+The V1 sync and NPU launchers retain their TP-only environment defaults.
 
 The legacy `+actor_rollout_ref.rollout.engine_kwargs.vllm_omni.text_encoder_tp_size`
 override remains supported; conflicting values fail at startup. The fix for
