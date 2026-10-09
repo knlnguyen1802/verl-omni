@@ -73,8 +73,18 @@ REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
 # disagreement.
 LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
 
-export TORCH_LOGS="${TORCH_LOGS:-graph_breaks,recompiles}"
-echo "Using TORCH_LOGS=$TORCH_LOGS for torch.compile diagnostics."
+# torch.compile diagnostics are opt-in: the FA-hub varlen branch
+# (flash_attn_hub.py torch.any(~mask)) is a fundamental graph break on every
+# block by design, and packed batches still produce one bounded recompile
+# variant when the prompt-embeds mask flips between None (uniform batch, no
+# padding) and a tensor (mixed text lengths). Both settle and neither is an
+# error, but TORCH_LOGS=graph_breaks,recompiles prints each occurrence, which
+# reads like a failure. Export TORCH_LOGS yourself when bringing up compile
+# changes; keep it unset for clean benchmark logs.
+export TORCH_LOGS="${TORCH_LOGS:-}"
+if [[ -n "$TORCH_LOGS" ]]; then
+    echo "Using TORCH_LOGS=$TORCH_LOGS for torch.compile diagnostics."
+fi
 
 python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.model.algorithm=flow_grpo \
