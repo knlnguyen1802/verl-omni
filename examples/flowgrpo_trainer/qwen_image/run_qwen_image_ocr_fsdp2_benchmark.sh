@@ -15,8 +15,8 @@
 # verl-omni/examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_v1.sh
 #
 # FSDP2 is required because FSDP1 runs out of memory on this configuration.
-# Rollout step execution and reward-model CUDA graphs/batching are enabled to
-# improve throughput. FSDP2 forward prefetch is also enabled. The benchmark
+# Rollouts use v1 request-level packing and reward-model CUDA graphs/batching
+# is enabled to improve throughput. FSDP2 forward prefetch is also enabled. The benchmark
 # enables regional torch.compile while retaining Hub FA3 for actor training
 # and rollout. Graph breaks are allowed so third-party attention preprocessing
 # can stay eager without requiring coordinated compiler, Diffusers, and FA3
@@ -53,14 +53,23 @@ IMAGE_RESOLUTION=512
 
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
-# Keep step-wise rollout and old-log-prob recomputation batch shapes aligned.
-# Qwen-Image BF16 kernels are batch-shape sensitive; allowing rollout batches
-# larger than recomputation batches can increase rollout-policy disagreement.
+# V1 rollouts use request-level packing: the engine waits up to
+# REQUEST_BATCH_MAX_WAIT_MS for MAX_NUM_SEQS requests, then denoises them as
+# one stable batch. Step-wise continuous batching (v0's step_execution=True)
+# is mutually exclusive with packing and streams requests into the scheduler
+# one at a time, so denoise batches grow 1, 2, ... 32 per step. The rollout
+# transformer compiles regionally with dynamic shapes (vllm-omni default
+# enforce_eager=False), but Dynamo still specializes batch size 1 and guards
+# on the None-vs-tensor prompt-embeds mask, so the stepwise batch trickle
+# exhausts the per-code-object recompile cache and silently falls back to
+# eager after burning compile time. Keep batches packed and stable instead.
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
+# Keep old-log-prob recomputation batch shapes aligned with the packed rollout
+# batch. Qwen-Image BF16 kernels are batch-shape sensitive; allowing rollout
+# batches larger than recomputation batches can increase rollout-policy
+# disagreement.
 LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-${LOG_PROB_MICRO_BATCH_SIZE}}
-if [[ "${MAX_NUM_SEQS}" != "${LOG_PROB_MICRO_BATCH_SIZE}" ]]; then
-    echo "WARNING: MAX_NUM_SEQS=${MAX_NUM_SEQS} differs from LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE}; this may hurt FlowGRPO convergence." >&2
-fi
 
 export TORCH_LOGS="${TORCH_LOGS:-graph_breaks,recompiles}"
 echo "Using TORCH_LOGS=$TORCH_LOGS for torch.compile diagnostics."
@@ -101,8 +110,8 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.rollout.algo.sde_window_range="[0,5]" \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=50 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
-    actor_rollout_ref.rollout.step_execution=true \
-    ++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.request_batch_max_wait_ms=${REQUEST_BATCH_MAX_WAIT_MS} \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE} \
     reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
     reward.reward_model.enable=True \
