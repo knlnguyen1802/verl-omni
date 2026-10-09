@@ -61,9 +61,11 @@ REWARD_ENGINE=vllm
 # transformer compiles regionally with dynamic shapes (vllm-omni default
 # enforce_eager=False), but Dynamo still specializes batch size 1 and guards
 # on the None-vs-tensor prompt-embeds mask, so the stepwise batch trickle
-# exhausts the per-code-object recompile cache and silently falls back to
-# eager after burning compile time. Keep batches packed and stable instead.
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+# cache and silently falls back to eager after burning compile time. Keep
+# batches packed and stable instead. 8 packed 512px sequences keeps the
+# full-weight rollout engine (transformer + text encoder + VAE) within 80 GB
+# alongside the colocated actor; raise it only with GPU headroom to spare.
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
 # Keep old-log-prob recomputation batch shapes aligned with the packed rollout
 # batch. Qwen-Image BF16 kernels are batch-shape sensitive; allowing rollout
