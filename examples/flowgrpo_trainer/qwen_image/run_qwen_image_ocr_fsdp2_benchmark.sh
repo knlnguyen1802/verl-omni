@@ -80,10 +80,14 @@ LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
 # padding) and a tensor (mixed text lengths). Both settle and neither is an
 # error, but TORCH_LOGS=graph_breaks,recompiles prints each occurrence, which
 # reads like a failure. Export TORCH_LOGS yourself when bringing up compile
-# changes; keep it unset for clean benchmark logs.
-export TORCH_LOGS="${TORCH_LOGS:-}"
-if [[ -n "$TORCH_LOGS" ]]; then
+# changes; keep it unset for clean benchmark logs. Never leave it set but
+# empty: torch (<=2.10) _parse_log_settings("") returns a bare dict, which
+# crashes import torch in _init_logs ("'dict' object has no attribute
+# 'get_log_level_pairs'").
+if [[ -n "${TORCH_LOGS:-}" ]]; then
     echo "Using TORCH_LOGS=$TORCH_LOGS for torch.compile diagnostics."
+else
+    unset TORCH_LOGS
 fi
 
 python3 -m verl_omni.trainer.main_diffusion_v1 \
