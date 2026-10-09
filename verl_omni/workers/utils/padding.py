@@ -20,6 +20,8 @@ from tensordict import TensorDict
 from verl.trainer.ppo import padding_utils as _padding_utils
 from verl.trainer.ppo.padding_utils import construct_minimal_padding_template as ori_padding_template
 
+from verl_omni.utils.kernels import site_marker
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,15 +55,16 @@ def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
                 f"{tuple(values.shape[:2])}."
             )
 
-        values_list, mask_list = [], []
-        for i in range(mask.shape[0]):
-            curr_mask = mask[i].bool()
-            values_list.append(values[i, curr_mask, :])
-            mask_list.append(curr_mask[curr_mask])
-        return (
-            torch.nested.as_nested_tensor(values_list, layout=torch.jagged),
-            torch.nested.as_nested_tensor(mask_list, layout=torch.jagged),
-        )
+        with site_marker("S6_jagged_pack"):
+            values_list, mask_list = [], []
+            for i in range(mask.shape[0]):
+                curr_mask = mask[i].bool()
+                values_list.append(values[i, curr_mask, :])
+                mask_list.append(curr_mask[curr_mask])
+            return (
+                torch.nested.as_nested_tensor(values_list, layout=torch.jagged),
+                torch.nested.as_nested_tensor(mask_list, layout=torch.jagged),
+            )
 
     padded_keys = {"prompt_embeds", "negative_prompt_embeds"}
     padded_keys.update(

@@ -34,6 +34,7 @@ from transfer_queue import KVBatchMeta
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
+from verl.plugin.platform import get_platform
 from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -210,6 +211,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # Local update index within the parameter-sync cycle.
         self.local_trigger_step = 0
         self._nonfinite_grad_streak = 0
+        controller_nsight_options = OmegaConf.select(
+            self.config,
+            "global_profiler.global_tool_config.nsys.controller_nsight_options",
+            default={},
+        )
+        self._controller_nsys_profile_enabled = (
+            OmegaConf.select(self.config, "global_profiler.tool") == "nsys"
+            and controller_nsight_options.get("capture-range") == "cudaProfilerApi"
+        )
+        self._controller_nsys_profile_active = False
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -246,6 +257,55 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if self._has_old_adapter:
             self.actor_rollout_wg.copy_adapter(source="default", target="old")
         self.on_init_end()
+
+    def _start_profiling(self, do_profile: bool) -> None:
+        """Start profiling for all worker groups if profiling is enabled."""
+        if not do_profile:
+            return
+
+        controller_profile_started = False
+        try:
+            if self._controller_nsys_profile_enabled:
+                if self._controller_nsys_profile_active:
+                    raise RuntimeError("Controller Nsight profiling is already active")
+                get_platform().profiler_start()
+                self._controller_nsys_profile_active = True
+                controller_profile_started = True
+
+            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            # ref_policy_wg aliases actor_rollout_wg in v1 (colocated); drive each
+            # distinct worker group exactly once so stop hooks fire once per rank.
+            if self.use_reference_policy and self.ref_policy_wg is not self.actor_rollout_wg:
+                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+            if self.use_teacher_policy and Role.TeacherModel in self.role_worker_mapping:
+                for wg in self.teacher_model_manager.teacher_wg.values():
+                    wg.start_profile(profile_step=self.global_steps)
+        except Exception:
+            if controller_profile_started:
+                try:
+                    get_platform().profiler_stop()
+                finally:
+                    self._controller_nsys_profile_active = False
+            raise
+
+    def _stop_profiling(self, do_profile: bool) -> None:
+        """Stop profiling for all worker groups if profiling is enabled."""
+        if not do_profile:
+            return
+
+        try:
+            self.actor_rollout_wg.stop_profile()
+            if self.use_reference_policy and self.ref_policy_wg is not self.actor_rollout_wg:
+                self.ref_policy_wg.stop_profile()
+            if self.use_teacher_policy and Role.TeacherModel in self.role_worker_mapping:
+                for wg in self.teacher_model_manager.teacher_wg.values():
+                    wg.stop_profile()
+        finally:
+            if self._controller_nsys_profile_active:
+                try:
+                    get_platform().profiler_stop()
+                finally:
+                    self._controller_nsys_profile_active = False
 
     def fit(self, agent_loop_manager: AgentLoopManager):
         """Run the v1 training loop, mirroring upstream ``PPOTrainer.fit``."""
@@ -285,12 +345,30 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self._reissue_inflight_prompts()
         self.on_train_begin()
         last_val_metrics = None
+
+        # Profiler step state machine. Mirrors the v0 trainer and verl v1 PPOTrainer.
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        next_step_profile = False
+
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
             is_last_step = self.global_steps >= self.total_training_steps
             metrics: dict = {}
             self.timing_raw: dict = {}
             with marked_timer("step", self.timing_raw):
                 self.on_step_begin()
+
+                with marked_timer("start_profile", self.timing_raw):
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+
                 batch = self.step(metrics, self.timing_raw)
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
@@ -310,6 +388,20 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     if is_last_step:
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
+
+            with marked_timer("stop_profile", self.timing_raw):
+                next_step_profile = (
+                    self.global_steps + 1 in self.config.global_profiler.steps
+                    if self.config.global_profiler.steps is not None
+                    else False
+                )
+                self._stop_profiling(
+                    curr_step_profile and not next_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else curr_step_profile
+                )
+                prev_step_profile = curr_step_profile
+                curr_step_profile = next_step_profile
 
             self._compute_metrics(batch, metrics, self.timing_raw, self.global_steps, current_epoch)
 
@@ -970,6 +1062,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         all_wg = {}
         wg_kwargs = {"device_name": self.config.trainer.device}
+        # Forward profiling steps and (when nsys is selected) per-worker Nsight options to the
+        # Ray worker group so that workers can be launched under nsys with the right capture range.
+        if OmegaConf.select(self.config, "global_profiler.steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                worker_nsight_options = OmegaConf.select(
+                    self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options"
+                )
+                assert worker_nsight_options is not None, (
+                    "global_profiler.global_tool_config.nsys.worker_nsight_options must be set "
+                    "when using nsys with global_profiler.steps"
+                )
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(worker_nsight_options)
         pools = [(pool, class_dict) for pool, class_dict in self.resource_pool_to_cls.items() if class_dict]
         master_port_range = OmegaConf.select(self.config.trainer, "ray_master_port_range")
         port_ranges = worker_group_port_ranges(master_port_range, len(pools))

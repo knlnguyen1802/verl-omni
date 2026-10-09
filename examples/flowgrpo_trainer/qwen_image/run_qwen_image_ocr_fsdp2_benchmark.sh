@@ -1,15 +1,28 @@
 #!/bin/bash
-# Qwen-Image full-weight RL throughput benchmark for 8 x 80 GB GPUs.
+# Qwen-Image full-weight RL throughput benchmark for 8 x 80 GB GPUs
+# (V1 trainer: TransferQueue + ReplayBuffer + sync mode).
 #
-# This is an incremental override of run_qwen_image_ocr.sh. FSDP2 is required
-# because FSDP1 runs out of memory on this configuration. Rollout step execution
-# and reward-model CUDA graphs/batching are enabled to improve throughput.
-# FSDP2 forward prefetch is also enabled. The benchmark enables
-# regional torch.compile while retaining Hub FA3 for actor training and rollout.
-# Graph breaks are allowed so third-party attention preprocessing can stay eager
-# without requiring coordinated compiler, Diffusers, and FA3 patches. Append
-# actor_rollout_ref.model.use_regional_compile=False to compare against eager
-# execution. This benchmark disables checkpoint saving and periodic validation.
+# Uses the `verl_omni.trainer.main_diffusion_v1` entrypoint, which selects
+# `PolicyGradientDiffusionTrainerV1Sync` via `trainer.v1.trainer_mode=sync`.
+# TransferQueue is force-enabled inside the runner, so it does not need to be
+# set on the CLI. Training, rollout, and reward knobs match the v0 benchmark
+# this replaces; workload parity (512px, true_cfg_scale=1.0, SDE window) is
+# kept so v0 vs v1 throughput is comparable.
+#
+# Reference (legacy v0 benchmark, FSDP1-era override wrapper):
+# verl-omni/examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr.sh
+# Reference (v1 twin this recipe's v1 wiring follows):
+# verl-omni/examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_v1.sh
+#
+# FSDP2 is required because FSDP1 runs out of memory on this configuration.
+# Rollouts use v1 request-level packing and reward-model CUDA graphs/batching
+# is enabled to improve throughput. FSDP2 forward prefetch is also enabled. The benchmark
+# enables regional torch.compile while retaining Hub FA3 for actor training
+# and rollout. Graph breaks are allowed so third-party attention preprocessing
+# can stay eager without requiring coordinated compiler, Diffusers, and FA3
+# patches. Append actor_rollout_ref.model.use_regional_compile=False to
+# compare against eager execution. This benchmark disables checkpoint saving
+# and periodic validation.
 #
 # Keep recompiles shared because regional compilation invokes torch.compile
 # once per repeated transformer block. The 60 structurally identical Qwen Image
@@ -19,27 +32,124 @@
 # length from each batch's text mask. Static compilation specializes every
 # repeated block for each prompt length and exhausts Dynamo's accumulated
 # recompile limit before the first training step completes.
-SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
-NUM_GPUS=${NUM_GPUS:-8}
-NUM_NODES=${NUM_NODES:-1}
-REWARD_TP=1
-export TORCH_LOGS="${TORCH_LOGS:-graph_breaks,recompiles}"
-echo "Using TORCH_LOGS=$TORCH_LOGS for torch.compile diagnostics."
+set -euo pipefail
+set -x
 
-NUM_GPUS=$NUM_GPUS NUM_NODES=$NUM_NODES bash "$SCRIPT_DIR/run_qwen_image_ocr.sh" \
+# Set WORKSPACE to any writable directory; defaults to $HOME
+WORKSPACE=${WORKSPACE:-$HOME}
+
+ocr_train_path=$WORKSPACE/data/ocr/qwen_image/train.parquet
+ocr_test_path=$WORKSPACE/data/ocr/qwen_image/test.parquet
+
+model_name=Qwen/Qwen-Image
+reward_model_name=Qwen/Qwen3-VL-8B-Instruct
+reward_function_path=verl_omni/utils/reward_score/genrm_ocr.py
+
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS:-8}
+NUM_NODES=${NUM_NODES:-1}
+ROLLOUT_TP=1
+REWARD_TP=1
+IMAGE_RESOLUTION=512
+
+ENGINE=vllm_omni
+REWARD_ENGINE=vllm
+# V1 rollouts use request-level packing: the engine waits up to
+# REQUEST_BATCH_MAX_WAIT_MS for MAX_NUM_SEQS requests, then denoises them as
+# one stable batch. Step-wise continuous batching (v0's step_execution=True)
+# is mutually exclusive with packing and streams requests into the scheduler
+# one at a time, so denoise batches grow 1, 2, ... 32 per step. The rollout
+# transformer compiles regionally with dynamic shapes (vllm-omni default
+# enforce_eager=False), but Dynamo still specializes batch size 1 and guards
+# on the None-vs-tensor prompt-embeds mask, so the stepwise batch trickle
+# cache and silently falls back to eager after burning compile time. Keep
+# batches packed and stable instead. 8 packed 512px sequences keeps the
+# full-weight rollout engine (transformer + text encoder + VAE) within 80 GB
+# alongside the colocated actor; raise it only with GPU headroom to spare.
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
+REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
+# Keep old-log-prob recomputation batch shapes aligned with the packed rollout
+# batch. Qwen-Image BF16 kernels are batch-shape sensitive; allowing rollout
+# batches larger than recomputation batches can increase rollout-policy
+# disagreement.
+LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-32}
+
+# torch.compile diagnostics are opt-in: the FA-hub varlen branch
+# (flash_attn_hub.py torch.any(~mask)) is a fundamental graph break on every
+# block by design, and packed batches still produce one bounded recompile
+# variant when the prompt-embeds mask flips between None (uniform batch, no
+# padding) and a tensor (mixed text lengths). Both settle and neither is an
+# error, but TORCH_LOGS=graph_breaks,recompiles prints each occurrence, which
+# reads like a failure. Export TORCH_LOGS yourself when bringing up compile
+# changes; keep it unset for clean benchmark logs. Never leave it set but
+# empty: torch (<=2.10) _parse_log_settings("") returns a bare dict, which
+# crashes import torch in _init_logs ("'dict' object has no attribute
+# 'get_log_level_pairs'").
+if [[ -n "${TORCH_LOGS:-}" ]]; then
+    echo "Using TORCH_LOGS=$TORCH_LOGS for torch.compile diagnostics."
+else
+    unset TORCH_LOGS
+fi
+
+python3 -m verl_omni.trainer.main_diffusion_v1 \
+    actor_rollout_ref.model.algorithm=flow_grpo \
+    data.train_files=$ocr_train_path \
+    data.val_files=$ocr_test_path \
+    data.train_batch_size=32 \
+    data.max_prompt_length=256 \
+    actor_rollout_ref.model.path=$model_name \
+    actor_rollout_ref.actor.optim.lr=3e-5 \
+    actor_rollout_ref.actor.optim.weight_decay=0.0001 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-5 \
     actor_rollout_ref.model.use_regional_compile=True \
     'actor_rollout_ref.model.regional_compile_options={backend:inductor,mode:default,fullgraph:false,dynamic:true}' \
-    actor_rollout_ref.rollout.step_execution=True \
-    reward.num_workers=$((NUM_GPUS / REWARD_TP)) \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE} \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
+    actor_rollout_ref.rollout.name=$ENGINE \
+    actor_rollout_ref.rollout.n=16 \
+    actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / ROLLOUT_TP)) \
+    actor_rollout_ref.rollout.load_format=safetensors \
+    actor_rollout_ref.rollout.layered_summon=True \
+    actor_rollout_ref.rollout.pipeline.true_cfg_scale=1.0 \
+    actor_rollout_ref.rollout.pipeline.height=$IMAGE_RESOLUTION \
+    actor_rollout_ref.rollout.pipeline.width=$IMAGE_RESOLUTION \
+    actor_rollout_ref.rollout.pipeline.max_sequence_length=256 \
+    actor_rollout_ref.rollout.algo.noise_level=1.2 \
+    actor_rollout_ref.rollout.algo.sde_type="sde" \
+    actor_rollout_ref.rollout.algo.sde_window_size=2 \
+    actor_rollout_ref.rollout.algo.sde_window_range="[0,5]" \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=50 \
+    actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=${MAX_NUM_SEQS} \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.request_batch_max_wait_ms=${REQUEST_BATCH_MAX_WAIT_MS} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE} \
+    reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
+    reward.reward_model.enable=True \
+    reward.reward_model.model_path=$reward_model_name \
+    reward.reward_model.rollout.name=$REWARD_ENGINE \
     reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
     reward.reward_model.rollout.enforce_eager=False \
     reward.reward_model.rollout.max_num_seqs=128 \
     reward.reward_model.rollout.max_model_len=8192 \
+    reward.custom_reward_function.path=$reward_function_path \
+    reward.custom_reward_function.name=compute_score_ocr \
     trainer.logger='["console", "tensorboard"]' \
-    trainer.experiment_name=qwen_image_ocr_8x80g_fsdp2_benchmark \
+    trainer.project_name=flow_grpo \
+    trainer.experiment_name=qwen_image_ocr_8x80g_fsdp2_v1_benchmark \
+    trainer.log_val_generations=8 \
+    trainer.val_before_train=False \
+    trainer.n_gpus_per_node=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / NUM_NODES)) \
+    trainer.nnodes=$NUM_NODES \
     trainer.resume_mode=disable \
     trainer.save_freq=0 \
     trainer.test_freq=0 \
-    "$@"
+    trainer.total_epochs=15 \
+    trainer.total_training_steps=300 \
+    trainer.use_v1=true \
+    trainer.v1.trainer_mode=sync "$@"

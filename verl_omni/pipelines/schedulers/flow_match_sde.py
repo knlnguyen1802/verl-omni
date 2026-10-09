@@ -21,6 +21,8 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 
+from verl_omni.utils.kernels import site_marker
+
 
 @dataclass
 class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
@@ -196,118 +198,120 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             assert prev_sample.dtype == torch.float32
         assert model_output.dtype == torch.float32
 
-        if per_token_timesteps is not None:
-            raise NotImplementedError("per_token_timesteps is not supported yet for FlowMatchSDEDiscreteScheduler.")
-        else:
-            if timestep is None:
-                sigma_idx = self.step_index
-                sigma = self.sigmas[sigma_idx]
-                sigma_prev = self.sigmas[sigma_idx + 1]
+        with site_marker("S4_sigma_index"):
+            if per_token_timesteps is not None:
+                raise NotImplementedError("per_token_timesteps is not supported yet for FlowMatchSDEDiscreteScheduler.")
             else:
-                sigma_idx = torch.tensor([self.index_for_timestep(t) for t in timestep])
-                sigma = self.sigmas[sigma_idx].view(-1, *([1] * (len(sample.shape) - 1)))
-                sigma_prev = self.sigmas[sigma_idx + 1].view(-1, *([1] * (len(sample.shape) - 1)))
+                if timestep is None:
+                    sigma_idx = self.step_index
+                    sigma = self.sigmas[sigma_idx]
+                    sigma_prev = self.sigmas[sigma_idx + 1]
+                else:
+                    sigma_idx = torch.tensor([self.index_for_timestep(t) for t in timestep])
+                    sigma = self.sigmas[sigma_idx].view(-1, *([1] * (len(sample.shape) - 1)))
+                    sigma_prev = self.sigmas[sigma_idx + 1].view(-1, *([1] * (len(sample.shape) - 1)))
 
-            sigma_max = self.sigmas[1]
-            dt = sigma_prev - sigma
+                sigma_max = self.sigmas[1]
+                dt = sigma_prev - sigma
 
-        if sde_type == "sde":
-            std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * noise_level
+        with site_marker("S1_sde_step"):
+            if sde_type == "sde":
+                std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * noise_level
 
-            prev_sample_mean = (
-                sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
-                + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
-            )
-
-            if prev_sample is None:
-                variance_noise = randn_tensor(
-                    model_output.shape,
-                    generator=generator,
-                    device=model_output.device,
-                    dtype=model_output.dtype,
+                prev_sample_mean = (
+                    sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
+                    + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
                 )
-                prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
 
-            if return_logprobs:
-                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (
-                    2 * ((std_dev_t * torch.sqrt(-1 * dt)) ** 2)
-                )
-                if include_logprob_normalizer:
-                    log_prob = (
-                        log_prob
-                        - torch.log(std_dev_t * torch.sqrt(-1 * dt))
-                        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+                if prev_sample is None:
+                    variance_noise = randn_tensor(
+                        model_output.shape,
+                        generator=generator,
+                        device=model_output.device,
+                        dtype=model_output.dtype,
                     )
-            else:
-                log_prob = None
+                    prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
 
-        elif sde_type == "cps":
-            sin_noise = (
-                torch.sin(noise_level * (math.pi / 2))
-                if isinstance(noise_level, torch.Tensor)
-                else math.sin(noise_level * math.pi / 2)
-            )
-            std_dev_t = sigma_prev * sin_noise
-            pred_original_sample = sample - sigma * model_output
-            noise_estimate = sample + model_output * (1 - sigma)
-            prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * torch.sqrt(
-                sigma_prev**2 - std_dev_t**2
-            )
+                if return_logprobs:
+                    log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (
+                        2 * ((std_dev_t * torch.sqrt(-1 * dt)) ** 2)
+                    )
+                    if include_logprob_normalizer:
+                        log_prob = (
+                            log_prob
+                            - torch.log(std_dev_t * torch.sqrt(-1 * dt))
+                            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+                        )
+                else:
+                    log_prob = None
 
-            if prev_sample is None:
-                variance_noise = randn_tensor(
-                    model_output.shape,
-                    generator=generator,
-                    device=model_output.device,
-                    dtype=model_output.dtype,
+            elif sde_type == "cps":
+                sin_noise = (
+                    torch.sin(noise_level * (math.pi / 2))
+                    if isinstance(noise_level, torch.Tensor)
+                    else math.sin(noise_level * math.pi / 2)
                 )
-                prev_sample = prev_sample_mean + std_dev_t * variance_noise
-
-            if return_logprobs:
-                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
-            else:
-                log_prob = None
-
-        elif sde_type == "dance_sde":
-            # DanceGRPO SDE step from https://github.com/XueZeyue/DanceGRPO
-            # Based on score-based SDE correction with eta (noise_level) controlling
-            # the stochasticity. This formulation is numerically stable even when
-            # sigma is close to 1, unlike the FlowGRPO "sde" variant.
-            dsigma = sigma_prev - sigma  # negative (sigma decreases)
-            delta_t = sigma - sigma_prev  # positive
-
-            # ODE mean: x_{t-1} = x_t + dsigma * model_output
-            prev_sample_mean = sample + dsigma * model_output
-
-            # Predicted original sample: x_0 = x_t - sigma * model_output
-            pred_original_sample = sample - sigma * model_output
-
-            # Score-based SDE correction term
-            # score_estimate = -(x_t - x_0 * (1 - sigma)) / sigma^2
-            # log_term = -0.5 * eta^2 * score_estimate
-            # prev_sample_mean += log_term * dsigma
-            score_estimate = -(sample - pred_original_sample * (1 - sigma)) / (sigma**2)
-            log_term = -0.5 * noise_level**2 * score_estimate
-            prev_sample_mean = prev_sample_mean + log_term * dsigma
-
-            # Noise standard deviation: eta * sqrt(delta_t)
-            std_dev_t = noise_level * torch.sqrt(delta_t)
-
-            if prev_sample is None:
-                variance_noise = randn_tensor(
-                    model_output.shape,
-                    generator=generator,
-                    device=model_output.device,
-                    dtype=model_output.dtype,
+                std_dev_t = sigma_prev * sin_noise
+                pred_original_sample = sample - sigma * model_output
+                noise_estimate = sample + model_output * (1 - sigma)
+                prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * torch.sqrt(
+                    sigma_prev**2 - std_dev_t**2
                 )
-                prev_sample = prev_sample_mean + std_dev_t * variance_noise
 
-            if return_logprobs:
-                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
-                if include_logprob_normalizer:
-                    log_prob = log_prob - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-            else:
-                log_prob = None
+                if prev_sample is None:
+                    variance_noise = randn_tensor(
+                        model_output.shape,
+                        generator=generator,
+                        device=model_output.device,
+                        dtype=model_output.dtype,
+                    )
+                    prev_sample = prev_sample_mean + std_dev_t * variance_noise
+
+                if return_logprobs:
+                    log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
+                else:
+                    log_prob = None
+
+            elif sde_type == "dance_sde":
+                # DanceGRPO SDE step from https://github.com/XueZeyue/DanceGRPO
+                # Based on score-based SDE correction with eta (noise_level) controlling
+                # the stochasticity. This formulation is numerically stable even when
+                # sigma is close to 1, unlike the FlowGRPO "sde" variant.
+                dsigma = sigma_prev - sigma  # negative (sigma decreases)
+                delta_t = sigma - sigma_prev  # positive
+
+                # ODE mean: x_{t-1} = x_t + dsigma * model_output
+                prev_sample_mean = sample + dsigma * model_output
+
+                # Predicted original sample: x_0 = x_t - sigma * model_output
+                pred_original_sample = sample - sigma * model_output
+
+                # Score-based SDE correction term
+                # score_estimate = -(x_t - x_0 * (1 - sigma)) / sigma^2
+                # log_term = -0.5 * eta^2 * score_estimate
+                # prev_sample_mean += log_term * dsigma
+                score_estimate = -(sample - pred_original_sample * (1 - sigma)) / (sigma**2)
+                log_term = -0.5 * noise_level**2 * score_estimate
+                prev_sample_mean = prev_sample_mean + log_term * dsigma
+
+                # Noise standard deviation: eta * sqrt(delta_t)
+                std_dev_t = noise_level * torch.sqrt(delta_t)
+
+                if prev_sample is None:
+                    variance_noise = randn_tensor(
+                        model_output.shape,
+                        generator=generator,
+                        device=model_output.device,
+                        dtype=model_output.dtype,
+                    )
+                    prev_sample = prev_sample_mean + std_dev_t * variance_noise
+
+                if return_logprobs:
+                    log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
+                    if include_logprob_normalizer:
+                        log_prob = log_prob - torch.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+                else:
+                    log_prob = None
 
         # mean along all but batch dimension
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim))) if log_prob is not None else None

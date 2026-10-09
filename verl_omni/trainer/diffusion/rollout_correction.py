@@ -31,6 +31,8 @@ from verl.trainer.ppo.rollout_corr_helper import (
     compute_rollout_correction_and_rejection_mask,
 )
 
+from verl_omni.utils.kernels import site_marker
+
 __all__ = [
     "apply_bypass_mode_to_diffusion_batch",
     "apply_rollout_correction_to_diffusion_batch",
@@ -204,15 +206,16 @@ def compute_rollout_corr_metrics_from_logprobs(
         else:
             metrics_with_prefix[f"rollout_corr/{key}"] = value
 
-    abs_diff = (log_prob - rollout_log_prob).abs()
-    metrics_with_prefix["rollout_corr/logprob_abs_diff_mean"] = abs_diff.mean().item()
-    metrics_with_prefix["rollout_corr/logprob_abs_diff_max"] = abs_diff.max().item()
+    with site_marker("S11_rollout_corr_metrics"):
+        abs_diff = (log_prob - rollout_log_prob).abs()
+        metrics_with_prefix["rollout_corr/logprob_abs_diff_mean"] = abs_diff.mean().item()
+        metrics_with_prefix["rollout_corr/logprob_abs_diff_max"] = abs_diff.max().item()
 
-    if timesteps is not None and timesteps.shape == log_prob.shape:
-        for ts in torch.unique(timesteps):
-            metrics_with_prefix[f"rollout_corr/logprob_abs_diff/ts_{ts.item():.4g}"] = (
-                abs_diff[timesteps == ts].mean().item()
-            )
+        if timesteps is not None and timesteps.shape == log_prob.shape:
+            for ts in torch.unique(timesteps):
+                metrics_with_prefix[f"rollout_corr/logprob_abs_diff/ts_{ts.item():.4g}"] = (
+                    abs_diff[timesteps == ts].mean().item()
+                )
 
     return metrics_with_prefix
 
