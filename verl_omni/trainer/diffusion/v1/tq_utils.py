@@ -15,6 +15,7 @@
 import dataclasses
 import logging
 import os
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -115,6 +116,7 @@ def diffusion_tq_batch_to_dataproto(
     batch_meta: KVBatchMeta,
     pad_token_id: int = 0,
     select_fields: list[str] | None = None,
+    timing_raw: dict | None = None,
 ) -> DataProto:
     """Read TQ rows and assemble a diffusion ``DataProto``.
 
@@ -123,6 +125,9 @@ def diffusion_tq_batch_to_dataproto(
         pad_token_id: Padding token id for variable-length prompt token tensors.
         select_fields: Optional TQ fields to retrieve. ``None`` preserves the
             full-payload behavior required by training and validation.
+        timing_raw: Optional accumulator (the trainer's ``timing_raw``); when
+            given, the ``kv_batch_get`` transfer is timed into ``tq_get`` so it
+            surfaces as ``timing_s/tq_get`` (issue #712 transfer accounting).
 
     Returns:
         ``DataProto`` whose ``batch`` carries diffusion tensors (prompts,
@@ -133,11 +138,21 @@ def diffusion_tq_batch_to_dataproto(
     keys = [batch_meta.keys[i] for i in sort_idx]
     partition_id = batch_meta.partition_id
 
-    data = tq.kv_batch_get(
-        keys=keys,
-        partition_id=partition_id,
-        select_fields=select_fields,
-    )
+    if timing_raw is not None:
+        start = time.perf_counter()
+        data = tq.kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+            select_fields=select_fields,
+        )
+        timing_raw.setdefault("tq_get", 0.0)
+        timing_raw["tq_get"] += time.perf_counter() - start
+    else:
+        data = tq.kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+            select_fields=select_fields,
+        )
 
     batch_dict: dict[str, torch.Tensor] = {}
     non_tensor_batch: dict[str, Any] = {}

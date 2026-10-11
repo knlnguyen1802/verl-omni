@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import ray
@@ -292,12 +293,24 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             rows.setdefault(tuple(field.keys()), []).append((key, field, tag))
 
         for group_rows in rows.values():
+            put_start = time.perf_counter()
             await tq.async_kv_batch_put(
                 keys=[key for key, _field, _tag in group_rows],
                 fields=list_of_dict_to_tensordict([field for _key, field, _tag in group_rows]),
                 tags=[tag for _key, _field, tag in group_rows],
                 partition_id=partition_id,
             )
+            # Rollout-side transfer accounting (issue #712): the put's wall time
+            # and payload bytes ride the tags the trainer already reads, so the
+            # cost is attributed to the batch that consumes these rows without
+            # any extra TQ round trip. Time is split evenly across the rows of
+            # this put; aggregation happens in aggregate_tq_write_stats.
+            put_seconds = time.perf_counter() - put_start
+            for _key, field, tag in group_rows:
+                tag["tq_put_s"] = put_seconds / len(group_rows)
+                tag["tq_payload_bytes"] = sum(
+                    value.nbytes for value in field.values() if isinstance(value, torch.Tensor)
+                )
 
 
 @auto_await
