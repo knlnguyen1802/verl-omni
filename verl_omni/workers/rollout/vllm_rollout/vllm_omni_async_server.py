@@ -22,7 +22,7 @@ from typing import Any, Optional
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
-from verl.utils.profiler import build_rollout_dist_profiler
+from verl.utils.profiler import build_rollout_dist_profiler, build_vllm_profiler_args
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
@@ -260,6 +260,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 attn_backend,
             )
 
+        # Parent ``launch_server`` is not used here, so verl's CLI ``profiler_config``
+        # never reaches the stage configs. Without it DiffusionWorker.profile returns
+        # immediately. Re-apply the same dict verl builds for vLLM.
+        profiler_config = self._rollout_engine_profiler_config()
+        if profiler_config is not None:
+            engine_args["profiler_config"] = profiler_config
+
         engine_client = AsyncOmni(**engine_args)
         app = build_app(args)
         await omni_init_app_state(engine_client, app.state, args)
@@ -274,6 +281,27 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             # attach engine-level monkey patches
             await self.collective_rpc(method="monkey_patch_model")
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+
+    def _rollout_engine_profiler_config(self) -> dict[str, Any] | None:
+        """Return this replica's vLLM-Omni stage ``profiler_config``, or None.
+
+        Same payload as verl's ``build_vllm_profiler_args``. Only replicas that
+        ``_should_profile`` (enabled, selected rank, discrete) get a config;
+        other replicas stay unconfigured so they do not log a live profiler.
+        """
+        controller = getattr(self, "profiler_controller", None)
+        if controller is None or getattr(controller, "config", None) is None or not self._should_profile():
+            return None
+        profiler_args = build_vllm_profiler_args(
+            controller.config,
+            controller.tool_config,
+            self.replica_rank,
+            legacy_env=False,
+        )
+        raw = profiler_args.get("profiler_config")
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        return raw if isinstance(raw, dict) else None
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""

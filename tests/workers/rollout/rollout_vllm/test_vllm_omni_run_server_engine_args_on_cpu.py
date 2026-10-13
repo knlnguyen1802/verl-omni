@@ -69,6 +69,55 @@ async def test_run_server_strips_default_fault_tolerance_config(monkeypatch):
     captured = await _run_server_capture(monkeypatch, server_module.OmniEngineArgs(model="m"))
     assert "fault_tolerance_config" not in captured
     assert "enable_fault_tolerance" not in captured
+    assert "profiler_config" not in captured
+
+
+@pytest.mark.asyncio
+async def test_run_server_passes_verl_profiler_config_to_async_omni(monkeypatch):
+    """A profiled replica must hand vLLM-Omni the stage profiler dict verl builds for vLLM."""
+    from types import SimpleNamespace
+
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server._generate_strategy = MagicMock()
+    server.config = SimpleNamespace(disable_log_stats=True)
+    server._server_address = ("127.0.0.1", 0)
+    server.replica_rank = 3
+    server.profiler_controller = SimpleNamespace(
+        config=SimpleNamespace(save_path="outputs/profile"),
+        tool_config=SimpleNamespace(contents=["cpu", "cuda"], profile_token_start=None, profile_token_end=None),
+    )
+    server._should_profile = lambda: True
+
+    monkeypatch.setattr(
+        server_module.OmniEngineArgs,
+        "from_cli_args",
+        classmethod(lambda cls, _: server_module.OmniEngineArgs(model="m")),
+    )
+    monkeypatch.setattr(server_module, "get_non_ephemeral_free_port", lambda *a, **k: 12345)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+
+    captured: dict = {}
+
+    def _capture_async_omni(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    async def _noop_init_app_state(*args, **kwargs):
+        return None
+
+    async def _stub_run_uvicorn(*args, **kwargs):
+        return (0, None)
+
+    monkeypatch.setattr(server_module, "AsyncOmni", _capture_async_omni)
+    monkeypatch.setattr(server_module, "build_app", lambda args: MagicMock())
+    monkeypatch.setattr(server_module, "omni_init_app_state", _noop_init_app_state)
+    monkeypatch.setattr(server_module, "run_uvicorn", _stub_run_uvicorn)
+
+    await server.run_server(SimpleNamespace())
+    profiler_config = captured["profiler_config"]
+    assert profiler_config["profiler"] == "torch"
+    assert profiler_config["torch_profiler_dir"].endswith("agent_loop_rollout_replica_3")
+    assert profiler_config["torch_profiler_with_stack"] is False
 
 
 @pytest.mark.asyncio

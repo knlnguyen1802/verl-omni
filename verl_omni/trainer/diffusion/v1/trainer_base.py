@@ -258,15 +258,25 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         managers = [getattr(self, "llm_server_manager", None)]
         return [manager for manager in managers if manager is not None]
 
+    def _reward_profiles_with_rollout(self) -> bool:
+        """Streaming reward servers score inside the generation window."""
+        if not getattr(self, "enable_agent_reward_loop", False):
+            return False
+        return getattr(self, "reward_loop_manager", None) is not None
+
     def _start_rollout_profiling(self) -> None:
         """Start rollout profiling."""
         for manager in self._rollout_server_managers():
             manager.start_profile()
+        if self._reward_profiles_with_rollout():
+            self.reward_loop_manager.start_profile()
 
     def _stop_rollout_profiling(self) -> None:
         """Stop rollout profiling."""
         for manager in self._rollout_server_managers():
             manager.stop_profile()
+        if self._reward_profiles_with_rollout():
+            self.reward_loop_manager.stop_profile()
 
     def _start_profiling(self) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1332,7 +1342,18 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def _compute_reward_colocate(self, data: DataProto) -> DataProto:
         """Compute reward score with a colocated reward model on a DataProto batch."""
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-        return self.reward_loop_manager.compute_rm_score(data)
+        # Streaming reward is profiled with the generation window. Colocated
+        # scoring runs later, after rollout replicas are asleep.
+        profile = bool(getattr(self, "curr_step_profile", False)) and not getattr(
+            self, "enable_agent_reward_loop", False
+        )
+        if profile:
+            self.reward_loop_manager.start_profile()
+        try:
+            return self.reward_loop_manager.compute_rm_score(data)
+        finally:
+            if profile:
+                self.reward_loop_manager.stop_profile()
 
     def _balance_batch(self, data: DataProto, metrics: dict) -> DataProto:
         dp_size = 1
