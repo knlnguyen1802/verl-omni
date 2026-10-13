@@ -26,6 +26,31 @@ from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionT
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_colocate_reward_profiles_only_the_selected_step():
+    trainer = object.__new__(PolicyGradientDiffusionTrainerV1Sync)
+    calls = []
+    trainer.reward_loop_manager = SimpleNamespace(
+        start_profile=lambda **kwargs: calls.append("start"),
+        stop_profile=lambda: calls.append("stop"),
+        compute_rm_score=lambda data: calls.append(("score", data)) or data,
+    )
+    trainer.enable_agent_reward_loop = False
+    trainer.curr_step_profile = True
+    assert trainer._compute_reward_colocate("batch") == "batch"
+    assert calls == ["start", ("score", "batch"), "stop"]
+
+    calls.clear()
+    trainer.curr_step_profile = False
+    assert trainer._compute_reward_colocate("idle") == "idle"
+    assert calls == [("score", "idle")]
+
+    calls.clear()
+    trainer.curr_step_profile = True
+    trainer.enable_agent_reward_loop = True
+    assert trainer._compute_reward_colocate("stream") == "stream"
+    assert calls == [("score", "stream")]
+
+
 @pytest.mark.parametrize("present", [False, True])
 def test_rollout_managers_ignore_missing_or_none_manager(present):
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1Sync)

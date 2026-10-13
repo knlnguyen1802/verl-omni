@@ -1,6 +1,6 @@
 # Profiling FlowGRPO / diffusion training in VeRL-Omni
 
-Last updated: 10/06/2026.
+Last updated: 10/13/2026.
 
 VeRL-Omni reuses the profiler subsystem from upstream
 [verl](https://github.com/verl-project/verl) (`verl.utils.profiler`) and exposes
@@ -497,20 +497,21 @@ the actor's `analysis=True` does not configure rollout parsing.
 ## Lightweight profiling recipe
 
 Profiling a full FlowGRPO step produces a large trace that is slow to open.
-This recipe uses a `main_diffusion` (v0) launcher on purpose: the diffusion
-V1 trainer (`main_diffusion_v1`) does not yet support step-based profiling,
-so keep profiling recipes on the v0 launchers until V1 gains
-`global_profiler.steps` support. The `main_diffusion` launchers under
-`examples/` pass `"$@"` through to Hydra, which resolves duplicate overrides
-last-wins — so appending overrides to any recipe shrinks its footprint
-without editing the script. The following profiles a single lightweight step
-of the SD3.5 OCR recipe (2 rollouts instead of 8, 4 denoising steps instead
-of 10, 256px instead of 384px, train batch 4 instead of 8), capturing the
-actor train phase, the rollout servers and the reward-model servers
-(recipes 1, 5 and 6 combined):
+Diffusion V1 (`main_diffusion_v1`) uses the same `global_profiler.steps`
+window as v0: actor traces come from the training worker, and rollout traces
+come from the vLLM-Omni stages. The `*_v1.sh` launchers pass `"$@"` through
+to Hydra, which resolves duplicate overrides last-wins, so appending overrides
+to any recipe shrinks its footprint without editing the script. The following
+profiles a single lightweight step of the SD3.5 OCR V1 recipe (2 rollouts
+instead of 8, 4 denoising steps instead of 10, 256px instead of 384px, train
+batch 4 instead of 8), capturing the actor train phase and the rollout
+servers (recipes 1 and 5). This launcher scores with `reward.models.ocr` and
+sets `reward.reward_model.enable=False`, so recipe 6's classic reward-model
+pool is not part of the run. Keep
+`global_profiler.profile_continuous_steps=False` when rollout profiling is on:
 
 ```bash
-bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh \
+bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1.sh \
     data.train_batch_size=4 \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.pipeline.num_inference_steps=4 \
@@ -538,15 +539,11 @@ bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh \
     actor_rollout_ref.rollout.profiler.tool=torch \
     actor_rollout_ref.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
     actor_rollout_ref.rollout.profiler.tool_config.torch.discrete=True \
-    reward.reward_model.rollout.profiler.enable=True \
-    reward.reward_model.rollout.profiler.ranks=[0] \
-    reward.reward_model.rollout.profiler.tool=torch \
-    reward.reward_model.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
-    reward.reward_model.rollout.profiler.tool_config.torch.discrete=True
+    global_profiler.profile_continuous_steps=False
 ```
 
-Measured on 3×RTX 4090 against the v0 recipe defaults: traces 163 MB → 32 MB,
-profiled step 616 s → 70 s.
+Measured on 3×RTX 4090 against the v0 recipe defaults, before this V1 path
+wrote rollout traces: traces 163 MB → 32 MB, profiled step 616 s → 70 s.
 
 The `trainer.*` lines are not optional: the run's last step force-triggers
 checkpoint saving and validation when `save_freq`/`test_freq` > 0, and a
@@ -581,11 +578,15 @@ recipe's own values, minding two couplings:
   helpful for analysing inter-step behaviour. Diffusion V1 follows
   `verl/trainer/ppo/v1/trainer_base.py`: use continuous windows for actor-only
   collection, and non-continuous windows when collecting rollout traces.
-* In the legacy diffusion trainer, for the rollout servers, the trainer calls
-  `llm_server_manager.start_profile()`/`stop_profile()` around the generation
-  phase of profiled steps; the servers record through vLLM's built-in torch
-  profiler (recipe 5). The reward-model servers are driven the same way
-  through `verl_omni.reward_loop.OmniRewardLoopManager` (recipe 6).
+* Rollout servers are started and stopped around the generation window of
+  profiled steps (`llm_server_manager.start_profile()`/`stop_profile()` on the
+  legacy trainer; `_start_rollout_profiling()` / `on_sample_end` or
+  `on_step_end` on diffusion V1). vLLM-Omni stages receive the same
+  `profiler_config` verl passes to vLLM, so `profile()` writes a trace
+  instead of returning immediately (recipe 5). Reward-model servers are
+  driven the same way through `verl_omni.reward_loop.OmniRewardLoopManager`
+  (recipe 6): with the generation window when reward streams with rollout,
+  and around colocated `compute_rm_score` otherwise.
 * `relocate_results` and `finish_hook_*` are forwarded to upstream workers.
   Diffusion V1 follows upstream finish-hook scheduling: a closing training-worker
   window runs the hook on the largest configured profile step, or on the final

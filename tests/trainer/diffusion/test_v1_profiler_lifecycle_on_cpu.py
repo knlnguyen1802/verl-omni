@@ -137,3 +137,20 @@ def test_async_without_hybrid_only_profiles_standalone(monkeypatch):
     trainer.fit(Mock())
     assert not any(e[0] == "rollout" for e in events)
     assert events.count(("standalone", "start", {})) == 3
+
+
+@pytest.mark.parametrize("mode", ["sync", "separate_async"])
+def test_fit_profiles_streaming_reward_with_rollout(monkeypatch, mode):
+    trainer, events = make_trainer(monkeypatch, mode=mode)
+    trainer.enable_agent_reward_loop = True
+
+    def stop_profile(**kwargs):
+        events.append(("reward", "stop"))
+
+    trainer.reward_loop_manager = SimpleNamespace(
+        start_profile=lambda **kwargs: events.append(("reward", "start", kwargs)),
+        stop_profile=stop_profile,
+    )
+    trainer.fit(Mock())
+    assert events.count(("reward", "start", {})) == 3
+    assert events.count(("reward", "stop")) == 3
