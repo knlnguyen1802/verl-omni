@@ -222,8 +222,9 @@ def resolve_lora_config(model_config: Any) -> LoRASettings:
                 "this build needs a verl pin bump."
             )
 
-    rank = _select(model_config, "lora_rank", 0) or 0
-    nested_rank = nested.get("rank", 0) or 0
+    # A CLI override can arrive as the string "8"; compare ints, not the raw values.
+    rank = int(_select(model_config, "lora_rank", 0) or 0)
+    nested_rank = int(nested.get("rank", 0) or 0)
     if rank > 0 and nested_rank > 0 and rank != nested_rank:
         raise ValueError(
             f"actor_rollout_ref.model.lora.rank={nested_rank} conflicts with "

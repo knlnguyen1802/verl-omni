@@ -67,6 +67,14 @@ def test_conflicting_rank_spellings_raise():
         resolve_lora_config(_model_config(lora_rank=32, lora={"rank": 16, "merge": False}))
 
 
+def test_string_ranks_compare_as_ints():
+    settings = resolve_lora_config(_model_config(lora_rank="32", lora={"rank": 32, "merge": False}))
+    assert settings.rank == 32
+    assert settings.enabled
+    with pytest.raises(ValueError, match="lora_rank=8"):
+        resolve_lora_config(_model_config(lora_rank="8", lora={"rank": "16", "merge": False}))
+
+
 def test_merge_is_read_from_nested_block_only():
     assert resolve_lora_config(_model_config(lora={"merge": True})).merge
     assert not resolve_lora_config(_model_config()).merge
