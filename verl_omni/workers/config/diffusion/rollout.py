@@ -63,6 +63,8 @@ class DiffusionPipelineConfig(BaseConfig):
     width: int = 512
     num_inference_steps: int = 10
     output_type: str = "image"
+    # Additional named artifacts required by rewards/logging, including previews with a latent primary.
+    requested_outputs: Optional[list[str]] = None
     true_cfg_scale: float = 1.0
     max_sequence_length: int = 512
     guidance_scale: Optional[float] = None
@@ -206,7 +208,8 @@ class DiffusionRolloutConfig(BaseConfig):
 
     enable_chunked_prefill: bool = True
 
-    enable_prefix_caching: bool = True
+    # Diffusion models generate latents without autoregressive token prefix caching; keep False.
+    enable_prefix_caching: bool = False
 
     load_format: str = "dummy"
 

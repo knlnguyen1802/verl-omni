@@ -1,6 +1,6 @@
 # Supported Models
 
-Last updated: 09/29/2026.
+Last updated: 10/13/2026.
 
 VeRL-Omni supports RL post-training for generative models across image, video,
 audio, and omni modalities. This page catalogues every model with a ready-to-run
@@ -105,8 +105,9 @@ alignment and does not directly enforce source-image preservation.
 | Diffusion-DPO (offline, v0 by design) | `examples/dpo_trainer/sd35/run_sd35_medium_offline_dpo_lora.sh` | 3×GPU |
 | [DiffusionOPD](../algo/diffusion_opd.md) (single teacher, OCR) | `examples/diffusionopd_trainer/sd35/run_sd35_medium_ocr_distill.sh` | 3×GPU (2 actor+rollout+teacher, 1 reward) |
 | [DiffusionOPD](../algo/diffusion_opd.md) (multi-teacher / MOPD) | `examples/diffusionopd_trainer/sd35/run_sd35_medium_mopd_distill.sh` | 3×GPU (2 actor+rollout+teachers, 1 reward) |
+| [DGPO](../algo/dgpo.md) (LoRA, V1 sync) | `examples/dgpo_trainer/sd35/run_sd35_medium_ocr_lora_v1.sh` | 3×GPU (2 actor+rollout, 1 reward) |
 
-**Reward model:** `Qwen/Qwen2.5-VL-3B-Instruct` (OCR VLM judge, TP=1, dedicated pool) for Flow-GRPO OCR and DiffusionOPD. The DiNa-LRM recipe scores clean latents over HTTP instead of decoding images; see [SD3.5 FlowGRPO with a latent reward model](../examples/flowgrpo_trainer_sd35_drm.md). DiffusionOPD monitors OCR (and PickScore on the mixed-task recipe) but does not put those scores in the loss — see [Diffusion On-Policy Distillation](../algo/diffusion_opd.md).
+**Reward model:** `Qwen/Qwen2.5-VL-3B-Instruct` (OCR VLM judge, TP=1, dedicated pool) for Flow-GRPO OCR, DGPO and DiffusionOPD. The DiNa-LRM recipe scores clean latents over HTTP instead of decoding images; see [SD3.5 FlowGRPO with a latent reward model](../examples/flowgrpo_trainer_sd35_drm.md). DiffusionOPD monitors OCR (and PickScore on the mixed-task recipe) but does not put those scores in the loss — see [Diffusion On-Policy Distillation](../algo/diffusion_opd.md).
 
 ---
 
@@ -188,6 +189,7 @@ data prep, and Diffusers pin, see
 | Flow-GRPO (T2VA LoRA, V1 sync — default) | `examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora_v1.sh` | 8×GPU (TP=2) |
 | Flow-GRPO (FL2VA LoRA, V1 sync — default) | `examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_fl2va_lora_v1.sh` | 8×GPU (TP=4) |
 | DiffusionNFT (T2VA LoRA) | `examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh` | 8×GPU (TP=2) |
+| DiffusionNFT (T2VA LoRA, Ascend NPU) | `examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora_npu.sh` | 16×NPU (FSDP=8, TP=4, CPU offload) |
 | DiffusionNFT (FL2VA LoRA) | `examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_fl2va_lora.sh` | 8×GPU (TP=4) |
 
 **Reward models:** CLAP and ImageBind (audio-video alignment), same pair as LTX-2.3.
@@ -302,7 +304,7 @@ See [Qwen3-TTS GRPO with an audio reward](../examples/qwen3_tts/grpo_trainer_qwe
 | Reward model | HF ID / Source | Modality | Used by | Deployment |
 |-------------|---------------|----------|---------|------------|
 | Qwen3-VL-8B-Instruct | `Qwen/Qwen3-VL-8B-Instruct` | Vision-Language | Qwen-Image (all trainers) | vLLM, TP=4, colocated |
-| Qwen2.5-VL-3B-Instruct | `Qwen/Qwen2.5-VL-3B-Instruct` | Vision-Language | SD3.5 (Flow-GRPO, DiffusionOPD) | vLLM, TP=1, dedicated pool |
+| Qwen2.5-VL-3B-Instruct | `Qwen/Qwen2.5-VL-3B-Instruct` | Vision-Language | SD3.5 (Flow-GRPO, DGPO, DiffusionOPD) | vLLM, TP=1, dedicated pool |
 | PickScore | `yuvalkirstain/PickScore_v1` | Vision (preference) | Qwen-Image-Edit (Flow-GRPO), BAGEL (PickScore recipe), SD3.5 (MOPD monitor) | Local CLIP load, async workers |
 | HPSv3 | Local `.safetensors` | Vision (aesthetic) | Wan2.2 (DanceGRPO) | Local safetensors load |
 | CLAP | `laion/larger_clap_general` | Audio | LTX-2.3 (Flow-GRPO), MiniMax-H3 (DiffusionNFT) | Local transformers load |
@@ -329,7 +331,8 @@ trainer's README in `examples/`.
 | Mix-GRPO | NPU ✅<br>GPU ✅ | — | — | — | — | — | — | — | — |
 | DanceGRPO | — | — | — | NPU ✅<br>GPU ✅ | — | — | — | — | — |
 | DPO | NPU ✅<br>GPU ✅ | — | GPU ✅ | — | — | — | — | GPU ✅ | — |
-| DiffusionNFT | NPU ✅<br>GPU ✅ | — | — | — | — | GPU ✅ | — | — | — |
+| DiffusionNFT | NPU ✅<br>GPU ✅ | — | — | — | — | NPU ✅ (T2VA)<br>GPU ✅ | — | — | — |
+| [DGPO](../algo/dgpo.md) | — | — | GPU ✅ | — | — | — | — | — | — |
 | [DiffusionOPD](../algo/diffusion_opd.md) (incl. MOPD) | — | — | GPU ✅ | — | — | — | — | — | — |
 | GSPO (incl. OPD) | — | — | — | — | — | — | — | NPU ✅<br>GPU ✅ | — |
 
