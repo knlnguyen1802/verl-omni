@@ -146,6 +146,28 @@ def test_sample_wait_no_poll_when_data_ready(monkeypatch):
     assert timing["sample_wait/generation_bound"] == pytest.approx(0.0, abs=0.05)
 
 
+def test_row_arriving_before_first_sync_counts_detection(monkeypatch):
+    """A row published inside the window counts detection on the first sync."""
+    fake_tq = _FakeTransferQueue({})
+    _patch_transfer_queue(monkeypatch, fake_tq)
+    real_kv_list = fake_tq.kv_list
+
+    def kv_list_publishing_row():
+        fake_tq.add_finished_group("uida", put_at=time.time())
+        return real_kv_list()
+
+    monkeypatch.setattr(replay_buffer_module.tq, "kv_list", kv_list_publishing_row)
+
+    buffer = _make_profiled_buffer()
+    buffer.sample(global_steps=1, partition_id="train", batch_size=1)
+
+    timing = buffer.last_sample_timing
+    assert timing["sample_wait/polls"] == 0.0
+    # Published between the window start and the first sync: the arrival gap
+    # is recorded instead of silently marking the row as seen.
+    assert timing["sample_wait/detection"] > 0.0
+
+
 def test_slow_generation_is_generation_bound_not_detection(monkeypatch):
     """Counterexample 1: slow generation must land in generation_bound.
 

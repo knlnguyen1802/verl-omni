@@ -68,9 +68,9 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
     - ``sample_wait/eviction`` -- stale/DAPO/failure eviction passes.
 
     Rows written by older writers carry no ``tq_put_at`` and fall back into
-    ``generation_bound``; the window's first sync counts no detection, since
-    rows that arrived while the trainer did other work were not polling
-    waste.
+    ``generation_bound``; rows tagged before the window started are likewise
+    excluded from detection, since they arrived while the trainer was not
+    polling for them.
 
     ``last_sample_timing`` (seconds per segment, plus poll count and the
     finished-group depth seen while waiting) is refreshed on every
@@ -92,7 +92,6 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
         self._poll_depths: list[tuple[int, int, int]] = []
         self._seen_trajectory_keys: dict[str, set[str]] = {}
         self._last_sync_wall_time: float | None = None
-        self._window_sync_count = 0
         self.last_sample_timing: dict[str, float] = {}
 
     # -- timed segments ----------------------------------------------------
@@ -111,22 +110,22 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
             for partition_id, partition in self.partitions.items():
                 current = set(partition)
                 seen = self._seen_trajectory_keys.setdefault(partition_id, set())
-                if self._profiling_active and self._window_sync_count > 0:
+                if self._profiling_active:
+                    window_start = self._last_sync_wall_time or now
                     arrivals = [
                         float(tag[TQ_PUT_AT_TAG])
                         for key in current - seen
                         if isinstance(tag := partition.get(key), dict)
                         and isinstance(tag.get(TQ_PUT_AT_TAG), int | float)
+                        and float(tag[TQ_PUT_AT_TAG]) >= window_start
                     ]
                     if arrivals:
                         # Clamping bounds clock skew between the rollout writer
                         # and this process to the inter-sync window.
-                        window_start = self._last_sync_wall_time or now
                         detection = min(max(now - max(arrivals), 0.0), now - window_start)
                         self._segment_timings["detection"] += detection
                 self._seen_trajectory_keys[partition_id] = current
             if self._profiling_active:
-                self._window_sync_count += 1
                 self._last_sync_wall_time = now
 
     def _evict_terminal_groups(self, global_steps, partition_id, eviction_reasons):
@@ -164,8 +163,7 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
             return
         self._segment_timings = defaultdict(float)
         self._poll_depths = []
-        self._window_sync_count = 0
-        self._last_sync_wall_time = None
+        self._last_sync_wall_time = time.time()
         self._profiling_active = True
 
     def _end_profile_window(self, total_seconds: float) -> None:

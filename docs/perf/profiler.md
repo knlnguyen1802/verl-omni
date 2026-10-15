@@ -632,7 +632,7 @@ were already being taken, promoted to the metrics dict; see
 The wait split is event-based, not sleep-based: the rollout stamps each
 written row with its arrival time, and the buffer measures how long finished
 rows sat unseen between polls. Plain poll-sleep time cannot make this split —
-a slow generation and a coarse `poll_interval` both show up as sleep.|
+a slow generation and a coarse `poll_interval` both show up as sleep.
 
 Read them straight off wandb / TensorBoard, or point
 [`scripts/analyze_step_metrics.py`](https://github.com/verl-project/verl-omni/blob/main/scripts/analyze_step_metrics.py)

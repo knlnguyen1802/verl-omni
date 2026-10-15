@@ -50,8 +50,10 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 
 # Serialized trainer-step segments, in pipeline order. The wait segments are
 # reported separately (they are idle, not work) and the remainder bucket
@@ -86,6 +88,18 @@ def _parse_console_value(raw: str) -> float | None:
         return None
 
 
+def _to_step(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not number.is_finite() or number != number.to_integral_value():
+        return None
+    return int(number)
+
+
 def _parse_line(line: str) -> tuple[int, dict] | None:
     stripped = _ANSI_ESCAPE.sub("", line).strip()
     if not stripped:
@@ -97,8 +111,8 @@ def _parse_line(line: str) -> tuple[int, dict] | None:
             return None
         if not isinstance(payload, dict):
             return None
-        step = payload.get("training/global_step")
-        return (int(step), payload) if step is not None else None
+        step = _to_step(payload.get("training/global_step"))
+        return (step, payload) if step is not None else None
     dict_match = _DICT_METRICS_LINE.match(stripped)
     if dict_match:
         try:
@@ -107,7 +121,8 @@ def _parse_line(line: str) -> tuple[int, dict] | None:
             return None
         if not isinstance(payload, dict):
             return None
-        return int(payload.get("training/global_step", dict_match.group(1))), payload
+        step = _to_step(payload.get("training/global_step", dict_match.group(1)))
+        return (step, payload) if step is not None else None
     # console_tracking lines (LocalLogger.concat_dict_to_str):
     # `step:12 - key:value - key:value - ...`
     step_match = _STEP_PREFIX.match(stripped)
@@ -137,9 +152,10 @@ def load_steps(path: str) -> list[tuple[int, dict]]:
 def _number(metrics: dict, key: str) -> float:
     value = metrics.get(key)
     try:
-        return float(value) if value is not None else 0.0
+        number = float(value) if value is not None else 0.0
     except (TypeError, ValueError):
         return 0.0
+    return number if math.isfinite(number) else 0.0
 
 
 def attribute_step(metrics: dict, step: int | None = None) -> dict:
