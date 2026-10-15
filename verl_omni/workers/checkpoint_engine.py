@@ -133,11 +133,14 @@ class OmniCheckpointEngineManager(CheckpointEngineManager):
 # without duplicating any of verl's internals; the inline phases (worker-group
 # construction, the transfer ``ray.get`` and ``finalize``) fall out as the
 # residual and are reported together as ``transfer_and_finalize`` because the
-# transfer dominates that window. Phase overrides keep verl's ``@auto_await``
-# dual sync/async call style, and await the parent's raw coroutine via
-# ``__wrapped__`` so the decorator never nests (auto_await dispatches on the
-# caller's frame; a coroutine caller gets the coroutine back, a sync caller
-# gets the thread-pool path -- exactly the parent's contract).
+# transfer dominates that window. The async phase overrides keep verl's
+# ``@auto_await`` dual sync/async call style and await the parent's raw
+# coroutine via ``__wrapped__`` so the decorator never nests; the sync caller
+# gets the thread-pool path -- exactly the parent's contract.
+# ``build_process_group`` is a plain synchronous method in the pinned verl and
+# is called un-awaited from the async ``update_weights``, so its override must
+# stay synchronous: an ``auto_await`` override would hand that caller a
+# coroutine it never awaits, silently skipping topology/process-group setup.
 class WeightSyncPhaseTimerMixin:
     """Report per-phase weight-sync timings through ``update_weights``'s metrics.
 
@@ -201,9 +204,12 @@ class WeightSyncPhaseTimerMixin:
     async def release_kv_cache_replicas(self):
         return await self._wrap_phase_method("release_kv_cache_replicas", "kv_release")
 
-    @auto_await
-    async def build_process_group(self, rollout):
-        return await self._wrap_phase_method("build_process_group", "topology", rollout)
+    def build_process_group(self, rollout):
+        start = time.perf_counter()
+        try:
+            return super().build_process_group(rollout)
+        finally:
+            self._sync_phase_timings["topology"] += time.perf_counter() - start
 
     @auto_await
     async def resume_kv_cache_replicas(self):

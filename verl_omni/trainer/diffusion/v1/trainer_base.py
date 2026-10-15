@@ -98,7 +98,6 @@ from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
 from verl_omni.trainer.diffusion.v1.async_profiling import (
     ProfiledReplayBufferAsync,
     aggregate_tq_write_stats,
-    dataproto_payload_bytes,
 )
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     canonicalize_diffusion_tq_meta,
@@ -478,7 +477,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 self.on_sample_begin()
                 for trigger_idx in range(self.parameter_sync_step):
                     self.local_trigger_step = trigger_idx
-                    prefetched_batches.append(self._sample_training_batch(sample_batch_size))
+                    batch_meta, off_policy_metrics = self._sample_training_batch(sample_batch_size)
+                    # Record each profile before the next sample overwrites the
+                    # buffer's last_sample_timing; the metrics ride the pair.
+                    self._record_async_sample_profile(off_policy_metrics, timing_raw, batch_meta)
+                    prefetched_batches.append((batch_meta, off_policy_metrics))
                 self.on_sample_end()
 
         combined_keys: list = []
@@ -543,13 +546,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         stats into this step's metrics (issue #712).
 
         The profiled replay buffer stashes where ``sample()`` spent its wall
-        time (poll sleep vs metadata sync vs eviction vs no-sampleable wait);
-        the row tags written by the rollout-side TQ writer carry the put cost
-        and payload bytes of exactly the trajectories being consumed. Neither
-        exists in sync mode, where sampling is on-policy, so both are read
-        defensively.
+        time (generation-bound wait vs detection latency vs metadata sync vs
+        eviction); the row tags written by the rollout-side TQ writer carry
+        the put cost and payload bytes of exactly the trajectories being
+        consumed. Neither exists in sync mode, where sampling is on-policy,
+        so both are read defensively.
         """
-        sample_timing = getattr(self.replay_buffer, "last_sample_timing", None)
+        replay_buffer = getattr(self, "replay_buffer", None)
+        sample_timing = getattr(replay_buffer, "last_sample_timing", None)
         if sample_timing:
             for name, value in sample_timing.items():
                 timing_raw.setdefault(name, 0.0)
@@ -1897,21 +1901,22 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             real_images,
             responses_shape,
         )
-        # Trainer-side read accounting (issue #712): bytes of one full-payload
-        # read pair with the cumulative timing_s/tq_get from the train-path
-        # reads above for a per-read transfer rate.
-        get_bytes = dataproto_payload_bytes(data)
-        metrics["tq/get/bytes"] = float(get_bytes)
+        # Trainer-side read accounting (issue #712): bytes accumulated at every
+        # timed kv_batch_get boundary pair with the cumulative timing_s/tq_get
+        # from the same train-path reads for a transfer rate. Pop it here: it
+        # is a byte count, not a stage timing, so it must never render as a
+        # timing_s/* metric.
+        metrics["tq/get/bytes"] = float(timing_raw.pop("tq_get_bytes", 0.0))
         # Trainer idle for async modes: the share of the step the trainer spent
         # waiting on the replay buffer, decomposed by the profiled buffer into
-        # poll-sleep / metadata-sync / eviction / no-sampleable (queue-empty)
-        # wait. Deliberately not timing_s/gen / step: gen also covers row
+        # generation-bound wait / detection latency / metadata sync / eviction.
+        # Deliberately not timing_s/gen / step: gen also covers row
         # materialization, which is work, not idle (see verl#7601).
         if self.trainer_mode != "sync" and timing_raw.get("step", 0.0) > 0:
             step_seconds = timing_raw["step"]
             sample_wait = timing_raw.get("sample_wait/total", 0.0)
             metrics["separate_async/trainer_idle_ratio"] = max(0.0, min(1.0, sample_wait / step_seconds))
-            for segment in ("poll_sleep", "metadata_sync", "eviction", "no_sampleable"):
+            for segment in ("generation_bound", "detection", "metadata_sync", "eviction"):
                 seconds = timing_raw.get(f"sample_wait/{segment}", 0.0)
                 if seconds > 0:
                     metrics[f"separate_async/idle_ratio/{segment}"] = seconds / step_seconds

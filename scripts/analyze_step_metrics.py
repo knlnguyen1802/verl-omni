@@ -31,10 +31,13 @@ Input formats (auto-detected per line):
    Export from wandb/TensorBoard, or emit directly by adding a small
    logger callback that dumps the metrics dict per step.
 
-2. verl console log -- lines like
-   ``step:12 metrics: {'timing_s/step': 41.2, ...}``
-   (the default console_tracking format); the dict literal is parsed with
-   ast.literal_eval.
+2. verl console log (``console_tracking``, ``LocalLogger``) -- lines like
+   ``step:12 - training/global_step:12 - timing_s/step:41.2 - ...``; the
+   numeric ``key:value`` fields are parsed and console ANSI escapes are
+   stripped. The step number comes from the ``step:`` prefix.
+
+3. ``step:12 metrics: {'timing_s/step': 41.2, ...}`` -- a metrics dict
+   literal after the step prefix; parsed with ``ast.literal_eval``.
 
 Usage:
     python scripts/analyze_step_metrics.py metrics.jsonl
@@ -65,17 +68,26 @@ SERIAL_WORK_SEGMENTS = (
 )
 
 WAIT_SEGMENTS = (
-    ("timing_s/sample_wait/no_sampleable", "wait:no_sampleable(queue-empty)"),
-    ("timing_s/sample_wait/poll_sleep", "wait:poll_sleep(quantization)"),
+    ("timing_s/sample_wait/generation_bound", "wait:generation_bound(rollout)"),
+    ("timing_s/sample_wait/detection", "wait:detection(poll quantization)"),
     ("timing_s/sample_wait/metadata_sync", "wait:metadata_sync"),
     ("timing_s/sample_wait/eviction", "wait:eviction"),
 )
 
-_CONSOLE_LINE = re.compile(r"step:(\d+)\s+metrics:\s+(\{.*\})\s*$")
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_DICT_METRICS_LINE = re.compile(r"^step:(\d+)\s+metrics:\s+(\{.*\})\s*$")
+_STEP_PREFIX = re.compile(r"^step:(\d+)\b")
+
+
+def _parse_console_value(raw: str) -> float | None:
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def _parse_line(line: str) -> tuple[int, dict] | None:
-    stripped = line.strip()
+    stripped = _ANSI_ESCAPE.sub("", line).strip()
     if not stripped:
         return None
     if stripped.startswith("{"):
@@ -83,23 +95,33 @@ def _parse_line(line: str) -> tuple[int, dict] | None:
             payload = json.loads(stripped)
         except json.JSONDecodeError:
             return None
-    else:
-        match = _CONSOLE_LINE.search(stripped)
-        if not match:
+        if not isinstance(payload, dict):
             return None
+        step = payload.get("training/global_step")
+        return (int(step), payload) if step is not None else None
+    dict_match = _DICT_METRICS_LINE.match(stripped)
+    if dict_match:
         try:
-            payload = ast.literal_eval(match.group(2))
+            payload = ast.literal_eval(dict_match.group(2))
         except (ValueError, SyntaxError):
             return None
-    if not isinstance(payload, dict):
+        if not isinstance(payload, dict):
+            return None
+        return int(payload.get("training/global_step", dict_match.group(1))), payload
+    # console_tracking lines (LocalLogger.concat_dict_to_str):
+    # `step:12 - key:value - key:value - ...`
+    step_match = _STEP_PREFIX.match(stripped)
+    if not step_match:
         return None
-    step = payload.get("training/global_step")
-    if step is None:
-        match = _CONSOLE_LINE.search(stripped)
-        step = int(match.group(1)) if match else None
-    if step is None:
-        return None
-    return int(step), payload
+    payload = {}
+    for item in stripped.split(" - ")[1:]:
+        if ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        number = _parse_console_value(value.strip())
+        if number is not None:
+            payload[key.strip()] = number
+    return (int(step_match.group(1)), payload) if payload else None
 
 
 def load_steps(path: str) -> list[tuple[int, dict]]:
@@ -120,10 +142,11 @@ def _number(metrics: dict, key: str) -> float:
         return 0.0
 
 
-def attribute_step(metrics: dict) -> dict:
+def attribute_step(metrics: dict, step: int | None = None) -> dict:
     """Build the per-step attribution record from one metrics dict."""
     step_seconds = _number(metrics, "timing_s/step")
-    attribution = {"step": _number(metrics, "training/global_step"), "step_s": step_seconds}
+    parsed_step = step if step is not None else _number(metrics, "training/global_step")
+    attribution = {"step": parsed_step, "step_s": step_seconds}
     waits = {label: _number(metrics, key) for key, label in WAIT_SEGMENTS}
     works = {label: _number(metrics, key) for key, label in SERIAL_WORK_SEGMENTS}
     wait_total = sum(waits.values())
@@ -159,7 +182,7 @@ def attribute_step(metrics: dict) -> dict:
 
 
 def print_report(steps: list[tuple[int, dict]], top: int, as_json: bool) -> None:
-    records = [attribute_step(metrics) for _, metrics in steps]
+    records = [attribute_step(metrics, step) for step, metrics in steps]
     if as_json:
         json.dump(records, sys.stdout, indent=2)
         sys.stdout.write("\n")

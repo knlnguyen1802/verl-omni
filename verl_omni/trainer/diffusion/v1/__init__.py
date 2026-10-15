@@ -15,7 +15,7 @@
 from verl_omni.trainer.diffusion.v1.async_profiling import (
     ProfiledReplayBufferAsync,
     aggregate_tq_write_stats,
-    dataproto_payload_bytes,
+    tensordict_payload_bytes,
 )
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
@@ -40,7 +40,7 @@ __all__ = [
     "PolicyGradientDiffusionTrainerV1Sync",
     "ProfiledReplayBufferAsync",
     "aggregate_tq_write_stats",
-    "dataproto_payload_bytes",
+    "tensordict_payload_bytes",
     "get_diffusion_trainer_cls",
     "register_diffusion_trainer",
     "diffusion_tq_batch_to_dataproto",
