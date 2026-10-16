@@ -56,6 +56,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.fsdp.utils import create_device_mesh, get_sharding_strategy
+from verl.workers.engine.spec import ShardSpec
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
@@ -254,7 +255,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         if self.model_config.enable_gradient_checkpointing:
             try:
-                module.enable_gradient_checkpointing()
+                self._configure_gradient_checkpointing(module)
             except AttributeError:
                 raise NotImplementedError(
                     f"Gradient checkpointing is enabled in config, but {type(module).__name__} "
@@ -268,6 +269,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         module.can_generate = lambda: False
         return module
+
+    def _configure_gradient_checkpointing(self, module):
+        module.enable_gradient_checkpointing()
 
     def _build_module(self):
         from diffusers import AutoModel
@@ -316,7 +320,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             )
 
             if self.model_config.enable_gradient_checkpointing:
-                module.enable_gradient_checkpointing()
+                self._configure_gradient_checkpointing(module)
 
             # patch for checkpoint saving
             def save_config(self, save_directory: str | os.PathLike):
@@ -715,7 +719,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
-            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            logger.warning("grad_norm is not finite: %s; skipping this optimizer step.", grad_norm)
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
@@ -900,7 +904,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             latents = data.get("all_latents", None)
             if not isinstance(latents, torch.Tensor) or latents.ndim != 4 or latents.shape[1] != num_steps + 1:
                 raise ValueError("Staged PPO all_latents must have shape (batch, timesteps + 1, tokens, channels).")
-            required = ("all_timesteps", "all_latents", "old_log_probs", "advantages", "prompt_embeds")
+            required = ("all_timesteps", "all_latents", "advantages", "prompt_embeds")
             step_fields = dict.fromkeys(
                 (
                     "all_timesteps",
@@ -977,6 +981,75 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.module)
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+
+    def get_per_tensor_param_shard(self, **kwargs):
+        """Like :meth:`get_per_tensor_param`, but yields each rank's *local* shard
+        ``(name, local_flat_shard, ShardSpec)`` instead of all-gathering full
+        tensors. Consumed by the ``omni_delta_sharded`` checkpoint engine, which byte-diffs
+        each rank's shard against a pinned snapshot; non-LoRA base path only. Names
+        match the full export (``convert_weight_keys`` plus the ``transformer.``
+        prefix) so HF coordinates are what the rollout pipelines already load, and
+        the cast rule matches too (DTensors bf16, plain tensors native) so the
+        pinned diff base is bit-identical to the seed sync's full export.
+        """
+        peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        if hasattr(peft_model, "peft_config"):
+            raise NotImplementedError(
+                "omni_delta_sharded shard export supports full-weight training only; LoRA runs "
+                "keep the adapter (merge=false) or merged full-weight (merge=true) sync paths."
+            )
+
+        # Staging rule mirrors verl's FSDP engine: FSDP1's sharded state-dict export runs
+        # through the unshard machinery and needs GPU-resident params; FSDP2 state_dict()
+        # only collects DTensor refs and the generator below stages each shard lazily.
+        _needs_staging = fsdp_version(self.module) == 1
+        if _needs_staging and not self._uses_fsdp2_cpu_offload_policy:
+            load_fsdp_model_to_gpu(self.module)
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        if _needs_staging and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.module)
+
+        device = get_device_id()
+
+        def _gen():
+            for name, param in params.items():
+                spec = ShardSpec.from_param(param)
+                p = param.to(device, non_blocking=True)
+                # Same cast rule as the full export: DTensors bf16, plain tensors
+                # native dtype. The pinned diff base must be bit-identical to what
+                # the seed (full) export sent the rollout, or steady deltas drift
+                # from the nccl path on FSDP1 / non-DTensor entries.
+                if isinstance(param, DTensor) and p.is_floating_point():
+                    p = p.to(torch.bfloat16, non_blocking=True)
+                local = p.to_local() if hasattr(p, "to_local") else p
+                yield f"transformer.{name}", local.reshape(-1), spec
+
+        return _gen(), None
+
+    def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        """Per-param HF delta entry builder: diffusers params are identity params
+        (weight name == HF name after conversion, coordinates translate directly)."""
+        from verl.workers.engine.utils import _hf_entry_identity
+
+        if spec.to_hf_chunk is not None:
+            raise NotImplementedError(
+                f"{name}: the diffusers engine only handles identity params; "
+                "converter specs belong to the engine that declared them"
+            )
+        return _hf_entry_identity(name, spec, place, lidx, lval)
+
+    def get_per_tensor_param_delta_shard(self, **kwargs):
+        """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
+        ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)`` per parameter,
+        byte-diffed against the pinned shard snapshot. Requires a prior
+        :meth:`prime_delta_snapshots` call (the delta engine primes right after the
+        seed sync)."""
+        from verl.workers.engine.utils import hf_delta_export
+
+        self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
+        gen, _ = self.get_per_tensor_param_shard()
+        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def _gradient_sync_context(self, *, is_last_micro_batch: bool):
         """Reuse verl FSDPEngine: skip reduce-scatter until the last accumulation step."""
@@ -1133,8 +1206,9 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
         if loss_function is not None:
             data = tu.get_tensordict(
                 {
-                    "old_log_probs": micro_batch["old_log_probs"][:, step],
-                    "advantages": micro_batch["advantages"][:, step],
+                    key: micro_batch[key][:, step]
+                    for key in ("old_log_probs", "advantages")
+                    if micro_batch.get(key, None) is not None
                 },
             )
             tu.assign_non_tensor(
@@ -1366,23 +1440,28 @@ class DPODiffusersFSDPEngine(DiffusersFSDPEngine):
 class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
     """Diffusers FSDP engine for direct-preference / forward-process objectives (e.g. DiffusionNFT)."""
 
+    def __init__(
+        self,
+        model_config: DiffusionModelConfig,
+        engine_config: FSDPEngineConfig,
+        optimizer_config: FSDPOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
+    ):
+        DiffusionModelBase.get_class(model_config).validate_engine_config(engine_config)
+        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+
+    def _configure_gradient_checkpointing(self, module):
+        DiffusionModelBase.get_class(self.model_config).configure_gradient_checkpointing(module, self.engine_config)
+
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
         return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="train_timesteps")
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
-        x0 = micro_batch["latents_clean"]
-        timestep = micro_batch["train_timesteps"][:, step]
-        t = timestep.float() / 1000.0
-        t_expanded = t.view(-1, *([1] * (x0.ndim - 1)))
-
-        if micro_batch.get("forward_noise", None) is not None:
-            forward_noise = micro_batch["forward_noise"]
-            noise = forward_noise[:, step] if forward_noise.ndim == x0.ndim + 1 else forward_noise
-        else:
-            noise = torch.randn_like(x0.float())
-        xt = (1.0 - t_expanded) * x0 + t_expanded * noise
+        latents, timesteps, loss_context = DiffusionModelBase.get_class(self.model_config).prepare_training_inputs(
+            micro_batch, step, self.scheduler
+        )
 
         prompt_embeds = micro_batch["prompt_embeds"]
         prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
@@ -1410,8 +1489,8 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
         model_inputs, negative_model_inputs = prepare_model_inputs(
             module=self.module,
             model_config=self.model_config,
-            latents=xt,
-            timesteps=timestep,
+            latents=latents,
+            timesteps=timesteps,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             negative_prompt_embeds=negative_prompt_embeds,
@@ -1419,21 +1498,14 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             micro_batch=micro_batch,
             step=step,
         )
-        return model_inputs, negative_model_inputs, x0, xt, t_expanded
+        return model_inputs, negative_model_inputs, loss_context
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
-        old_prediction, forward_prediction, ref_forward_prediction, x0, xt, t_expanded = output
-        return {
-            "old_prediction": old_prediction,
-            "forward_prediction": forward_prediction,
-            "ref_forward_prediction": ref_forward_prediction,
-            "x0": x0,
-            "xt": xt,
-            "t_expanded": t_expanded,
-        }
+        predictions, loss_context = output
+        return DiffusionModelBase.get_class(self.model_config).prepare_model_outputs(predictions, loss_context)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
-        model_inputs, negative_model_inputs, x0, xt, t_expanded = self.prepare_model_inputs(
+        model_inputs, negative_model_inputs, loss_context = self.prepare_model_inputs(
             micro_batch=micro_batch, step=step
         )
 
@@ -1443,7 +1515,12 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                 model_config=self.model_config,
                 model_inputs=model_inputs,
                 negative_model_inputs=negative_model_inputs,
-            ).detach()
+            )
+            old_prediction = (
+                old_prediction.detach()
+                if isinstance(old_prediction, torch.Tensor)
+                else tuple(prediction.detach() for prediction in old_prediction)
+            )
 
         forward_prediction = forward(
             module=self.module,
@@ -1459,16 +1536,29 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                     model_config=self.model_config,
                     model_inputs=model_inputs,
                     negative_model_inputs=negative_model_inputs,
-                ).detach()
+                )
+                ref_forward_prediction = (
+                    ref_forward_prediction.detach()
+                    if isinstance(ref_forward_prediction, torch.Tensor)
+                    else tuple(prediction.detach() for prediction in ref_forward_prediction)
+                )
         self._set_adapter("default")
 
         model_output = self.prepare_model_outputs(
-            output=(old_prediction, forward_prediction, ref_forward_prediction, x0, xt, t_expanded),
+            output=(
+                {
+                    "old_prediction": old_prediction,
+                    "forward_prediction": forward_prediction,
+                    "ref_forward_prediction": ref_forward_prediction,
+                },
+                loss_context,
+            ),
             micro_batch=micro_batch,
         )
 
         if loss_function is not None:
-            data = tu.get_tensordict({"reward_prob": micro_batch["reward_prob"][:, step]})
+            loss_inputs = DiffusionModelBase.get_class(self.model_config).prepare_loss_inputs(micro_batch, step)
+            data = tu.get_tensordict(loss_inputs)
             tu.assign_non_tensor(
                 data,
                 gradient_accumulation_steps=tu.get_non_tensor_data(
@@ -1479,7 +1569,8 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
-            loss = torch.tensor(1.0, device=x0.device)
+            prediction = forward_prediction if isinstance(forward_prediction, torch.Tensor) else forward_prediction[0]
+            loss = torch.tensor(1.0, device=prediction.device)
             metrics = {}
 
         output = {

@@ -19,6 +19,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from numbers import Integral
 from pprint import pprint
 
@@ -56,11 +57,13 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl.workers.rollout.llm_server import LLMServerManager
 
 from verl_omni.pipelines.rollout_media import (
+    MediaArtifact,
+    previews_from_batch,
     resolve_batch_media_kind,
     resolve_is_video,
+    validate_previews,
     validate_visual_media_batch_rank,
 )
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
@@ -73,8 +76,9 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     old_policy_decay,
+    skip_old_log_prob,
+    track_nonfinite_grad_streak,
     validate_distillation_config,
-    worker_group_port_ranges,
 )
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     BaseRayDiffusionTrainer,
@@ -93,12 +97,15 @@ from verl_omni.trainer.diffusion.rollout_correction import (
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     DIFFUSION_DUMP_TQ_FIELDS,
+    canonicalize_diffusion_tq_meta,
     diffusion_metric_tq_fields,
     diffusion_persisted_tq_fields,
     diffusion_tq_batch_to_dataproto,
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
+from verl_omni.utils.net_utils import worker_group_port_ranges
+from verl_omni.utils.tracking import batch_items, validate_audio_batch
 from verl_omni.workers.config.reward import (
     reward_is_enabled,
     reward_pool_is_separate,
@@ -106,6 +113,7 @@ from verl_omni.workers.config.reward import (
     streaming_reward_enabled,
 )
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker, resolve_teacher_infer_micro_batch_size
+from verl_omni.workers.rollout.replica import DiffusionLLMServerManager as LLMServerManager
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 logger = logging.getLogger(__name__)
@@ -151,6 +159,8 @@ def _copy_media_to_cpu(value):
     """Return an independent CPU snapshot safe for background media export."""
     if isinstance(value, torch.Tensor):
         return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, MediaArtifact):
+        return replace(value, data=_copy_media_to_cpu(value.data))
     if isinstance(value, list):
         return [_copy_media_to_cpu(item) for item in value]
     if isinstance(value, tuple):
@@ -176,10 +186,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if self._is_direct_preference:
             if config.algorithm.get("sample_source", "online") == "offline":
                 raise NotImplementedError(
-                    "Diffusion offline DPO stays on the v0 trainer. Use "
-                    "`python -m verl_omni.trainer.main_diffusion` with trainer.use_v1=false."
+                    "Diffusion offline DPO stays on the v0 trainer by design. Use "
+                    "`python -m verl_omni.trainer.main_diffusion` (the legacy v0 entrypoint)."
                 )
             self._loss_fn = get_diffusion_loss_fn(loss_mode)
+            self._loss_fn.validate_trainer_config(config)
             self._has_old_adapter = "old" in tuple(
                 config.actor_rollout_ref.model.get("policy_state_adapters", ("default",))
             )
@@ -189,11 +200,15 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self._loss_fn = None
             self._has_old_adapter = False
         # DPO needs trainer-side ref noise preds even when KL is disabled.
+        self.use_critic = False  # Diffusion has no critic worker group.
         self.use_reference_policy = need_reference_policy(config) or (loss_mode == "dpo")
         self.use_rm = reward_is_enabled(config)
         self.use_teacher_policy = is_distillation_enabled(config.get("distillation"))
         self.distillation_config = omega_conf_to_dataclass(config.distillation) if self.use_teacher_policy else None
         validate_distillation_config(config)
+        self.skip_old_log_prob = skip_old_log_prob(config)
+        if self.skip_old_log_prob:
+            logger.info("The actor loss reads no log-probs; skipping the old_log_prob stage.")
         self._teacher_one_step_off = self.use_teacher_policy and self.distillation_config.scheduler == "one_step_off"
         self._pending_teacher_batch = None
         self.replay_buffer = self._build_replay_buffer()
@@ -208,6 +223,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.global_steps = 0
         # Local update index within the parameter-sync cycle.
         self.local_trigger_step = 0
+        self._nonfinite_grad_streak = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -219,14 +235,23 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 raise ValueError("max_incomplete_group_refill_rounds must be a positive integer")
 
         replay_buffer_cls = ReplayBufferAsync if self.trainer_mode == "separate_async" else ReplayBuffer
+        # ReplayBuffer.sample() discovers finished groups by sleeping a fixed
+        # poll_interval between tq.kv_list() calls. The upstream 2.0s default
+        # quantizes sync gen: sample() returns only on a poll boundary, so a
+        # rollout finishing mid-sleep idles the trainer for the remainder
+        # (observed +1.15s/step on Qwen-Image FlowGRPO). Sync mode has nothing
+        # to overlap with the wait, so poll fast unless configured otherwise.
+        poll_interval = sampler_config.get("poll_interval", None)
+        if poll_interval is None:
+            poll_interval = 2.0 if self.trainer_mode == "separate_async" else 0.05
         return replay_buffer_cls(
             trainer_mode=self.trainer_mode,
             trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
             max_off_policy_threshold=sampler_config.max_off_policy_threshold,
             max_off_policy_strategy=sampler_config.max_off_policy_strategy,
             sampler_kwargs=sampler_config.sampler_kwargs,
-            poll_interval=sampler_config.get("poll_interval", 2.0),
             refill_fn=self._add_prompts_to_generate,
+            poll_interval=float(poll_interval),
         )
 
     def init(self):
@@ -235,6 +260,91 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if self._has_old_adapter:
             self.actor_rollout_wg.copy_adapter(source="default", target="old")
         self.on_init_end()
+
+    def _rollout_server_managers(self) -> list:
+        """LLM server managers whose inference engines take part in rollout profiling.
+
+        Subclasses owning additional replicas (e.g. the standalone rollout of separate-async
+        training) extend this list so those engines are profiled as well.
+        """
+        managers = [getattr(self, "llm_server_manager", None)]
+        return [manager for manager in managers if manager is not None]
+
+    def _start_rollout_profiling(self) -> None:
+        """Start rollout profiling."""
+        for manager in self._rollout_server_managers():
+            manager.start_profile()
+
+    def _stop_rollout_profiling(self) -> None:
+        """Stop rollout profiling."""
+        for manager in self._rollout_server_managers():
+            manager.stop_profile()
+
+    def _start_profiling(self) -> None:
+        """Start profiling for all worker groups if profiling is enabled."""
+        do_profile = (
+            not self.prev_step_profile and self.curr_step_profile
+            if self.config.global_profiler.profile_continuous_steps
+            else self.curr_step_profile
+        )
+
+        if do_profile:
+            # "train", not "e2e": this window only holds what the training worker itself runs
+            # (log-prob forwards and the actor update). Generation happens in the inference
+            # engines below, which write their own traces.
+            #
+            # In the hybrid engine, actor/rollout and the (colocated) reference -- and sometimes the
+            # critic -- share ONE worker group object, so ref_policy_wg / critic_wg can alias
+            # actor_rollout_wg. Each start/stop_profile round-trips to every rank and, on stop, runs
+            # the finish hook (e.g. the user's trace-upload command); driving the same physical
+            # workers more than once would fire that hook once per alias and upload the same trace
+            # file multiple times. Drive each distinct worker group exactly once.
+            self.actor_rollout_wg.start_profile(role="train", profile_step=self.global_steps)
+            seen = {id(self.actor_rollout_wg)}
+            if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+                seen.add(id(self.ref_policy_wg))
+                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+            if self.use_critic and id(self.critic_wg) not in seen:
+                seen.add(id(self.critic_wg))
+                self.critic_wg.start_profile(profile_step=self.global_steps)
+            self._start_rollout_profiling()
+
+    def _stop_profiling(self) -> None:
+        """Stop profiling for all worker groups if profiling is enabled."""
+        this_step_profile = self.curr_step_profile
+        self.next_step_profile = (
+            self.global_steps + 1 in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        do_profile = (
+            self.curr_step_profile and not self.next_step_profile
+            if self.config.global_profiler.profile_continuous_steps
+            else self.curr_step_profile
+        )
+        self.prev_step_profile = self.curr_step_profile
+        self.curr_step_profile = self.next_step_profile
+
+        if do_profile:
+            # Run the finish command (e.g. the trace upload) only once, on the last profiled step, so
+            # a command that uploads the whole save_path sends each trace once instead of re-uploading
+            # the accumulating directory every step. "Last" is the largest configured step, or the
+            # run's final step if it ends earlier on a profiled step.
+            profiled_steps = self.config.global_profiler.steps
+            is_last_step = self.global_steps >= self.total_training_steps
+            run_command = bool(
+                this_step_profile and profiled_steps and (self.global_steps == max(profiled_steps) or is_last_step)
+            )
+            # See _start_profiling: skip aliased worker groups so the finish hook (and any trace
+            # upload it triggers) fires exactly once per distinct process, not once per role alias.
+            self.actor_rollout_wg.stop_profile(run_command=run_command)
+            seen = {id(self.actor_rollout_wg)}
+            if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+                seen.add(id(self.ref_policy_wg))
+                self.ref_policy_wg.stop_profile(run_command=run_command)
+            if self.use_critic and id(self.critic_wg) not in seen:
+                seen.add(id(self.critic_wg))
+                self.critic_wg.stop_profile(run_command=run_command)
 
     def fit(self, agent_loop_manager: AgentLoopManager):
         """Run the v1 training loop, mirroring upstream ``PPOTrainer.fit``."""
@@ -272,6 +382,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.global_steps += 1
         SkipManager.set_step(self.global_steps)
         self._reissue_inflight_prompts()
+        self.prev_step_profile = False
+        self.curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        self.next_step_profile = False
+
         self.on_train_begin()
         last_val_metrics = None
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
@@ -280,7 +398,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self.timing_raw: dict = {}
             with marked_timer("step", self.timing_raw):
                 self.on_step_begin()
+                self._start_profiling()
                 batch = self.step(metrics, self.timing_raw)
+                self._stop_profiling()
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
@@ -461,12 +581,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         bypass_recomputing_logprobs = bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
         if bypass_recomputing_logprobs:
             apply_bypass_mode_to_diffusion_batch(data)
-        else:
+        elif not self.skip_old_log_prob:
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 old_log_prob = self._compute_old_log_prob(data)
                 data = data.union(old_log_prob)
-
-        assert "old_log_probs" in data.batch, f'"old_log_probs" not in {data.batch.keys()}'
+            assert "old_log_probs" in data.batch, f'"old_log_probs" not in {data.batch.keys()}'
 
         metrics.update(
             compute_rollout_corr_metrics_from_batch(
@@ -498,6 +617,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         with marked_timer("adv", timing_raw, color="brown"):
             data = self._compute_advantage(data)
 
+        # Zero advantages of rows appended by _balance_batch so the unmasked
+        # FlowGRPO loss mean is not corrupted by duplicated real advantages.
+        # _compute_advantage recomputes advantages, so this must run after it.
+        data = self._zero_pad_row_advantages(data)
+
         with marked_timer("update_actor", timing_raw, color="red"):
             actor_output = self._update_actor(data)
             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -524,9 +648,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
         if rollout_cfg.rollout_adapter != "old":
             raise ValueError("Old-adapter algorithms require actor_rollout_ref.rollout.rollout_adapter=old.")
-        if actor_loss_cfg.loss_mode != "diffusion_nft":
+        if not get_diffusion_loss_fn(actor_loss_cfg.loss_mode).uses_old_adapter:
             raise ValueError(
-                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft."
+                "Old-adapter algorithms require an actor_rollout_ref.actor.diffusion_loss.loss_mode that trains "
+                f"against the old adapter, got {actor_loss_cfg.loss_mode}."
             )
 
     def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
@@ -807,6 +932,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             sampler=create_rl_sampler(self.config.data, self.train_dataset),
         )
         self.train_dataloader_it = None
+        # Per-run monotonic generation-batch number; pairs with the batch-local
+        # ``index`` so TQ row ordering survives multi-batch sampling paths.
+        self._gen_batch_seq = 0
         val_batch_size = self.config.data.val_batch_size or len(self.val_dataset)
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
@@ -950,7 +1078,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 }
 
         all_wg = {}
-        wg_kwargs = {"device_name": self.config.trainer.device}
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.config.trainer.device
         pools = [(pool, class_dict) for pool, class_dict in self.resource_pool_to_cls.items() if class_dict]
         master_port_range = OmegaConf.select(self.config.trainer, "ray_master_port_range")
         port_ranges = worker_group_port_ranges(master_port_range, len(pools))
@@ -1041,6 +1181,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+        batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
+        self._gen_batch_seq += 1
         return tu.get_tensordict(batch_dict)
 
     def _generation_batch_size(self) -> int:
@@ -1089,11 +1231,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Use the upstream replay buffer and replace only selected failed groups."""
         sampler_config = self.config.trainer.v1.sampler
         if not sampler_config.get("drop_incomplete_groups", False):
-            return self.replay_buffer.sample(
+            batch_meta, off_policy_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps,
                 partition_id="train",
                 batch_size=batch_size,
             )
+            # Restore the v0 prompt-major row order before any consumer reads
+            # or writes these keys (TQ key order is storage-arbitrary).
+            return canonicalize_diffusion_tq_meta(batch_meta), off_policy_metrics
 
         max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
         remaining_batch_size = batch_size
@@ -1166,7 +1311,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 max_refill_rounds,
             )
 
-        return KVBatchMeta(partition_id="train", keys=keys, tags=tags), {**sampling_metrics, **failure_metrics}
+        return canonicalize_diffusion_tq_meta(KVBatchMeta(partition_id="train", keys=keys, tags=tags)), {
+            **sampling_metrics,
+            **failure_metrics,
+        }
 
     def _submit_batch_to_rollout(self, batch) -> int:
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
@@ -1225,7 +1373,29 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
         if len(data) % batch_multiple != 0:
-            data, _ = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+            # pad_dataproto_to_divisor pads by duplicating real rows, which would
+            # carry real advantages into the unmasked FlowGRPO loss mean and bias
+            # the gradient. Mark the duplicated tail so its advantages can be zeroed
+            # before the actor update (see _zero_pad_row_advantages).
+            data, pad_size = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+            is_pad = np.zeros(len(data), dtype=bool)
+            is_pad[-pad_size:] = True
+            data.non_tensor_batch["_balance_is_pad"] = is_pad
+        return data
+
+    def _zero_pad_row_advantages(self, data: DataProto) -> DataProto:
+        """Zero advantages of rows appended by ``_balance_batch``.
+
+        ``_compute_advantage`` recomputes advantages, so this must run after it.
+        Pad rows then contribute nothing to the unmasked ``torch.mean`` loss.
+        No-op when no padding occurred.
+        """
+        is_pad = data.non_tensor_batch.pop("_balance_is_pad", None)
+        if is_pad is None or not is_pad.any():
+            return data
+        advantages = data.batch["advantages"]
+        is_pad = torch.from_numpy(is_pad).to(advantages.device)
+        advantages[is_pad] = 0.0
         return data
 
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
@@ -1284,7 +1454,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if reward_extra_infos_dict:
             data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-        num_timesteps = data.batch["old_log_probs"].shape[1]
+        num_timesteps = data.batch["all_timesteps"].shape[1]
         data.batch["sample_level_rewards"] = data.batch["sample_level_scores"].expand(-1, num_timesteps)
 
         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
@@ -1314,10 +1484,13 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
-        if paired and shuffle:
+        loss_mode = OmegaConf.select(self.config, "actor_rollout_ref.actor.diffusion_loss.loss_mode")
+        keep_groups = paired or (loss_mode is not None and get_diffusion_loss_fn(loss_mode).requires_whole_groups)
+        if keep_groups and shuffle:
             logger.warning(
                 "Shuffle is not supported for direct preference during actor update."
-                "This is to prevent the chosen/rejected pairs from being split across different micro batches."
+                "This is to prevent chosen/rejected pairs and rollout groups from being split across "
+                "different micro batches."
                 "Setting shuffle to False."
             )
             shuffle = False
@@ -1346,6 +1519,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         sample_audios: list = []
         sample_audio_sample_rates: list = []
         sample_media_kinds: list = []
+        sample_previews: list = []
         sample_gts: list = []
         sample_scores: list[float] = []
         sample_turns: list = []
@@ -1358,6 +1532,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
             batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
+            batch_dict["gen_batch_seq"] = np.full(len(batch_dict["raw_prompt"]), self._gen_batch_seq)
+            self._gen_batch_seq += 1
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
@@ -1370,6 +1546,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             batch_meta, _ = self.replay_buffer.sample(
                 global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
             )
+            batch_meta = canonicalize_diffusion_tq_meta(batch_meta)
             # Full payload on purpose: the colocated reward model receives this
             # DataProto and may read any pipeline-emitted row field.
             data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
@@ -1409,6 +1586,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             sample_inputs.extend(input_texts)
             sample_outputs.append(output_images)
+            sample_previews.extend(previews_from_batch(data) or [None] * len(output_images))
             tool_extra = data.non_tensor_batch.get("tool_extra_fields")
             sample_audios.extend(_resolve_rollout_media_field(data, tool_extra, "audio"))
             sample_audio_sample_rates.extend(_resolve_rollout_media_field(data, tool_extra, "audio_sample_rate"))
@@ -1446,6 +1624,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=sample_audios,
             audio_sample_rates=sample_audio_sample_rates,
             media_kinds=sample_media_kinds,
+            previews=sample_previews,
         )
 
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1462,6 +1641,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 audios=sample_audios,
                 audio_sample_rates=sample_audio_sample_rates,
                 media_kind=resolve_batch_media_kind(sample_media_kinds),
+                previews=sample_previews,
             )
 
         data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
@@ -1475,6 +1655,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kinds=None,
+        previews=None,
     ):
         """Use the shared image/video W&B path with declared media metadata."""
         return BaseRayDiffusionTrainer._maybe_log_val_generations(
@@ -1485,6 +1666,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=audios,
             audio_sample_rates=audio_sample_rates,
             media_kinds=media_kinds,
+            previews=previews,
         )
 
     def _dump_generations(
@@ -1500,16 +1682,45 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kind=None,
+        previews=None,
     ):
         """Validate media synchronously, then submit best-effort I/O with a step snapshot."""
-        _validate_generation_outputs(outputs)
-        resolve_is_video(outputs.ndim, media_kind)
-        dump_ndim = outputs.ndim - 1 if outputs.ndim == 6 and outputs.shape[1] == 1 else outputs.ndim
-        validate_visual_media_batch_rank(dump_ndim, media_kind)
+        previews = validate_previews(previews, len(inputs))
+        if previews == []:
+            return
+        effective_media_kind = previews[0].spec.modality if previews is not None else media_kind
+        if previews is None:
+            _validate_generation_outputs(outputs)
+            resolve_is_video(effective_media_kind)
+            validate_visual_media_batch_rank(outputs.ndim, effective_media_kind)
+        if effective_media_kind == "video":
+            validate_audio_batch(audios, audio_sample_rates, len(inputs), context="generation dump")
+        self._drain_dump_futures()
+        if self._dump_futures:
+            logger.warning("Skipping media dump at step %s: previous dump is still running", self.global_steps)
+            return
+        full_count = len(inputs)
+        retained_count = full_count if max_samples is None else min(max_samples, full_count)
+        if retained_count != full_count:
+            inputs = list(inputs)[:retained_count]
+            gts = list(gts)[:retained_count]
+            scores = list(scores)[:retained_count]
+            reward_extra_infos_dict = {
+                key: list(values)[:retained_count] if len(values) == full_count else values
+                for key, values in reward_extra_infos_dict.items()
+            }
+            audios = batch_items(audios, full_count, "audio")[:retained_count]
+            audio_sample_rates = batch_items(audio_sample_rates, full_count, "audio_sample_rate")[:retained_count]
+            if previews is not None:
+                previews = previews[:retained_count]
+            else:
+                outputs = outputs[:retained_count]
+            max_samples = None
         global_step = self.global_steps
-        outputs_to_dump = _copy_media_to_cpu(outputs)
+        outputs_to_dump = None if previews is not None else _copy_media_to_cpu(outputs)
         audios_to_dump = _copy_media_to_cpu(audios)
         audio_sample_rates_to_dump = _copy_media_to_cpu(audio_sample_rates)
+        previews_to_dump = _copy_media_to_cpu(previews)
         future = self._dump_executor.submit(
             dump_generations,
             global_step,
@@ -1524,9 +1735,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios_to_dump,
             audio_sample_rates_to_dump,
             media_kind,
+            previews_to_dump,
         )
         self._dump_futures.append((future, global_step))
-        self._drain_dump_futures()
 
     def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout rows from TQ and dump sorted by uid.
@@ -1559,8 +1770,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios = _resolve_rollout_media_field(data, tool_extra, "audio")
             audio_sample_rates = _resolve_rollout_media_field(data, tool_extra, "audio_sample_rate")
             media_kinds = _resolve_rollout_media_field(data, tool_extra, "media_kind")
+            previews = previews_from_batch(data)
 
             sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
+            if previews is not None:
+                previews = [previews[i] for i in sort_idx]
             inputs = [inputs[i] for i in sort_idx]
             outputs = outputs[torch.tensor(sort_idx)]
             gts = [gts[i] for i in sort_idx]
@@ -1581,6 +1795,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 audios=audios,
                 audio_sample_rates=audio_sample_rates,
                 media_kind=resolve_batch_media_kind(media_kinds),
+                previews=previews,
             )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict:
@@ -1670,9 +1885,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             for key in keys:
                 reward_extra_infos_dict[key] = [info.get(key) for info in infos]
         metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos_dict))
+        gradient_norm = metrics.get("actor/grad_norm", None)
         if "advantages" in data.batch:
-            gradient_norm = metrics.get("actor/grad_norm", None)
             metrics.update(compute_variance_proxy_metrics(batch=data, gradient_norm=gradient_norm))
+        self._nonfinite_grad_streak = track_nonfinite_grad_streak(self._nonfinite_grad_streak, gradient_norm)
+        metrics["train/nonfinite_grad_steps"] = self._nonfinite_grad_streak
 
         # off-policy staleness metrics (model-version units)
         non_padding = np.array([not tag.get("is_padding", False) for tag in batch_meta.tags], dtype=bool)

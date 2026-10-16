@@ -8,7 +8,7 @@ ARG MOONCAKE_INDEX_URL="https://mirrors.aliyun.com/pypi/web/simple"
 ARG MOONCAKE_TAG="0.3.11.post1"
 
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_REF="v0.28.0"
+ARG VLLM_REF="v0.30.0"
 
 ARG VLLM_ASCEND_REPO="https://github.com/vllm-project/vllm-ascend.git"
 ARG VLLM_ASCEND_REF=""
@@ -169,9 +169,10 @@ RUN git clone \
         ${VERL_OMNI_REPO} \
         /workspace/src/verl-omni && \
     cd /workspace/src/verl-omni && \
-    python3 -m pip install -e ".[ocr]" \
+    python3 -m pip install --no-deps -e . \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
-        --extra-index-url ${PYTORCH_CPU_INDEX_URL}
+        --extra-index-url ${PYTORCH_CPU_INDEX_URL} \
+    && python3 -m pip install Levenshtein
 
 RUN python3 -m pip install --force-reinstall \
         torch==2.10.0+cpu \

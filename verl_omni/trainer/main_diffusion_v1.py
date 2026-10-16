@@ -14,7 +14,6 @@
 
 import logging
 import os
-import warnings
 from pprint import pprint
 
 import hydra
@@ -41,6 +40,31 @@ def run_diffusion_v1(config, task_runner_class=None) -> None:
                 settings, model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    # Reject unsupported profiling combinations before starting Ray or workers.
+    if OmegaConf.select(config, "global_profiler.steps"):
+        if (
+            OmegaConf.select(config, "global_profiler.tool") == "nsys"
+            and OmegaConf.select(
+                config, "global_profiler.global_tool_config.nsys.controller_nsight_options.capture-range"
+            )
+            == "cudaProfilerApi"
+        ):
+            raise ValueError(
+                "Diffusion V1 does not support controller-side Nsight capture-range=cudaProfilerApi. "
+                "Remove global_profiler.global_tool_config.nsys.controller_nsight_options.capture-range; "
+                "worker-side capture-range settings are unaffected."
+            )
+        if OmegaConf.select(config, "actor_rollout_ref.rollout.profiler.enable", default=False) and OmegaConf.select(
+            config, "global_profiler.profile_continuous_steps", default=False
+        ):
+            raise ValueError(
+                "Diffusion V1 rollout profiling requires global_profiler.profile_continuous_steps=False. "
+                "Disable actor_rollout_ref.rollout.profiler.enable for actor-only continuous profiling."
+            )
+
+    # TransferQueue is required for v1; force-enable it before ray.init() so
+    # TRANSFER_QUEUE_ENABLE is exported to every worker through the runtime env.
+    config.transfer_queue.enable = True
     enable_rl_insight(config)
 
     if not ray.is_initialized():
@@ -70,9 +94,9 @@ def run_diffusion_v1(config, task_runner_class=None) -> None:
         from verl.utils.import_utils import is_nvtx_available
 
         assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
-        nsight_options = OmegaConf.to_container(
-            config.global_profiler.global_tool_config.nsys.controller_nsight_options
-        )
+        from verl_omni.trainer.main_diffusion import _resolve_controller_nsight_options
+
+        nsight_options = _resolve_controller_nsight_options(config)
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
         runner = task_runner_class.remote()
@@ -148,13 +172,8 @@ def main(config):
     if config.trainer.get("use_v1", False):
         run_diffusion_v1(config)
     else:
-        # Fall back to the legacy (v0) diffusion trainer entrypoint.
-        warnings.warn(
-            "trainer.use_v1 is unset or false; the legacy diffusion trainer is deprecated. "
-            "Set trainer.use_v1=true to use the V1 trainer.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+        # Explicit opt-out of the (default since v0.3.0) V1 trainer: fall back
+        # to the legacy v0 entrypoint, which emits the deprecation warning.
         from verl_omni.trainer.main_diffusion import run_diffusion
 
         run_diffusion(config)
