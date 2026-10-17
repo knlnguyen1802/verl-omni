@@ -179,3 +179,93 @@ class StableDiffusion3FlowGRPO(DiffusionModelBase):
             return_sqrt_dt=True,
         )
         return log_prob, prev_sample_mean, std_dev_t, sqrt_dt
+
+    @classmethod
+    def forward_and_sample_window(
+        cls,
+        module: ModelMixin,
+        scheduler: FlowMatchSDEDiscreteScheduler,
+        model_config: DiffusionModelConfig,
+        *,
+        all_latents: torch.Tensor,
+        all_timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run every SDE-window step in a single batched forward + scheduler call.
+
+        Folds the window axis ``W`` into the batch dimension so the transformer
+        executes one large matmul instead of ``W`` small ones, and the reverse-SDE
+        log-prob is computed in one ``sample_previous_step`` call. This is the
+        batched counterpart of :meth:`forward_and_sample_previous_step`; the
+        returned tensors carry the window axis explicitly so callers can stack
+        them along ``dim=1`` exactly as the per-step path did.
+
+        Args:
+            all_latents: ``(B, W+1, ...)`` trajectory; step ``s`` uses
+                ``all_latents[:, s]`` as the sample and ``all_latents[:, s+1]`` as
+                the realised ``prev_sample``.
+            all_timesteps: ``(B, W)`` per-step timesteps.
+            prompt_embeds / pooled_prompt_embeds: positive prompt conditioning,
+                shapes ``(B, L, D)`` and ``(B, Dp)``.
+            negative_*: optional CFG negative conditioning, same shapes.
+
+        Returns:
+            ``(log_prob, prev_sample_mean, std_dev_t, sqrt_dt)`` with window axis
+            restored: ``(B, W)``, ``(B, W, ...)``, ``(B, W, ...)``, ``(B, W)``.
+        """
+        # all_latents: (B, W+1, ...); sample = [:, :-1], prev_sample = [:, 1:]
+        sample = all_latents[:, :-1]
+        prev_sample = all_latents[:, 1:]
+        batch_size, window = sample.shape[0], sample.shape[1]
+        # Flatten (B, W, ...) -> (B*W, ...) for the transformer + scheduler.
+        sample_flat = sample.reshape(batch_size * window, *sample.shape[2:])
+        prev_sample_flat = prev_sample.reshape(batch_size * prev_sample.shape[1], *prev_sample.shape[2:])
+        timestep_flat = all_timesteps.reshape(batch_size * window)
+
+        # Expand prompt conditioning along the window axis: (B, L, D) -> (B*W, L, D).
+        prompt_embeds_flat = prompt_embeds.repeat_interleave(window, dim=0)
+        pooled_flat = pooled_prompt_embeds.repeat_interleave(window, dim=0)
+
+        model_inputs = cls.build_transformer_inputs(
+            latents=sample_flat,
+            timesteps=timestep_flat,
+            prompt_embeds=prompt_embeds_flat,
+            pooled_prompt_embeds=pooled_flat,
+        )
+        noise_pred = cls.forward(module, model_config, model_inputs)
+
+        guidance_scale = model_config.pipeline.guidance_scale
+        if guidance_scale is not None and guidance_scale > 1.0:
+            if negative_prompt_embeds is None or negative_pooled_prompt_embeds is None:
+                raise ValueError("SD3 CFG requires negative prompt embeds when guidance_scale > 1.")
+            neg_prompt_flat = negative_prompt_embeds.repeat_interleave(window, dim=0)
+            neg_pooled_flat = negative_pooled_prompt_embeds.repeat_interleave(window, dim=0)
+            negative_model_inputs = cls.build_transformer_inputs(
+                latents=sample_flat,
+                timesteps=timestep_flat,
+                prompt_embeds=neg_prompt_flat,
+                pooled_prompt_embeds=neg_pooled_flat,
+            )
+            neg_noise_pred = cls.forward(module, model_config, negative_model_inputs)
+            noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+
+        _, log_prob_flat, prev_sample_mean_flat, std_dev_t_flat, sqrt_dt_flat = scheduler.sample_previous_step(
+            sample=sample_flat.float(),
+            model_output=noise_pred.float(),
+            timestep=timestep_flat,
+            noise_level=model_config.algo.noise_level,
+            prev_sample=prev_sample_flat.float(),
+            sde_type=model_config.algo.sde_type,
+            return_logprobs=True,
+            return_sqrt_dt=True,
+        )
+
+        # Restore the window axis.
+        log_prob = log_prob_flat.reshape(batch_size, window)
+        prev_sample_mean = prev_sample_mean_flat.reshape(batch_size, window, *prev_sample_mean_flat.shape[1:])
+        std_dev_t = std_dev_t_flat.reshape(batch_size, window, *std_dev_t_flat.shape[1:])
+        sqrt_dt = sqrt_dt_flat.reshape(batch_size, window)
+        return log_prob, prev_sample_mean, std_dev_t, sqrt_dt
