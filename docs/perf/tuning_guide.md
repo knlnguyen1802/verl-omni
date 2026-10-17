@@ -1,7 +1,7 @@
 (tuning_guide)=
 # Performance Tuning Guide
 
-Last updated: 10/06/2026
+Last updated: 10/17/2026
 
 This page is the starting point for tuning a VeRL-Omni diffusion RL run. It
 does not repeat the detail already covered by the more specific pages —
@@ -121,10 +121,12 @@ Symptoms that show up regardless of which stage causes them:
   wall-clock time after rollout lands, and a very small one adds metadata
   syncs. Halving it typically pays off when `parameter_sync_step > 1`
   because every local update waits once.
-- Check what actually crosses TransferQueue per step. The rollout dump and
-  validation reads are field-projected (latents/embeds stay in
-  TransferQueue), and trajectory writes are batched per prompt group; if you
-  add custom reads, pass `select_fields` rather than fetching full rows.
+- Check what actually crosses TransferQueue per step. The rollout dump read
+  is field-projected (latents/embeds stay in TransferQueue); validation
+  deliberately stays a full read because the colocated reward model receives
+  that DataProto and may read any pipeline-emitted field. Trajectory writes
+  are batched per prompt group; if you add custom reads, pass `select_fields`
+  rather than fetching full rows.
 
 **Step time dominated by reward scoring**
 - Confirm with a profiler trace (recipe 6 in [profiler.md](profiler.md)) before

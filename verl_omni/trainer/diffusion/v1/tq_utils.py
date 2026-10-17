@@ -67,12 +67,15 @@ DUMP_MEDIA_ARTIFACT_NAMES = (
 # Fields consumed by the post-step rollout-dump read. Selecting them
 # explicitly keeps the dump from re-pulling the trainer-only compute payloads
 # (all_latents, prompt_embeds, ...) which dominate row size. Absent optional
-# fields (e.g. audio on image pipelines) are silently skipped by
-# TransferQueue's field selection.
+# fields are silently skipped by TransferQueue's field selection:
+# ``sample_level_scores`` is persisted by the colocated-reward trainer before
+# the dump (its preferred scores source), while async-reward rows carry only
+# ``rm_scores`` and keep that fallback.
 DIFFUSION_DUMP_TQ_FIELDS = (
     "prompts",
     "responses",
     "rm_scores",
+    "sample_level_scores",
     "reward_model",
     "data_source",
     "extra_info",

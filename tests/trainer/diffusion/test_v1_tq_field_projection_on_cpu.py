@@ -166,22 +166,29 @@ def test_metric_projection_is_subset_of_persisted_and_rollout_fields(algorithm):
 
 
 def test_rollout_dump_fetches_only_dump_fields(monkeypatch):
-    """The dump re-read must project fields instead of re-pulling latents/embeds."""
-    data = DataProto.from_dict(
-        tensors={
-            "prompts": torch.zeros(2, 4, dtype=torch.int64),
-            "responses": torch.zeros(2, 3, 8, 8, dtype=torch.uint8),
-            "sample_level_scores": torch.ones(2, 1),
-        },
-        non_tensors={
-            "reward_model": np.array([{"ground_truth": "gt"}, {"ground_truth": "gt"}], dtype=object),
-        },
-    )
+    """The dump re-read must project fields instead of re-pulling latents/embeds.
+
+    The stub honors the projection, so the colocated-reward case is exercised
+    for real: TransferQueue carries the persisted ``sample_level_scores`` and
+    no ``rm_scores``, and the dump must record those scores, not zeros.
+    """
+    tensors = {
+        "prompts": torch.zeros(2, 4, dtype=torch.int64),
+        "responses": torch.zeros(2, 3, 8, 8, dtype=torch.uint8),
+        "sample_level_scores": torch.tensor([[3.0], [7.0]]),
+    }
+    non_tensors = {
+        "reward_model": np.array([{"ground_truth": "gt"}, {"ground_truth": "gt"}], dtype=object),
+    }
     captured = {}
 
     def get_data(batch_meta, pad_token_id, select_fields):
         captured.update(select_fields=select_fields, pad_token_id=pad_token_id)
-        return data
+        # Mimic kv_batch_get's field selection: return only requested fields.
+        return DataProto.from_dict(
+            tensors={name: value for name, value in tensors.items() if name in select_fields},
+            non_tensors={name: value for name, value in non_tensors.items() if name in select_fields},
+        )
 
     monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", get_data)
     dumps = []
@@ -202,12 +209,16 @@ def test_rollout_dump_fetches_only_dump_fields(monkeypatch):
     trainer_base_module.PolicyGradientDiffusionTrainerV1._log_rollout_data(trainer, batch_meta, {}, "/tmp/dump")
 
     assert set(captured["select_fields"]) == set(tq_utils.DIFFUSION_DUMP_TQ_FIELDS)
+    assert "sample_level_scores" in captured["select_fields"]
     assert captured["pad_token_id"] == 7
     # Trainer-only compute payloads stay out of the dump read.
     assert "all_latents" not in captured["select_fields"]
     assert "prompt_embeds" not in captured["select_fields"]
     assert "old_log_probs" not in captured["select_fields"]
     assert len(dumps) == 1
+    # Rows are sorted by uid (prompt_0_0 first); the persisted
+    # sample_level_scores are dumped, not the [0.0, 0.0] no-scores fallback.
+    assert dumps[0]["scores"] == [7.0, 3.0]
 
 
 @pytest.mark.parametrize("policy_gradient", [True, False])
