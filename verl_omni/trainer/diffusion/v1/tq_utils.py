@@ -45,24 +45,9 @@ def diffusion_persisted_tq_fields(
     raise ValueError(f"Unsupported diffusion trainer algorithm: {algorithm}")
 
 
-# Artifact names an in-tree rollout adapter can declare (see each adapter's
-# ``diffusion_io_spec``). Their tensors ride top-level
-# ``media_artifact__<name>`` TransferQueue fields (the
-# ``rollout_media.ARTIFACT_PREFIX`` spelling) while the non-tensor
-# declarations ride the ``extra_fields`` envelope, so the dump projection
-# below must carry the tensors too: ``validate_artifacts`` raises on any
-# declared artifact whose tensor is missing from the read. The prefix is
-# spelled literally to keep this core trainer module free of the pipeline
-# package's import graph; ``test_v1_tq_field_projection_on_cpu.py`` enforces
-# that these names cover every artifact an in-tree adapter declares.
-DUMP_MEDIA_ARTIFACT_NAMES = (
-    "image_preview",
-    "image_latent",
-    "video_preview",
-    "video_latent",
-    "audio",
-    "audio_latent",
-)
+# ``rollout_media.ARTIFACT_PREFIX``, spelled literally to keep this core
+# trainer module free of the pipeline package's import graph.
+MEDIA_ARTIFACT_TQ_PREFIX = "media_artifact__"
 
 # Fields consumed by the post-step rollout-dump read. Selecting them
 # explicitly keeps the dump from re-pulling the trainer-only compute payloads
@@ -90,7 +75,23 @@ DIFFUSION_DUMP_TQ_FIELDS = (
     "audio",
     "audio_sample_rate",
     "media_kind",
-) + tuple(f"media_artifact__{name}" for name in DUMP_MEDIA_ARTIFACT_NAMES)
+)
+
+
+def diffusion_dump_tq_fields(batch_meta: KVBatchMeta) -> list[str]:
+    """Return the rollout-dump projection, including every stored media artifact.
+
+    Artifact names are adapter-defined (``DiffusionIOSpec``) and their
+    declarations ride ``extra_fields``; ``validate_artifacts`` raises on any
+    declared artifact whose ``media_artifact__<name>`` tensor is missing from
+    the read, so the names come from the stored schema, not a fixed list.
+    """
+    stored = (
+        tq.get_client()
+        .kv_retrieve_meta(keys=list(batch_meta.keys), partition_id=batch_meta.partition_id, create=False)
+        .field_names
+    )
+    return [*DIFFUSION_DUMP_TQ_FIELDS, *(name for name in stored if name.startswith(MEDIA_ARTIFACT_TQ_PREFIX))]
 
 
 def diffusion_metric_tq_fields(

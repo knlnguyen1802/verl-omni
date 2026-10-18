@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ast
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,6 +24,18 @@ from verl import DataProto
 from verl_omni.pipelines.rollout_media import ARTIFACT_PREFIX, previews_from_batch
 from verl_omni.trainer.diffusion.v1 import tq_utils
 from verl_omni.trainer.diffusion.v1 import trainer_base as trainer_base_module
+
+
+def _stub_tq_stored_fields(monkeypatch, field_names):
+    """Stub the metadata-only schema lookup used to discover artifact fields."""
+    calls = []
+
+    def kv_retrieve_meta(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(field_names=sorted(field_names))
+
+    monkeypatch.setattr(tq_utils.tq, "get_client", lambda: SimpleNamespace(kv_retrieve_meta=kv_retrieve_meta))
+    return calls
 
 
 def test_tq_conversion_forwards_field_projection_and_unpacks_extra_fields(monkeypatch):
@@ -191,6 +201,9 @@ def test_rollout_dump_fetches_only_dump_fields(monkeypatch):
         )
 
     monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", get_data)
+    schema_calls = _stub_tq_stored_fields(
+        monkeypatch, [*tensors, *non_tensors, "all_latents", "prompt_embeds", "old_log_probs"]
+    )
     dumps = []
     trainer = SimpleNamespace(
         tokenizer=SimpleNamespace(pad_token_id=7, batch_decode=lambda ids, **kwargs: ["p", "p"]),
@@ -208,6 +221,7 @@ def test_rollout_dump_fetches_only_dump_fields(monkeypatch):
 
     trainer_base_module.PolicyGradientDiffusionTrainerV1._log_rollout_data(trainer, batch_meta, {}, "/tmp/dump")
 
+    assert schema_calls == [{"keys": ["prompt_1_0", "prompt_0_0"], "partition_id": "train", "create": False}]
     assert set(captured["select_fields"]) == set(tq_utils.DIFFUSION_DUMP_TQ_FIELDS)
     assert "sample_level_scores" in captured["select_fields"]
     assert captured["pad_token_id"] == 7
@@ -409,16 +423,18 @@ def test_metrics_ignores_padding_without_response_shape(monkeypatch, caplog):
     assert "2 trajectories, 1 real images, responses shape=(1, 3, 256, 256)" in caplog.text
 
 
-def test_rollout_dump_projection_restores_media_artifacts(monkeypatch):
+@pytest.mark.parametrize("preview_name", ["video_preview", "custom_preview"])
+def test_rollout_dump_projection_restores_media_artifacts(monkeypatch, preview_name):
     """Declared media artifacts must survive the dump's field projection.
 
     Regression test: the projection restored the extra_fields declarations
     but dropped the media_artifact__* tensors, so previews_from_batch raised
     "declared artifacts missing" and failed the training step's rollout dump
-    (MiniMax-H3 T2VA e2e).
+    (MiniMax-H3 T2VA e2e). Artifact names are adapter-defined, so a custom
+    name must be carried as well as the in-tree ones.
     """
     specs = {
-        "video_preview": {
+        preview_name: {
             "modality": "video",
             "representation": "decoded",
             "layout": "THWC",
@@ -450,35 +466,39 @@ def test_rollout_dump_projection_restores_media_artifacts(monkeypatch):
     envelope = {
         "media_artifact_specs": specs,
         "primary_artifact": "video_latent",
-        "preview_artifact": "video_preview",
+        "preview_artifact": preview_name,
         "media_artifact_context": "pipeline=MiniMaxH3Pipeline/flow_grpo, request_id=test",
         "min_global_steps": 1,
         "max_global_steps": 1,
+    }
+    stored = {
+        "prompts": torch.zeros(2, 4, dtype=torch.int64),
+        "responses": torch.zeros(2, 3, 8, 8, dtype=torch.uint8),
+        "uid": ["first", "second"],
+        "extra_fields": [dict(envelope), dict(envelope)],
+        "all_latents": torch.zeros(2, 3, 2, 4, 8, 8, dtype=torch.float32),
+        f"media_artifact__{preview_name}": torch.zeros(2, 4, 8, 8, 3, dtype=torch.uint8),
+        "media_artifact__audio": torch.zeros(2, 1, 16000, dtype=torch.float32),
+        "media_artifact__video_latent": torch.zeros(2, 2, 4, 8, 8, dtype=torch.float32),
+        "media_artifact__audio_latent": torch.zeros(2, 1, 400, 24, dtype=torch.float32),
     }
 
     def get_fields(select_fields=None, **kwargs):
         # Mimic kv_batch_get's field selection: keep only requested fields,
         # silently skipping absent ones (TransferQueue's documented contract).
-        fields = {
-            "prompts": torch.zeros(2, 4, dtype=torch.int64),
-            "responses": torch.zeros(2, 3, 8, 8, dtype=torch.uint8),
-            "uid": ["first", "second"],
-            "extra_fields": [dict(envelope), dict(envelope)],
-            "media_artifact__video_preview": torch.zeros(2, 4, 8, 8, 3, dtype=torch.uint8),
-            "media_artifact__audio": torch.zeros(2, 1, 16000, dtype=torch.float32),
-            "media_artifact__video_latent": torch.zeros(2, 2, 4, 8, 8, dtype=torch.float32),
-            "media_artifact__audio_latent": torch.zeros(2, 1, 400, 24, dtype=torch.float32),
-        }
         if select_fields is None:
-            return fields
-        return {name: value for name, value in fields.items() if name in select_fields}
+            return stored
+        return {name: value for name, value in stored.items() if name in select_fields}
 
     monkeypatch.setattr(tq_utils.tq, "kv_batch_get", get_fields)
+    _stub_tq_stored_fields(monkeypatch, stored)
+    batch_meta = SimpleNamespace(keys=["first_0_0", "second_0_0"], partition_id="train")
 
-    data = tq_utils.diffusion_tq_batch_to_dataproto(
-        SimpleNamespace(keys=["first_0_0", "second_0_0"], partition_id="train"),
-        select_fields=list(tq_utils.DIFFUSION_DUMP_TQ_FIELDS),
-    )
+    select_fields = tq_utils.diffusion_dump_tq_fields(batch_meta)
+    assert f"media_artifact__{preview_name}" in select_fields
+    assert "all_latents" not in select_fields
+
+    data = tq_utils.diffusion_tq_batch_to_dataproto(batch_meta, select_fields=select_fields)
 
     previews = previews_from_batch(data)
     assert previews is not None
@@ -491,42 +511,5 @@ def test_rollout_dump_projection_restores_media_artifacts(monkeypatch):
         assert preview.data.shape == (4, 3, 8, 8)
 
 
-def test_dump_projection_covers_every_declared_artifact_name():
-    """Every artifact name an in-tree adapter declares must survive the dump read.
-
-    Parses each adapter's ``diffusion_io_spec`` declaration instead of
-    importing it, so the check stays CPU-cheap and dependency-free.
-    """
-    adapters_dir = Path(__file__).parents[3] / "verl_omni" / "pipelines"
-    declared: dict[str, set[str]] = {}
-    for path in sorted(adapters_dir.glob("*/vllm_omni_rollout_adapter.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        names: set[str] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            if not any(isinstance(target, ast.Name) and target.id == "diffusion_io_spec" for target in node.targets):
-                continue
-            for keyword in getattr(node.value, "keywords", []):
-                if keyword.arg != "artifacts" or not isinstance(keyword.value, ast.Dict):
-                    continue
-                names.update(
-                    key.value
-                    for key in keyword.value.keys
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
-                )
-        if names:
-            declared[path.parent.name] = names
-
-    # Sanity: the AST walker still finds the in-tree declarations.
-    assert len(declared) >= 10, f"expected adapter io_spec declarations, found {sorted(declared)}"
-    missing = {
-        f"{adapter}:{name}"
-        for adapter, names in declared.items()
-        for name in names
-        if f"{ARTIFACT_PREFIX}{name}" not in tq_utils.DIFFUSION_DUMP_TQ_FIELDS
-    }
-    assert not missing, (
-        "DIFFUSION_DUMP_TQ_FIELDS lacks artifact tensors declared by in-tree "
-        f"adapters; add the names to DUMP_MEDIA_ARTIFACT_NAMES: {sorted(missing)}"
-    )
+def test_dump_artifact_prefix_matches_rollout_media():
+    assert tq_utils.MEDIA_ARTIFACT_TQ_PREFIX == ARTIFACT_PREFIX

@@ -96,8 +96,8 @@ from verl_omni.trainer.diffusion.rollout_correction import (
 )
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
 from verl_omni.trainer.diffusion.v1.tq_utils import (
-    DIFFUSION_DUMP_TQ_FIELDS,
     canonicalize_diffusion_tq_meta,
+    diffusion_dump_tq_fields,
     diffusion_metric_tq_fields,
     diffusion_persisted_tq_fields,
     diffusion_tq_batch_to_dataproto,
@@ -1749,7 +1749,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             data = diffusion_tq_batch_to_dataproto(
                 batch_meta,
                 pad_token_id=self.tokenizer.pad_token_id or 0,
-                select_fields=list(DIFFUSION_DUMP_TQ_FIELDS),
+                select_fields=diffusion_dump_tq_fields(batch_meta),
             )
             inputs = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
             outputs = data.batch["responses"]
