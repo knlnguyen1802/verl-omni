@@ -615,14 +615,14 @@ were already being taken, promoted to the metrics dict; see
 |--------|---------|
 | `timing_s/sample_wait/total` | Wall time inside `replay_buffer.sample()` |
 | `timing_s/sample_wait/generation_bound` | Wait while the needed trajectories were still generating (rollout-bound idle) |
-| `timing_s/sample_wait/detection` | Completion-to-discovery latency: finished rows waiting unseen for the next poll (recoverable by a smaller `poll_interval`) |
+| `timing_s/sample_wait/detection` | Batch-readiness discovery latency: how long the group that completed the requested batch sat between publication and the poll that made the batch sampleable (recoverable by a smaller `poll_interval`) |
 | `timing_s/sample_wait/metadata_sync` | `kv_list` metadata round trips while polling |
 | `timing_s/sample_wait/eviction` | Stale / DAPO / failure eviction passes |
 | `timing_s/sample_wait/polls` | Poll iterations while waiting |
 | `timing_s/sample_wait/buffer_*` | Pending / running / finished group counts seen while waiting |
 | `timing_s/tq_get` | Trainer-side TransferQueue payload reads (`kv_batch_get`) |
 | `tq/get/bytes` | Bytes fetched by the timed `kv_batch_get` reads (pairs with `timing_s/tq_get` for a GB/s figure) |
-| `tq/put/seconds`, `tq/put/bytes`, `tq/put/bytes_per_second` | Rollout-side writes of the sampled trajectories (attributed via row tags) |
+| `tq/put/seconds`, `tq/put/bytes`, `tq/put/bytes_per_second` | Rollout-side writes of the sampled trajectories (attributed via row tags); counters sum across the step's local updates, the rate is derived from the step sums |
 | `weight_sync/phase/{abort,kv_release,topology,transfer_and_finalize,kv_resume,generation_resume}_s` | Per-phase breakdown of the standalone weight sync |
 | `weight_sync/total_s`, `weight_sync/replicas` | Whole sync window and replica count |
 | `separate_async/switch/cost_to_trainer_s`, `..._to_rollout_s` | Rolling mean hybrid-switch costs |
@@ -630,9 +630,12 @@ were already being taken, promoted to the metrics dict; see
 | `separate_async/idle_ratio/{generation_bound,detection,metadata_sync,eviction}` | Idle decomposition |
 
 The wait split is event-based, not sleep-based: the rollout stamps each
-written row with its arrival time, and the buffer measures how long finished
-rows sat unseen between polls. Plain poll-sleep time cannot make this split —
-a slow generation and a coarse `poll_interval` both show up as sleep.
+written row with the moment its payload put completed, and the buffer charges
+detection once, at the poll where the requested batch first became sampleable
+-- earlier-completing groups were waited on for their generation, so their
+undiscovered time stays in `generation_bound`. Plain poll-sleep time cannot
+make this split — a slow generation and a coarse `poll_interval` both show up
+as sleep.
 
 Read them straight off wandb / TensorBoard, or point
 [`scripts/analyze_step_metrics.py`](https://github.com/verl-project/verl-omni/blob/main/scripts/analyze_step_metrics.py)

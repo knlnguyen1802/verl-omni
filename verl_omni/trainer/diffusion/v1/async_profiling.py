@@ -39,11 +39,19 @@ from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
 
 # Tag keys written by ``DiffusionAgentLoopWorkerTQ._write_trajectories_to_tq``
 # and summed by :func:`aggregate_tq_write_stats`. ``tq_put_at`` (wall-clock
-# seconds) is the arrival event the wait decomposition keys on; keep in sync
-# with the rollout writer's stamping.
+# seconds) is the completed-publication boundary the wait decomposition keys
+# on; keep in sync with the rollout writer's stamping.
 TQ_PUT_SECONDS_TAG = "tq_put_s"
 TQ_PAYLOAD_BYTES_TAG = "tq_payload_bytes"
 TQ_PUT_AT_TAG = "tq_put_at"
+
+# Per-local-update totals that must sum across the ``parameter_sync_step``
+# updates of one outer step: ``MetricsAggregator``'s default rule is
+# weighted_avg, which would undercount every one of them. The step-level
+# rate is derived from the summed bytes and seconds by
+# :func:`derive_tq_put_rate` -- averaging per-update rates misstates
+# throughput when updates carry different durations.
+TQ_COUNTER_METRICS = ("tq/put/rows", "tq/put/seconds", "tq/put/bytes", "tq/get/bytes")
 
 
 class ProfiledReplayBufferAsync(ReplayBufferAsync):
@@ -60,13 +68,17 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
 
     - ``sample_wait/generation_bound`` -- wait while the needed trajectories
       were still generating (residual: total minus the segments below);
-    - ``sample_wait/detection`` -- completion-to-discovery latency: how long
-      already-finished rows sat unseen between their put and the sync that
-      discovered them (this is the part a smaller ``poll_interval``
-      recovers);
+    - ``sample_wait/detection`` -- batch-readiness discovery latency: how long
+      the group that completed the requested batch sat unseen between its
+      publication and the sync at which the batch became sampleable (this is
+      the part a smaller ``poll_interval`` recovers);
     - ``sample_wait/metadata_sync`` -- ``kv_list`` round trips;
     - ``sample_wait/eviction`` -- stale/DAPO/failure eviction passes.
 
+    Detection is charged once per window, at the sampleability transition:
+    rows discovered before the batch is sampleable were waited on for their
+    generation, so their undiscovered time stays in ``generation_bound``, and
+    a window that opens with the batch already sampleable charges nothing.
     Rows written by older writers carry no ``tq_put_at`` and fall back into
     ``generation_bound``; rows tagged before the window started are likewise
     excluded from detection, since they arrived while the trainer was not
@@ -92,6 +104,13 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
         self._poll_depths: list[tuple[int, int, int]] = []
         self._seen_trajectory_keys: dict[str, set[str]] = {}
         self._last_sync_wall_time: float | None = None
+        # Batch-readiness attribution: each profiled sync stages the detection
+        # it discovered per partition; ``_has_enough_samples`` commits it only
+        # when that sync's check turns the window from waiting to ready, so
+        # discoveries the batch does not need yet stay in generation_bound.
+        self._sync_detection_candidates: dict[str, float] = {}
+        self._sampleable_latched = False
+        self._sampleable_at_window_open = False
         self.last_sample_timing: dict[str, float] = {}
 
     # -- timed segments ----------------------------------------------------
@@ -123,7 +142,9 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
                         # Clamping bounds clock skew between the rollout writer
                         # and this process to the inter-sync window.
                         detection = min(max(now - max(arrivals), 0.0), now - window_start)
-                        self._segment_timings["detection"] += detection
+                        self._sync_detection_candidates[partition_id] = detection
+                    else:
+                        self._sync_detection_candidates[partition_id] = 0.0
                 self._seen_trajectory_keys[partition_id] = current
             if self._profiling_active:
                 self._last_sync_wall_time = now
@@ -155,7 +176,7 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
 
     # -- profiling window --------------------------------------------------
 
-    def _begin_profile_window(self) -> None:
+    def _begin_profile_window(self, global_steps: int, partition_id: str, target_count: int) -> None:
         # sample() wraps wait_for_sampleable(); the nested call must not reset
         # the outer window's accumulators.
         self._window_depth += 1
@@ -164,6 +185,16 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
         self._segment_timings = defaultdict(float)
         self._poll_depths = []
         self._last_sync_wall_time = time.time()
+        self._sync_detection_candidates = {}
+        self._sampleable_latched = False
+        # Sampleability of the last-synced state: a window that opens with the
+        # batch already ready never waits, so it must not charge detection for
+        # rows it happens to discover. Cache-only reads -- the wait loop's own
+        # first iteration evaluates the same state.
+        eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
+        self._sampleable_at_window_open = (
+            len(self._sampleable_terminal_keys(partition_id, eviction_reasons)) >= target_count
+        )
         self._profiling_active = True
 
     def _end_profile_window(self, total_seconds: float) -> None:
@@ -193,8 +224,21 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
             timings["sample_wait/buffer_running_mean"] = sum(running) / len(running)
         self.last_sample_timing = timings
 
+    def _has_enough_samples(
+        self, global_steps: int, partition_id: str, batch_size: int, sampleable_keys: set[str]
+    ) -> bool:
+        result = super()._has_enough_samples(global_steps, partition_id, batch_size, sampleable_keys)
+        if self._profiling_active and result and not self._sampleable_latched:
+            self._sampleable_latched = True
+            if not self._sampleable_at_window_open:
+                # The sync that discovered the completing group stages its
+                # detection in the candidate; waits for earlier-completing
+                # groups were generation-bound and stay in the residual.
+                self._segment_timings["detection"] += self._sync_detection_candidates.get(partition_id, 0.0)
+        return result
+
     def wait_for_sampleable(self, global_steps: int, partition_id: str, target_count: int):
-        self._begin_profile_window()
+        self._begin_profile_window(global_steps, partition_id, target_count)
         start = time.perf_counter()
         try:
             return super().wait_for_sampleable(global_steps, partition_id, target_count)
@@ -202,7 +246,7 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
             self._end_profile_window(time.perf_counter() - start)
 
     def sample(self, global_steps: int, partition_id: str, batch_size: int):
-        self._begin_profile_window()
+        self._begin_profile_window(global_steps, partition_id, batch_size)
         start = time.perf_counter()
         try:
             return super().sample(global_steps, partition_id, batch_size)
@@ -217,7 +261,11 @@ def aggregate_tq_write_stats(batch_meta) -> dict[str, float]:
     of its ``kv_batch_put`` and the payload bytes it carried. Rows written by
     older writers (or tag-only prompt rows filtered out before this point)
     simply lack the keys and are skipped, so the aggregation degrades to zero
-    rather than error.
+    rather than error. The totals are per local update: the trainer's
+    aggregator sums them across the step (:data:`TQ_COUNTER_METRICS`) and
+    :func:`derive_tq_put_rate` derives the step-level rate from the sums --
+    per-update rates weighted-averaged by the aggregator would misstate
+    throughput, so this function emits none.
     """
     put_seconds = 0.0
     payload_bytes = 0
@@ -230,14 +278,23 @@ def aggregate_tq_write_stats(batch_meta) -> dict[str, float]:
             put_seconds += float(seconds)
             tagged_rows += 1
         payload_bytes += int(tag.get(TQ_PAYLOAD_BYTES_TAG, 0) or 0)
-    metrics: dict[str, float] = {
+    return {
         "tq/put/rows": float(tagged_rows),
         "tq/put/seconds": put_seconds,
         "tq/put/bytes": float(payload_bytes),
     }
-    if put_seconds > 0 and payload_bytes > 0:
-        metrics["tq/put/bytes_per_second"] = payload_bytes / put_seconds
-    return metrics
+
+
+def derive_tq_put_rate(step_metrics: dict[str, float]) -> None:
+    """Fill ``tq/put/bytes_per_second`` from the step-summed bytes and seconds.
+
+    Call after the aggregator has summed the per-update counters; the rate is
+    a property of the whole outer step, not of any single local update.
+    """
+    put_bytes = step_metrics.get("tq/put/bytes", 0.0)
+    put_seconds = step_metrics.get("tq/put/seconds", 0.0)
+    if put_bytes > 0 and put_seconds > 0:
+        step_metrics["tq/put/bytes_per_second"] = put_bytes / put_seconds
 
 
 def tensordict_payload_bytes(data) -> int:

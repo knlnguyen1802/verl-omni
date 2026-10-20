@@ -35,6 +35,7 @@ from verl_omni.trainer.diffusion.v1.async_profiling import (
     TQ_PUT_SECONDS_TAG,
     ProfiledReplayBufferAsync,
     aggregate_tq_write_stats,
+    derive_tq_put_rate,
     tensordict_payload_bytes,
 )
 from verl_omni.workers.checkpoint_engine import (
@@ -153,7 +154,10 @@ def test_row_arriving_before_first_sync_counts_detection(monkeypatch):
     real_kv_list = fake_tq.kv_list
 
     def kv_list_publishing_row():
-        fake_tq.add_finished_group("uida", put_at=time.time())
+        # The first sync stalls mid-flight and the row lands inside that gap,
+        # so its unseen time (put_at -> discovery) is real and in-window.
+        time.sleep(0.02)
+        fake_tq.add_finished_group("uida", put_at=time.time() - 0.01)
         return real_kv_list()
 
     monkeypatch.setattr(replay_buffer_module.tq, "kv_list", kv_list_publishing_row)
@@ -246,6 +250,44 @@ def test_rows_without_arrival_timestamp_fall_back_to_generation_bound(monkeypatc
     assert timing["sample_wait/generation_bound"] >= 0.06
 
 
+def test_detection_charged_at_sampleability_transition(monkeypatch):
+    """Staggered arrivals: only the completing group's discovery is detection.
+
+    Two groups are required. A completes early and is discovered mid-wait,
+    B completes the batch last: A's undiscovered window is generation-bound
+    wait (the trainer could not have sampled anyway), so detection must cover
+    only B's publication-to-discovery latency -- not the sum over both.
+    """
+    fake_tq = _FakeTransferQueue({})
+    _patch_transfer_queue(monkeypatch, fake_tq)
+    real_kv_list = fake_tq.kv_list
+    start = time.time()
+
+    def kv_list_staggered():
+        now = time.time()
+        elapsed = now - start
+        if elapsed > 0.10 and "uida" not in fake_tq.items["train"]:
+            # A completed near the 0.02 boundary but is discovered only here.
+            fake_tq.add_finished_group("uida", put_at=start + 0.02)
+        if elapsed > 0.16 and "uidb" not in fake_tq.items["train"]:
+            # B completes the requested batch right before this poll.
+            fake_tq.add_finished_group("uidb", put_at=now - 0.01)
+        return real_kv_list()
+
+    monkeypatch.setattr(replay_buffer_module.tq, "kv_list", kv_list_staggered)
+
+    buffer = _make_profiled_buffer(poll_interval=0.02)
+    meta, _eviction = buffer.sample(global_steps=1, partition_id="train", batch_size=2)
+
+    timing = buffer.last_sample_timing
+    assert len(meta.keys) == 2
+    # B's latency only (~0.01s): charging A's ~0.08s of undiscovered wait
+    # here would mislabel a rollout bottleneck as polling overhead.
+    assert timing["sample_wait/detection"] < 0.04
+    assert timing["sample_wait/generation_bound"] >= 0.05
+    assert timing["sample_wait/generation_bound"] > timing["sample_wait/detection"]
+
+
 def test_incidental_metadata_syncs_are_not_profiled(monkeypatch):
     """get_sampleable_count runs outside the profiling window by design."""
     fake_tq = _FakeTransferQueue({})
@@ -270,7 +312,38 @@ def test_aggregate_tq_write_stats_sums_tags():
     assert stats["tq/put/rows"] == 3.0
     assert stats["tq/put/seconds"] == pytest.approx(3.0)
     assert stats["tq/put/bytes"] == 400.0
-    assert stats["tq/put/bytes_per_second"] == pytest.approx(400.0 / 3.0)
+    # The rate is a whole-step property derived from the summed counters, not
+    # something the aggregator could average per update.
+    assert "tq/put/bytes_per_second" not in stats
+
+
+def test_tq_put_counters_sum_across_local_updates():
+    """With parameter_sync_step > 1 the counters must sum, not weighted-average.
+
+    Two one-row updates carrying 100 bytes in 1 s and 2 s must log 2 rows /
+    200 bytes / 3 s, with the rate derived from those sums -- averaging the
+    per-update rates (66.7 and 50 B/s) would misstate the throughput.
+    """
+    from verl.trainer.ppo.v1.utils import MetricsAggregator
+
+    from verl_omni.trainer.diffusion.v1.trainer_base import configure_step_metrics_aggregator
+
+    aggregator = configure_step_metrics_aggregator(MetricsAggregator())
+    aggregator.add_step_metrics(
+        {"tq/put/rows": 1.0, "tq/put/seconds": 1.0, "tq/put/bytes": 100.0, "tq/get/bytes": 500.0},
+        sample_count=1,
+    )
+    aggregator.add_step_metrics(
+        {"tq/put/rows": 1.0, "tq/put/seconds": 2.0, "tq/put/bytes": 100.0, "tq/get/bytes": 1500.0},
+        sample_count=1,
+    )
+    step_metrics = aggregator.get_aggregated_metrics()
+    derive_tq_put_rate(step_metrics)
+    assert step_metrics["tq/put/rows"] == 2.0
+    assert step_metrics["tq/put/seconds"] == pytest.approx(3.0)
+    assert step_metrics["tq/put/bytes"] == 200.0
+    assert step_metrics["tq/get/bytes"] == 2000.0
+    assert step_metrics["tq/put/bytes_per_second"] == pytest.approx(200.0 / 3.0)
 
 
 def test_aggregate_tq_write_stats_empty_and_untagged():
@@ -301,15 +374,22 @@ def test_tensordict_payload_bytes_counts_tensor_columns():
 def test_tq_write_accounting_reaches_the_queue(monkeypatch):
     """The write-side accounting tags must survive the producer->queue round trip.
 
-    The fake queue copies tags at the send boundary (like the real controller);
-    mutating the local dicts after the put would leave these assertions empty.
+    The fake queue copies tags at the send boundary (like the real controller)
+    and the payload put itself takes time, so the completion stamps provably
+    exclude the transfer duration; mutating the local dicts after the put
+    would leave these assertions empty.
     """
     import transfer_queue as tq_module
 
     store: dict[str, dict] = {}
     calls: list[dict] = []
+    payload_completed_at = 0.0
 
     async def fake_async_kv_batch_put(*, keys, partition_id, fields=None, tags=None, **kwargs):
+        nonlocal payload_completed_at
+        if fields is not None:
+            await asyncio.sleep(0.05)  # the payload upload takes time
+            payload_completed_at = time.time()
         calls.append({"keys": list(keys), "fields": fields, "tags": [dict(t) for t in (tags or [])]})
         # Controller-side semantics: a put merges the new tag into the stored
         # row tag (TransferQueue BatchMeta.update_custom_meta).
@@ -348,7 +428,6 @@ def test_tq_write_accounting_reaches_the_queue(monkeypatch):
         ),
     ]
     worker = object.__new__(worker_cls)
-    before = time.time()
     asyncio.run(
         worker._write_trajectories_to_tq(
             outputs,
@@ -365,18 +444,19 @@ def test_tq_write_accounting_reaches_the_queue(monkeypatch):
     assert payload_put["fields"] is not None
     assert completion_put["fields"] is None
     assert completion_put["keys"] == payload_put["keys"]
-    # Bytes and the put start time rode the payload put itself.
+    # Bytes rode the payload put itself.
     for tag in payload_put["tags"]:
         assert tag[TQ_PAYLOAD_BYTES_TAG] > 0
-        assert before <= tag[TQ_PUT_AT_TAG] <= time.time()
-    # The completed duration reached the stored rows via the tag-only update.
-    per_row_seconds = {tag[TQ_PUT_SECONDS_TAG] for tag in completion_put["tags"]}
-    assert len(per_row_seconds) == 1
-    assert next(iter(per_row_seconds)) > 0.0
+    # The completion update carries the put duration and the publication
+    # boundary -- stamped after the transfer finished, not when it started,
+    # so the trainer's detection never bills the upload to polling.
+    for tag in completion_put["tags"]:
+        assert tag[TQ_PUT_SECONDS_TAG] > 0.0
+        assert tag[TQ_PUT_AT_TAG] >= payload_completed_at
     for key in ("uida_0_0", "uida_1_0"):
         assert store[key][TQ_PAYLOAD_BYTES_TAG] > 0
         assert store[key][TQ_PUT_SECONDS_TAG] > 0.0
-        assert TQ_PUT_AT_TAG in store[key]
+        assert store[key][TQ_PUT_AT_TAG] >= payload_completed_at
 
 
 # -- weight-sync phase timer -------------------------------------------------

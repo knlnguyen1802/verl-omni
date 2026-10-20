@@ -300,12 +300,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                 tag["gen_batch_seq"] = int(gen_batch_seq)
             rows.setdefault(tuple(field.keys()), []).append((key, field, tag))
 
-        # Rollout-side transfer accounting (issue #712): payload bytes and the
-        # put's start time must ride the payload put itself -- anything stamped
-        # only into these local dicts after that call never reaches the
-        # TransferQueue controller. The completed put's wall time follows as a
-        # tag-only update, the queue's documented tag-merge path; it is split
-        # evenly across the rows of its put. Aggregation happens in
+        # Rollout-side transfer accounting: payload bytes must ride the
+        # payload put itself -- anything stamped only into these local dicts
+        # after that call never reaches the TransferQueue controller. The
+        # completed put's wall time and its publication boundary follow as a
+        # tag-only update, the queue's documented tag-merge path; both are
+        # split evenly across the rows of their put. Aggregation happens in
         # aggregate_tq_write_stats on the trainer side.
         from verl_omni.trainer.diffusion.v1.async_profiling import (
             TQ_PAYLOAD_BYTES_TAG,
@@ -318,7 +318,6 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                 tag[TQ_PAYLOAD_BYTES_TAG] = sum(
                     value.nbytes for value in field.values() if isinstance(value, torch.Tensor)
                 )
-                tag[TQ_PUT_AT_TAG] = time.time()
             put_start = time.perf_counter()
             await tq.async_kv_batch_put(
                 keys=[key for key, _field, _tag in group_rows],
@@ -327,9 +326,15 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                 partition_id=partition_id,
             )
             put_seconds = time.perf_counter() - put_start
+            # ``tq_put_at`` is the completed-publication boundary: the
+            # trainer's wait decomposition keys on when rows became readable,
+            # so stamping the upload start here would bill the transfer to
+            # polling latency.
+            published_at = time.time()
+            completion_tag = {TQ_PUT_SECONDS_TAG: put_seconds / len(group_rows), TQ_PUT_AT_TAG: published_at}
             await tq.async_kv_batch_put(
                 keys=[key for key, _field, _tag in group_rows],
-                tags=[{TQ_PUT_SECONDS_TAG: put_seconds / len(group_rows)}] * len(group_rows),
+                tags=[completion_tag] * len(group_rows),
                 partition_id=partition_id,
             )
 

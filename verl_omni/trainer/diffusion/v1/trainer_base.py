@@ -97,7 +97,9 @@ from verl_omni.trainer.diffusion.rollout_correction import (
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
 from verl_omni.trainer.diffusion.v1.async_profiling import (
     ProfiledReplayBufferAsync,
+    TQ_COUNTER_METRICS,
     aggregate_tq_write_stats,
+    derive_tq_put_rate,
 )
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     canonicalize_diffusion_tq_meta,
@@ -121,6 +123,26 @@ from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def configure_step_metrics_aggregator(aggregator: MetricsAggregator) -> MetricsAggregator:
+    """Pin the aggregation rules for one outer step's local-update metrics.
+
+    The aggregator's default rule is weighted_avg, but per-update totals must
+    sum across the ``parameter_sync_step`` updates: transfer counters
+    (:data:`TQ_COUNTER_METRICS`) and the rollout-failure counters would
+    otherwise undercount every step with more than one update.
+    """
+    aggregator.aggregation_rules["sum"].extend(
+        [
+            *TQ_COUNTER_METRICS,
+            "training/rollout_failure/evicted_groups",
+            "training/rollout_failure/evicted_trajectories",
+            "training/rollout_failure/refilled_prompts",
+            "training/rollout_failure/refill_rounds",
+        ]
+    )
+    return aggregator
 
 
 def _tq_supports_checkpoint() -> bool:
@@ -459,15 +481,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         prepare_metrics = self.prepare_step()
 
-        metrics_aggregator = MetricsAggregator()
-        metrics_aggregator.aggregation_rules["sum"].extend(
-            [
-                "training/rollout_failure/evicted_groups",
-                "training/rollout_failure/evicted_trajectories",
-                "training/rollout_failure/refilled_prompts",
-                "training/rollout_failure/refill_rounds",
-            ]
-        )
+        metrics_aggregator = configure_step_metrics_aggregator(MetricsAggregator())
         if prepare_metrics:
             metrics_aggregator.add_step_metrics(prepare_metrics)
         prefetched_batches = None
@@ -503,6 +517,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             combined_partition_id = batch.partition_id
 
         metrics.update(metrics_aggregator.get_aggregated_metrics())
+        derive_tq_put_rate(metrics)
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def prepare_step(self) -> dict:
