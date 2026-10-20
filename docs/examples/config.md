@@ -193,27 +193,33 @@ actor_rollout_ref:
 #### LoRA config resolution
 
 `verl_omni.utils.config.resolve_lora_config` is the single authority for LoRA
-configuration; trainer entry points and engines read its `LoRASettings` instead of
-the raw keys. Resolution rules:
+configuration; trainer entry points read its `LoRASettings` instead of the raw
+keys. The engine wrap gates still read the raw keys and cutover when engine
+gating unifies (#693). Resolution rules:
 
 - The rank is the flat `actor_rollout_ref.model.lora_rank`. A nested
   `model.lora.rank` set without the flat key raises a `ValueError` ("set
-  `lora_rank`"): every engine gate reads the flat spelling, so a nested-only
+  `lora_rank`"): the engine rank gates read the flat spelling, so a nested-only
   value would silently run full-parameter training where LoRA was intended.
   Setting both spellings to different positive values also raises.
 - `merge` is read only from the nested `actor_rollout_ref.model.lora.merge`.
 - The adapter path is the flat `actor_rollout_ref.model.lora_adapter_path`,
   same rule as rank: a nested-only `lora.adapter_path` raises; setting both
-  spellings to different paths raises a `ValueError`.
+  spellings to different paths raises a `ValueError`. The FSDP wrap gate keys
+  on rank only, so pair an adapter with `lora_rank` until engine gating
+  unifies (#693): a rank-0 adapter path enables LoRA for the trainer without
+  the engine wrapping PEFT.
 - `alpha` is read only from the flat `actor_rollout_ref.model.lora_alpha`. The
   nested `lora.alpha` key is Megatron grammar and is unread: composed omni configs
   currently carry `lora.alpha: 32` next to `lora_alpha: 16` (both injected from
   verl's default tree), and that disagreement is ignored until one of the two
   defaults changes.
-- Nested `model.lora` keys beyond `merge`/`rank` are Megatron grammar that verl's
-  default config tree injects into every composed config. They are
-  tolerated-but-unread; any other nested key raises a `ValueError` — remove
-  the override, or bump the verl pin if the key comes from a newer verl default.
+- Nested `model.lora` keys beyond `merge`/`rank`/`adapter_path` are Megatron
+  grammar that verl's default config tree injects into every composed config.
+  They are tolerated-but-unread; any other nested key raises a `ValueError` —
+  remove the override, or bump the verl pin if the key comes from a newer verl
+  default. The pinned `adapter_path` follows the rule above: the `null` the
+  composed configs carry is tolerated; a set value raises.
 - `actor_rollout_ref.model.policy_state_adapters` accepts only `default`, `old`,
   and `reference`; `default` is always forced first because it is the trained policy.
 

@@ -66,14 +66,21 @@ def _validate_delta_sharded(config: Any) -> None:
         )
 
     model_key = "actor_rollout_ref.model"
-    settings = resolve_lora_config(_select(config, model_key))
+    # A resolver ValueError means LoRA was requested in some spelling; its flat-key
+    # hint is a dead end where the flat key is refused too.
+    delta_lora_error = (
+        "checkpoint_engine.backend='omni_delta_sharded' requires full-weight training; LoRA is "
+        "refused in either merge mode because the shard export's names and values differ "
+        "from the adapter (merge=false) and merged (merge=true) full exports."
+    )
+    try:
+        settings = resolve_lora_config(_select(config, model_key))
+    except ValueError as e:
+        raise ValueError(delta_lora_error) from e
     if settings.enabled:
         raise ValueError(
-            "checkpoint_engine.backend='omni_delta_sharded' requires full-weight training; LoRA is "
-            "refused in either merge mode because the shard export's names and values differ "
-            "from the adapter (merge=false) and merged (merge=true) full exports. "
-            f"Resolved LoRA settings for {model_key}: rank={settings.rank}, "
-            f"adapter_path={settings.adapter_path!r}, merge={settings.merge}."
+            f"{delta_lora_error} Resolved LoRA settings for {model_key}: "
+            f"rank={settings.rank}, adapter_path={settings.adapter_path!r}, merge={settings.merge}."
         )
 
     for qat_path in ("actor_rollout_ref.actor.fsdp_config.qat.enable", "actor_rollout_ref.actor.megatron.qat.enable"):
@@ -179,8 +186,9 @@ KNOWN_POLICY_STATES = ("default", "old", "reference")
 class LoRASettings:
     """Normalized LoRA policy resolved from ``actor_rollout_ref.model``.
 
-    The single authority for LoRA configuration: trainer entry points and
-    engines read this instead of re-deriving the flat vs nested spellings.
+    The single authority for LoRA configuration: trainer entry points read
+    this instead of re-deriving the flat vs nested spellings. Engine wrap
+    gates still read the raw keys until engine gating unifies.
     """
 
     rank: int  # flat lora_rank (a nested-only lora.rank raises in the resolver)

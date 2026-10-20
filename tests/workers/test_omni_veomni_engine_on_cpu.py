@@ -178,22 +178,22 @@ def test_engine_requires_prompt_boundaries(backend_setup):
 
 
 @pytest.mark.parametrize(
-    ("owner", "key", "value", "raises"),
+    ("owner", "key", "value"),
     [
-        ("model_config", "model_stage", "talker", NotImplementedError),
-        ("model_config", "lora_rank", 8, NotImplementedError),
-        # Nested-only rank is rejected by the resolver before the engine guard.
-        ("model_config", "lora", {"rank": 8}, ValueError),
-        ("model_config", "lora_adapter_path", "existing-adapter", NotImplementedError),
-        ("model_config", "trainer_type", "direct_preference", NotImplementedError),
-        ("model_config", "use_remove_padding", False, NotImplementedError),
-        ("engine_config", "ulysses_parallel_size", 2, NotImplementedError),
+        ("model_config", "model_stage", "talker"),
+        ("model_config", "lora_rank", 8),
+        # setup_backend re-raises resolver errors as the engine's NotImplementedError.
+        ("model_config", "lora", {"rank": 8}),
+        ("model_config", "lora_adapter_path", "existing-adapter"),
+        ("model_config", "trainer_type", "direct_preference"),
+        ("model_config", "use_remove_padding", False),
+        ("engine_config", "ulysses_parallel_size", 2),
     ],
 )
-def test_engine_rejects_unsupported_config_before_model_loading(owner, key, value, raises, backend_setup):
+def test_engine_rejects_unsupported_config_before_model_loading(owner, key, value, backend_setup):
     engine = _engine()
     setattr(getattr(engine, owner), key, value)
-    with pytest.raises(raises):
+    with pytest.raises(NotImplementedError):
         engine._get_model_config_path()
     backend_setup[1].assert_not_called()
 

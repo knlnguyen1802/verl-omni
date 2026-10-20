@@ -129,19 +129,14 @@ def test_separate_trainer_rejects_missing_reference_mapping(separate_config):
 
 
 @pytest.mark.parametrize(
-    ("path", "value", "match"),
+    ("path", "value"),
     [
-        # Nested-only rank is rejected by the resolver before the separate-mode check.
-        ("actor_rollout_ref.model.lora.rank", 8, "set actor_rollout_ref.model.lora_rank"),
-        ("actor_rollout_ref.model.lora_rank", 8, "Separate mode currently supports full finetuning only"),
-        (
-            "actor_rollout_ref.model.lora_adapter_path",
-            "/tmp/adapter",
-            "Separate mode currently supports full finetuning only",
-        ),
+        ("actor_rollout_ref.model.lora.rank", 8),
+        ("actor_rollout_ref.model.lora_rank", 8),
+        ("actor_rollout_ref.model.lora_adapter_path", "/tmp/adapter"),
     ],
 )
-def test_lora_separate_fails_before_ray_initialization(monkeypatch, separate_config, path, value, match):
+def test_lora_separate_fails_before_ray_initialization(monkeypatch, separate_config, path, value):
     config = copy.deepcopy(separate_config)
     OmegaConf.update(config, path, value, force_add=True)
     monkeypatch.setattr(
@@ -150,7 +145,9 @@ def test_lora_separate_fails_before_ray_initialization(monkeypatch, separate_con
         lambda: pytest.fail("Ray must not be inspected before separate LoRA validation"),
     )
 
-    with pytest.raises(ValueError, match=match):
+    # validate_separate_config re-raises any resolver error as its own message:
+    # the flat-key hint dead-ends where the flat key is refused too.
+    with pytest.raises(ValueError, match="Separate mode currently supports full finetuning only"):
         main_diffusion.run_diffusion(config)
 
 

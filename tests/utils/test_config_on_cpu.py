@@ -106,17 +106,16 @@ def test_delta_sharded_rejects_lora(model_override):
         validate_config(_delta_config(actor_rollout_ref={"model": model_override}))
 
 
-def test_delta_sharded_surfaces_lora_rank_conflict():
-    """The LoRA gate reads through resolve_lora_config, so a conflicting
-    flat/nested rank raises the resolver's conflict error, not the delta message."""
-    with pytest.raises(ValueError, match="conflicts with"):
+def test_delta_sharded_rejects_conflicting_lora_spellings():
+    """A resolver ValueError means LoRA was requested: the delta gate re-raises
+    its own full-weight message instead of the resolver's flat-key hint."""
+    with pytest.raises(ValueError, match="full-weight training"):
         validate_config(_delta_config(actor_rollout_ref={"model": {"lora": {"rank": 8}, "lora_rank": 16}}))
 
 
-def test_delta_sharded_surfaces_nested_only_rank():
-    """A nested-only rank is Megatron grammar no engine gates on: the resolver's
-    set-the-flat-key error fires before the delta gate can speak."""
-    with pytest.raises(ValueError, match="set actor_rollout_ref.model.lora_rank"):
+def test_delta_sharded_rejects_nested_only_rank():
+    """Same for a nested-only rank: the flat-key hint would dead-end at this gate."""
+    with pytest.raises(ValueError, match="full-weight training"):
         validate_config(_delta_config(actor_rollout_ref={"model": {"lora": {"rank": 8}}}))
 
 
