@@ -308,6 +308,7 @@ def test_on_step_end_syncs_every_outer_step():
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
     events = []
     trainer.global_steps = 1
+    trainer.prev_step_profile = False
     trainer.timing_raw = {}
     trainer.hybrid_rollout_config = HybridRolloutSwitchConfig(enable_switch=False)
     trainer.standalone_checkpoint_manager = SimpleNamespace(
@@ -332,9 +333,9 @@ def test_on_step_end_syncs_every_outer_step():
 @pytest.mark.parametrize(
     ("strategy", "save_handler_name", "restore_handler_name"),
     [
-        ("fsdp", "fsdp1_sharded_save_to_cpu", "fsdp1_sharded_load_from_cpu"),
-        ("fsdp2", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
-        ("veomni", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
+        ("fsdp", "fsdp1_sharded_save_to_cpu", "_restore_local_shards"),
+        ("fsdp2", "fsdp2_sharded_save_to_cpu", "_restore_local_shards"),
+        ("veomni", "fsdp2_sharded_save_to_cpu", "_restore_local_shards"),
     ],
 )
 def test_snapshot_worker_selects_sharded_strategy_handlers(strategy, save_handler_name, restore_handler_name):

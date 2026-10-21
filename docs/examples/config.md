@@ -1,6 +1,6 @@
 # Config Explanation
 
-Last updated: 09/17/2026
+Last updated: 10/10/2026
 
 VeRL-Omni builds on [verl](https://github.com/verl-project/verl) and reuses the
 same Hydra config surface for shared RL trainer fields (`data`, FSDP actor /
@@ -55,6 +55,8 @@ algorithm:
   old_policy_decay: null
   old_policy_update_interval: 1
   timestep_fraction: 1.0
+  train_timestep_range: null
+  train_timestep_count: null
   adv_mode: continuous
   paired_preference: false
   rollout_correction: { ... }   # mirrors upstream RolloutCorrectionConfig
@@ -65,10 +67,12 @@ algorithm:
 - `algorithm.adv_estimator`: Advantage estimator name; defaults to `actor_rollout_ref.model.algorithm` (e.g. `flow_grpo`).
 - `algorithm.norm_adv_by_std_in_grpo`: Normalize advantages by within-group std (GRPO-style).
 - `algorithm.global_std`: Use a global (cross-group) std for advantage normalization.
-- `algorithm.old_policy_decay_schedule`: DiffusionNFT old-policy EMA schedule. One of `copy`, `linear_to_0_5`, `delayed_linear_to_0_999`.
+- `algorithm.old_policy_decay_schedule`: DiffusionNFT/DGPO old-policy EMA schedule. One of `copy`, `linear_to_0_5`, `linear_to_0_3`, `delayed_linear_to_0_999`.
 - `algorithm.old_policy_decay`: Fixed old-policy EMA decay in `[0, 1]`. When set, overrides `old_policy_decay_schedule`.
 - `algorithm.old_policy_update_interval`: DiffusionNFT optimizer steps between old-policy adapter refreshes (must be `> 0`).
 - `algorithm.timestep_fraction`: Fraction of rollout timesteps used for forward-process training, in `(0, 1]`.
+- `algorithm.train_timestep_range`: DGPO only. Rollout schedule indices `[start, end)` that training timesteps are drawn from; `null` uses the whole schedule.
+- `algorithm.train_timestep_count`: DGPO only. Number of schedule indices drawn per step and shared by the batch; `null` applies `timestep_fraction`.
 - `algorithm.adv_mode`: Advantage mapping before reward-probability scaling. One of `continuous`, `positive_only`, `negative_only`, `one_only`, `binary`.
 - `algorithm.paired_preference`: `true` for pair-based algorithms (e.g. offline DPO); doubles actor batch size and disables shuffle.
 - `algorithm.rollout_correction.*`: Experimental IS / RS correction. Schema mirrors upstream verl; see {doc}`../algo/rollout_correction` and [verl Rollout Correction](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html).
@@ -167,7 +171,7 @@ actor_rollout_ref:
 
 - `actor_rollout_ref.model.model_type`: Dispatch key; must be `diffusion_model` for the diffusion agent loop.
 - `actor_rollout_ref.model.path`: HuggingFace / local diffusion pipeline root.
-- `actor_rollout_ref.model.algorithm`: RL algorithm name (also drives default `diffusion_loss.loss_mode` / `adv_estimator`). Examples: `flow_grpo`, `mix_grpo`, `flow_dppo`, `diffusion_nft`, `dpo`, `dance_grpo`.
+- `actor_rollout_ref.model.algorithm`: RL algorithm name (also drives default `diffusion_loss.loss_mode` / `adv_estimator`). Examples: `flow_grpo`, `mix_grpo`, `flow_dppo`, `diffusion_nft`, `dgpo`, `dpo`, `dance_grpo`.
 - `actor_rollout_ref.model.tokenizer_path`: Optional tokenizer path if not under `path` (falls back to `<path>/tokenizer` or `path`).
 - `actor_rollout_ref.model.config_path`: Optional transformer config path. If null, backends use `<path>/<transformer_subfolder>`.
 - `actor_rollout_ref.model.transformer_subfolder`: Subfolder with diffusion transformer weights/config (default `transformer`).
@@ -186,6 +190,39 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.fsdp_layer_prefixes`: FSDP layer name prefixes for LoRA layered summon (default `["transformer_blocks."]`).
 - `actor_rollout_ref.model.pipeline` / `algo`: Mirrored from `actor_rollout_ref.rollout.pipeline` / `algo` via `oc.select`; prefer overriding the rollout copies.
 
+#### LoRA config resolution
+
+`verl_omni.utils.config.resolve_lora_config` is the single authority for LoRA
+configuration; trainer entry points read its `LoRASettings` instead of the raw
+keys. The engine wrap gates still read the raw keys and cutover when engine
+gating unifies (#693). Resolution rules:
+
+- The rank is the flat `actor_rollout_ref.model.lora_rank`. A nested
+  `model.lora.rank` set without the flat key raises a `ValueError` ("set
+  `lora_rank`"): the engine rank gates read the flat spelling, so a nested-only
+  value would silently run full-parameter training where LoRA was intended.
+  Setting both spellings to different positive values also raises.
+- `merge` is read only from the nested `actor_rollout_ref.model.lora.merge`.
+- The adapter path is the flat `actor_rollout_ref.model.lora_adapter_path`,
+  same rule as rank: a nested-only `lora.adapter_path` raises; setting both
+  spellings to different paths raises a `ValueError`. The FSDP wrap gate keys
+  on rank only, so pair an adapter with `lora_rank` until engine gating
+  unifies (#693): a rank-0 adapter path enables LoRA for the trainer without
+  the engine wrapping PEFT.
+- `alpha` is read only from the flat `actor_rollout_ref.model.lora_alpha`. The
+  nested `lora.alpha` key is Megatron grammar and is unread: composed omni configs
+  currently carry `lora.alpha: 32` next to `lora_alpha: 16` (both injected from
+  verl's default tree), and that disagreement is ignored until one of the two
+  defaults changes.
+- Nested `model.lora` keys beyond `merge`/`rank`/`adapter_path` are Megatron
+  grammar that verl's default config tree injects into every composed config.
+  They are tolerated-but-unread; any other nested key raises a `ValueError` —
+  remove the override, or bump the verl pin if the key comes from a newer verl
+  default. The pinned `adapter_path` follows the rule above: the `null` the
+  composed configs carry is tolerated; a set value raises.
+- `actor_rollout_ref.model.policy_state_adapters` accepts only `default`, `old`,
+  and `reference`; `default` is always forced first because it is the trained policy.
+
 ### `actor_rollout_ref.actor` — diffusion actor / loss
 
 ```yaml
@@ -202,6 +239,8 @@ actor_rollout_ref:
       ref_kl_coef: 0.0
       adaptive_weight_min: 1e-5
       dpo_beta: 2000.0
+      dgpo_beta: 100.0
+      dgpo_clip_range: 0.01
       kl_mask_threshold: 1e-5
       add_kl_coefficient: true
     loss_scale_factor: null
@@ -214,13 +253,15 @@ actor_rollout_ref:
 
 #### `diffusion_loss` — `DiffusionLossConfig`
 
-- `actor_rollout_ref.actor.diffusion_loss.loss_mode`: Loss registry key. One of `flow_grpo`, `flow_dppo`, `grpo_guard`, `diffusion_nft`, `dpo`, `dance_grpo`, `distill_kl`, `distill_fm_mse`.
+- `actor_rollout_ref.actor.diffusion_loss.loss_mode`: Loss registry key. One of `flow_grpo`, `flow_dppo`, `grpo_guard`, `diffusion_nft`, `dgpo`, `dpo`, `dance_grpo`, `distill_kl`, `distill_fm_mse`.
 - `actor_rollout_ref.actor.diffusion_loss.clip_ratio`: PPO-style clip ratio for diffusion policy loss (FlowGRPO default is very small, e.g. `1e-4`).
 - `actor_rollout_ref.actor.diffusion_loss.adv_clip_max`: Max absolute advantage before computing the policy loss (must be `> 0`).
 - `actor_rollout_ref.actor.diffusion_loss.mix_beta`: DiffusionNFT β for positive / implicit-negative prediction mixing (must be `> 0`).
 - `actor_rollout_ref.actor.diffusion_loss.ref_kl_coef`: DiffusionNFT prediction-space reference MSE coefficient.
 - `actor_rollout_ref.actor.diffusion_loss.adaptive_weight_min`: DiffusionNFT minimum adaptive denominator for x0 reconstruction losses (must be `> 0`).
 - `actor_rollout_ref.actor.diffusion_loss.dpo_beta`: DPO inverse temperature for pairwise flow-matching preference loss.
+- `actor_rollout_ref.actor.diffusion_loss.dgpo_beta`: DGPO β in the group preference score (must be `> 0`).
+- `actor_rollout_ref.actor.diffusion_loss.dgpo_clip_range`: DGPO old-policy ratio clip range; `0` disables clipping (must be `>= 0`).
 - `actor_rollout_ref.actor.diffusion_loss.kl_mask_threshold`: Flow-DPPO divergence threshold for masking high-KL updates (must be `> 0`).
 - `actor_rollout_ref.actor.diffusion_loss.add_kl_coefficient`: Whether Flow-DPPO normalizes mean drift by the scheduler SDE noise scale.
 
@@ -245,9 +286,9 @@ Diffusion-specific blocks sit under `pipeline`, `algo`, and `val_kwargs`. Severa
 #### Text-encoder tensor parallelism
 
 `actor_rollout_ref.rollout.text_encoder_tp_size` (default `1`) controls encoder
-sharding for supporting diffusion pipelines. Use `1` or exactly
-`actor_rollout_ref.rollout.tensor_model_parallel_size`; intermediate subgroups
-are rejected for the pinned backend.
+sharding for supporting diffusion pipelines. Use `1` or the full DiT group
+size (`tensor_model_parallel_size * ulysses_degree * ring_degree`);
+intermediate subgroups are rejected for the pinned backend.
 
 ```bash
 actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
@@ -256,13 +297,68 @@ actor_rollout_ref.rollout.text_encoder_tp_size=4
 
 NFT and FlowGRPO share this path. The field reaches the fused engine's
 `OmniDiffusionConfig.parallel_config.text_encoder_tp_size`; it is independent
-of CPU/layerwise offload. H3 launchers default `TEXT_ENCODER_TP` to `ROLLOUT_TP`.
+of CPU/layerwise offload. H3 launchers default `TEXT_ENCODER_TP` to `ROLLOUT_TP`
+when sequence parallelism is disabled.
 
 The legacy `+actor_rollout_ref.rollout.engine_kwargs.vllm_omni.text_encoder_tp_size`
 override is still accepted and overrides the typed default of `1`. Conflicting
 non-default typed and legacy values raise an error. If an explicit
 `parallel_config` provides ETP, it must agree with any requested override;
 otherwise its value is preserved. Prefer the typed field without `+`.
+
+#### Rollout sequence and VAE parallelism
+
+These are engine-startup fields under `actor_rollout_ref.rollout`, not per-request
+`pipeline` fields. Both NFT and FlowGRPO use the same configuration path.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `ulysses_degree` | `1` | Ulysses SP degree (`--usp` in vLLM-Omni) |
+| `ring_degree` | `1` | Ring SP degree |
+| `vae_patch_parallel_size` | `1` | VAE patch/tile ranks, reused from the DiT group |
+| `vae_parallel_mode` | `tile` | VAE parallel decode mode |
+| `vae_use_tiling` | `false` | Request tiled VAE execution |
+
+A replica occupies `TP * Ulysses * Ring` GPUs with `DP=PP=1`. Encoder TP and
+VAE parallelism reuse those ranks; they do not multiply GPU allocation again.
+Resource-bearing degrees must be set through these typed fields, not conflicting
+`engine_kwargs` or nested `parallel_config` overrides.
+
+The V0/V1 diffusion trainers use a local `LLMServerManager` subclass for SP-aware
+allocation, with matching vLLM-Omni replica, server-adapter and profiler rank
+mapping. No verl patch or TP-field substitution is needed. SP=1 delegates to the
+upstream path; SP>1 is limited to vLLM-Omni diffusion with DP=PP=1 and no
+prefill/decode disaggregation. GPU validation of the new SP/VAE path is still
+pending; CPU resource/routing checks are not performance evidence.
+
+vLLM-Omni's custom-pipeline loader skips its post-construction VAE/SP setup, so
+every registered rollout pipeline applies it after construction. Ulysses/Ring
+requires every declared DiT to define `_sp_plan`, and VAE parallelism requires a
+distributed VAE; unsupported combinations fail at startup instead of being
+ignored. At the pinned vLLM-Omni, Qwen-Image, Wan2.2, LTX-2 and MiniMax-H3 support
+both, Qwen-Image-Edit-Plus supports SP only, SD3 and Bagel support VAE parallelism
+only, and FLUX and Boogu-Image support neither.
+
+For MiniMax-H3, `vae_parallel_mode` must be `tile`, VAE parallel size must be `1`
+or the complete DiT group, CFG parallelism must be `1`, and hybrid Ulysses x Ring
+is rejected. Encoder TP must also divide 8. The native VAE may decode locally
+when there are fewer spatial tiles than ranks, so actual tile assignments must
+be checked when measuring speedup.
+
+Example using an existing four-GPU TP group:
+
+```bash
+actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+actor_rollout_ref.rollout.text_encoder_tp_size=4 \
+actor_rollout_ref.rollout.vae_patch_parallel_size=4 \
+actor_rollout_ref.rollout.vae_parallel_mode=tile \
+actor_rollout_ref.rollout.vae_use_tiling=true
+```
+
+Pure Ulysses on four GPUs uses
+`tensor_model_parallel_size=1`, `ulysses_degree=4`, `ring_degree=1`, and encoder
+and VAE parallel sizes of `4`. Do not set both TP and Ulysses to `4` on four GPUs:
+that requests sixteen ranks.
 
 #### Pipeline — `DiffusionPipelineConfig`
 

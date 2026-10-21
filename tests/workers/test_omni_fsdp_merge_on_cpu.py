@@ -24,6 +24,8 @@ import verl_omni.workers.engine.lora_export as lora_export
 class _FakeModule:
     def __init__(self):
         self.weight = torch.tensor([1.0])
+        # ``peft_config`` is what routes the export onto the merged-LoRA stream.
+        self.peft_config = {"default": SimpleNamespace(to_dict=lambda: {"r": 8})}
 
     def state_dict(self):
         # Match torch state_dict semantics: returned tensors alias live storage.

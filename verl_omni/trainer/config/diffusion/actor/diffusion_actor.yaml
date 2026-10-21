@@ -53,6 +53,24 @@ diffusion_loss:
   # Whether Flow-DPPO normalizes mean drift by the scheduler SDE noise scale
   add_kl_coefficient: true
 
+  # DGPO inverse temperature of the group-level preference weight
+  dgpo_beta: 100.0
+
+  # DGPO clip range on the old-policy denoising-loss ratio; 0 disables clipping
+  dgpo_clip_range: 0.01
+
+  # OmniNFT video loss weight
+  video_weight: 1.0
+
+  # OmniNFT audio loss weight
+  audio_weight: 1.0
+
+  # OmniNFT video prediction-space reference MSE coefficient
+  video_ref_kl_coef: 0.0
+
+  # OmniNFT audio prediction-space reference MSE coefficient
+  audio_ref_kl_coef: 0.0
+
 # Rollout Correction config.  Fields mirror RolloutCorrectionConfig.
 # rollout_is defaults to null (off); override for IS diagnostics.
 rollout_correction:
@@ -119,6 +137,9 @@ checkpoint:
 
   # What to include in saved checkpoints
   save_contents: ['model', 'optimizer', 'extra']
+
+  # Save only LoRA model weights with the FSDP checkpoint saver
+  save_lora_only: false
 
   # For more flexibility, you can specify the contents to load from the checkpoint.
   # .xxx refers to the local variable xxx from the same level of hierarchy similar to python pkg

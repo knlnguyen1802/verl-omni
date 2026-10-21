@@ -38,6 +38,7 @@ from verl.utils.device import get_device_id
 from verl.utils.fsdp_utils import merged_lora_context, normalize_peft_param_name, replace_lora_wrapper
 from verl.utils.model import convert_weight_keys
 
+from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.fsdp_utils import collect_lora_params
 
 
@@ -120,7 +121,9 @@ def export_lora_for_sync(
     """
     peft_model = getattr(module, "_fsdp_wrapped_module", module)
     has_lora = hasattr(peft_model, "peft_config")
-    merge_lora = has_lora and model_config.lora.get("merge", False)
+    # Resolved unconditionally (like the pre-refactor engines did): the resolver
+    # fail-fast-validates the LoRA config surface even for full-weight runs.
+    merge_lora = resolve_lora_config(model_config).merge
     adapter = adapter_name or "default"
     peft_config = None
 

@@ -134,7 +134,9 @@ def test_non_lora_full_weights_cast_policy(monkeypatch):
     monkeypatch.setattr(module, "state_dict", lambda: {"w": plain}, raising=False)
     _patch_export_machinery(monkeypatch)
 
-    params, peft_config = export_lora_for_sync(module, model_config=_model_config(), base_sync_done=True)
+    params, peft_config = export_lora_for_sync(
+        module, model_config=_model_config(), base_sync_done=True, is_diffusers=False
+    )
 
     weights = dict(params)
     assert peft_config is None
@@ -147,10 +149,12 @@ def test_non_lora_full_weights_cast_policy(monkeypatch):
 
 
 class _FakeModule:
-    """Module whose ``state_dict`` aliases live storage, like torch's."""
+    """PEFT-wrapped module whose ``state_dict`` aliases live storage, like torch's."""
 
     def __init__(self):
         self.weight = torch.tensor([1.0])
+        # ``peft_config`` is what routes the export onto the merged-LoRA stream.
+        self.peft_config = {"default": SimpleNamespace(to_dict=lambda: {"r": 8})}
 
     def state_dict(self):
         return {"weight": self.weight}
@@ -214,6 +218,7 @@ def test_merged_stream_offload_runs_when_consumed(monkeypatch):
         module,
         model_config=_model_config(merge=True),
         base_sync_done=True,
+        is_diffusers=False,
         offload_fn=lambda: offloads.append(1),
     )
     assert offloads == []  # merged offload waits for the stream to finish
@@ -249,6 +254,7 @@ def test_merged_export_rejects_named_adapter(monkeypatch):
             model_config=_model_config(merge=True),
             base_sync_done=True,
             adapter_name="old",
+            is_diffusers=False,
         )
     # "default" is what the weight-sync call sites pass and must stay accepted.
     _, peft_config = export_lora_for_sync(
@@ -256,6 +262,7 @@ def test_merged_export_rejects_named_adapter(monkeypatch):
         model_config=_model_config(merge=True),
         base_sync_done=True,
         adapter_name="default",
+        is_diffusers=False,
     )
     assert peft_config is None
 
@@ -369,6 +376,7 @@ def _slow_path_worker(*, has_lora: bool, peft_merge: bool, base_sync_done: bool)
     worker.base_sync_done = base_sync_done
     worker.layered_summon = False
     worker.rollout_adapter = "default"
+    worker._rank = 0  # update_weights stamps timings/metrics with f"rank_{self.rank}"
     worker._offload_actor_and_empty_cache = lambda *args, **kwargs: None
     return worker
 
