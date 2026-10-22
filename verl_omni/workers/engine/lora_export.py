@@ -143,7 +143,7 @@ def export_lora_for_sync(
         if is_diffusers:
             # Passed through exactly as the engine did: an empty list empties the
             # prefix walker, which then falls back to the full LoRA dump.
-            layer_prefixes = getattr(model_config, "fsdp_layer_prefixes", ("transformer_blocks.",))
+            layer_prefixes = model_config.fsdp_layer_prefixes
         else:
             layer_prefixes = ("transformer_blocks.",)
         with adapter_ctx:

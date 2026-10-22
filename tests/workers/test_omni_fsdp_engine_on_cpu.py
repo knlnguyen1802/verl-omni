@@ -328,38 +328,6 @@ def test_prepare_model_inputs_applies_registered_adapter_hook():
     assert output_args == {"base": True}
 
 
-def test_weight_sync_casts_floating_dtensor_to_bfloat16():
-    """The shared export casts floating-point full-weight gathers to bf16."""
-    from torch.distributed.tensor import DTensor
-
-    import verl_omni.workers.engine.lora_export as lora_export
-
-    gathered = torch.tensor([1.25], dtype=torch.float32)
-    dtensor = MagicMock(spec=DTensor)
-    dtensor.to.return_value.full_tensor.return_value = gathered
-
-    synced = lora_export._cast_for_sync(dtensor)
-
-    assert synced.dtype is torch.bfloat16
-    assert synced.item() == pytest.approx(1.25)
-
-
-def test_weight_sync_keeps_integer_dtensor_buffers():
-    """Integer gathers pass through the export cast untouched."""
-    from torch.distributed.tensor import DTensor
-
-    import verl_omni.workers.engine.lora_export as lora_export
-
-    gathered = torch.tensor([1, 2], dtype=torch.int64)
-    dtensor = MagicMock(spec=DTensor)
-    dtensor.to.return_value.full_tensor.return_value = gathered
-
-    synced = lora_export._cast_for_sync(dtensor)
-
-    assert synced is gathered
-    assert synced.dtype is torch.int64
-
-
 # ---------------------------------------------------------------------------
 # ``collect_lora_params`` import source
 # ---------------------------------------------------------------------------

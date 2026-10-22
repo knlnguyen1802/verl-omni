@@ -554,13 +554,6 @@ def collect_lora_params(
     Raises ``RuntimeError`` when no parameters were collected
     (e.g. mismatched ``layer_prefixes``).
 
-    # DIFF vs upstream (verl.utils.fsdp_utils.collect_lora_params): this wrapper
-    # adds an explicit ``adapter_name`` (named policy adapters), the diffusers
-    # layered walker with ``layer_prefixes``, and FSDP wrapper-token name
-    # cleaning. The upstream fast path survives only for the default adapter on
-    # non-diffusers-layered, non-FSDP2 modules; everything else flows through
-    # the adapter-aware implementation below.
-
     Args:
         module: The FSDP-wrapped or plain module.
         layered_summon: Summon one FSDP unit at a time instead of the full model.
@@ -569,6 +562,12 @@ def collect_lora_params(
         adapter_name: LoRA adapter name (usually ``"default"``).
         layer_prefixes: FSDP layer name prefixes (``["transformer_blocks."]``
     """
+    # DIFF vs upstream (verl.utils.fsdp_utils.collect_lora_params): this wrapper
+    # adds an explicit ``adapter_name`` (named policy adapters), the diffusers
+    # layered walker with ``layer_prefixes``, and FSDP wrapper-token name
+    # cleaning. The upstream fast path survives only for the default adapter on
+    # non-diffusers-layered, non-FSDP2 modules; everything else flows through
+    # the adapter-aware implementation below.
     # A single-rank FSDP1 actor uses NO_SHARD. The upstream layered
     # collector's fallback summons with offload_to_cpu=True, which PyTorch
     # rejects for NO_SHARD. Materialize on device and copy the adapter tensors
