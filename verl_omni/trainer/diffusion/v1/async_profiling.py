@@ -37,10 +37,12 @@ from collections import defaultdict
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
 
-# Tag keys written by ``DiffusionAgentLoopWorkerTQ._write_trajectories_to_tq``
-# and summed by :func:`aggregate_tq_write_stats`. ``tq_put_at`` (wall-clock
-# seconds) is the completed-publication boundary the wait decomposition keys
-# on; keep in sync with the rollout writer's stamping.
+# Tag keys written by ``DiffusionAgentLoopWorkerTQ`` and summed by
+# :func:`aggregate_tq_write_stats`. ``tq_put_at`` (wall-clock seconds) is the
+# terminal-publication boundary the wait decomposition keys on: the rollout
+# writer stamps it only after the prompt's ``status=finished`` put has
+# returned, because the buffer cannot sample the group before that status.
+# Keep in sync with the rollout writer's stamping.
 TQ_PUT_SECONDS_TAG = "tq_put_s"
 TQ_PAYLOAD_BYTES_TAG = "tq_payload_bytes"
 TQ_PUT_AT_TAG = "tq_put_at"
@@ -69,20 +71,29 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
     - ``sample_wait/generation_bound`` -- wait while the needed trajectories
       were still generating (residual: total minus the segments below);
     - ``sample_wait/detection`` -- batch-readiness discovery latency: how long
-      the group that completed the requested batch sat unseen between its
-      publication and the sync at which the batch became sampleable (this is
-      the part a smaller ``poll_interval`` recovers);
+      the group whose completion made the requested batch sampleable sat
+      between its terminal publication and the metadata sync that discovered
+      it (this is the part a smaller ``poll_interval`` recovers);
     - ``sample_wait/metadata_sync`` -- ``kv_list`` round trips;
     - ``sample_wait/eviction`` -- stale/DAPO/failure eviction passes.
 
-    Detection is charged once per window, at the sampleability transition:
-    rows discovered before the batch is sampleable were waited on for their
-    generation, so their undiscovered time stays in ``generation_bound``, and
-    a window that opens with the batch already sampleable charges nothing.
-    Rows written by older writers carry no ``tq_put_at`` and fall back into
-    ``generation_bound``; rows tagged before the window started are likewise
-    excluded from detection, since they arrived while the trainer was not
-    polling for them.
+    Detection is charged once per window, at the sampleability transition, and
+    only for the crossing group: among the eligible terminal groups first
+    tagged by the committing sync, the ``(target - already_sampleable)``-th
+    earliest arrival is the one that completed the batch -- earlier-completing
+    groups were waited on for their generation, so their undiscovered time
+    stays in ``generation_bound``, and a window that opens with the batch
+    already sampleable charges nothing. The arrival timestamp is sampled
+    before the discovering sync's ``kv_list`` call, so detection can never
+    overlap the metadata segment: an arrival inside a metadata RPC is that
+    RPC's service time, and the segment sums stay within the wall time.
+    Groups published by older writers carry no ``tq_put_at`` and fall back
+    into ``generation_bound``; groups tagged before the window started are
+    likewise excluded from detection, since they arrived while the trainer
+    was not polling for them. A completion tag that appears on an already
+    visible group is what stages the arrival -- the writer publishes payload
+    rows before the telemetry tags, so keying on tag transitions rather than
+    row novelty is what keeps such a group's wait from collapsing to zero.
 
     ``last_sample_timing`` (seconds per segment, plus poll count and the
     finished-group depth seen while waiting) is refreshed on every
@@ -102,13 +113,19 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
         self._window_depth = 0
         self._segment_timings: dict[str, float] = defaultdict(float)
         self._poll_depths: list[tuple[int, int, int]] = []
-        self._seen_trajectory_keys: dict[str, set[str]] = {}
+        # Completion-tag bookkeeping per partition: uid -> staged arrival. A
+        # uid is staged once its rows first carry ``tq_put_at`` (which may be
+        # several syncs after the rows themselves became visible) and never
+        # re-staged while its rows persist.
+        self._counted_arrivals: dict[str, dict[str, float]] = {}
+        self._window_started_at: float | None = None
         self._last_sync_wall_time: float | None = None
-        # Batch-readiness attribution: each profiled sync stages the detection
-        # it discovered per partition; ``_has_enough_samples`` commits it only
-        # when that sync's check turns the window from waiting to ready, so
-        # discoveries the batch does not need yet stay in generation_bound.
-        self._sync_detection_candidates: dict[str, float] = {}
+        # Batch-readiness attribution: each profiled sync stages the eligible
+        # arrivals it discovered as ``{uid: arrival}`` plus the pre-sync clock
+        # reading and the clamp cap; ``_has_enough_samples`` commits the
+        # threshold-crossing arrival only when that sync's check turns the
+        # window from waiting to ready.
+        self._sync_detection_candidates: dict[str, tuple[dict[str, float], float, float]] = {}
         self._sampleable_latched = False
         self._sampleable_at_window_open = False
         self.last_sample_timing: dict[str, float] = {}
@@ -117,36 +134,47 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
 
     def _sync_metadata_from_transfer_queue(self):
         start = time.perf_counter() if self._profiling_active else None
+        # Detection's reference clock is read before the RPC below: an arrival
+        # that lands inside the metadata call is that call's service time, so
+        # detection and metadata_sync stay disjoint and their sums stay within
+        # the wall time.
+        now = time.time()
         try:
             return super()._sync_metadata_from_transfer_queue()
         finally:
             if start is not None:
                 self._segment_timings["metadata_sync"] += time.perf_counter() - start
-            # Arrival bookkeeping runs on every sync (profiled or not) so rows
-            # that arrived via incidental syncs are never re-detected as new
-            # arrivals inside a later profiling window.
-            now = time.time()
-            for partition_id, partition in self.partitions.items():
-                current = set(partition)
-                seen = self._seen_trajectory_keys.setdefault(partition_id, set())
-                if self._profiling_active:
-                    window_start = self._last_sync_wall_time or now
-                    arrivals = [
-                        float(tag[TQ_PUT_AT_TAG])
-                        for key in current - seen
-                        if isinstance(tag := partition.get(key), dict)
-                        and isinstance(tag.get(TQ_PUT_AT_TAG), int | float)
-                        and float(tag[TQ_PUT_AT_TAG]) >= window_start
-                    ]
-                    if arrivals:
-                        # Clamping bounds clock skew between the rollout writer
-                        # and this process to the inter-sync window.
-                        detection = min(max(now - max(arrivals), 0.0), now - window_start)
-                        self._sync_detection_candidates[partition_id] = detection
-                    else:
-                        self._sync_detection_candidates[partition_id] = 0.0
-                self._seen_trajectory_keys[partition_id] = current
             if self._profiling_active:
+                # Arrivals are counted from the window open (older rows were
+                # published while the trainer was not polling for them), but
+                # detection is clamped to the discovering gap: an undiscovered
+                # stretch that spans earlier syncs overlaps those RPCs, so it
+                # stays in the generation_bound residual instead.
+                window_open = self._window_started_at if self._window_started_at is not None else now
+                prev_sync_end = self._last_sync_wall_time if self._last_sync_wall_time is not None else window_open
+                cap = max(0.0, now - prev_sync_end)
+                for partition_id, partition in self.partitions.items():
+                    counted = self._counted_arrivals.setdefault(partition_id, {})
+                    finished_uids = self.finished_keys[partition_id]
+                    latest_arrival: dict[str, float] = {}
+                    uids_with_rows: set[str] = set()
+                    for key, tag in partition.items():
+                        uid = key.split("_")[0]
+                        uids_with_rows.add(uid)
+                        if uid in counted or uid not in finished_uids or not isinstance(tag, dict):
+                            continue
+                        put_at = tag.get(TQ_PUT_AT_TAG)
+                        if isinstance(put_at, int | float) and float(put_at) >= window_open:
+                            arrival = float(put_at)
+                            if uid not in latest_arrival or arrival > latest_arrival[uid]:
+                                latest_arrival[uid] = arrival
+                    self._sync_detection_candidates[partition_id] = (latest_arrival, now, cap)
+                    counted.update(latest_arrival)
+                    # Groups whose rows vanished (evicted or cleared) are
+                    # forgotten, so a refilled re-publication counts afresh.
+                    for uid in list(counted):
+                        if uid not in uids_with_rows:
+                            del counted[uid]
                 self._last_sync_wall_time = now
 
     def _evict_terminal_groups(self, global_steps, partition_id, eviction_reasons):
@@ -184,7 +212,9 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
             return
         self._segment_timings = defaultdict(float)
         self._poll_depths = []
-        self._last_sync_wall_time = time.time()
+        self._counted_arrivals = {}
+        self._window_started_at = time.time()
+        self._last_sync_wall_time = self._window_started_at
         self._sync_detection_candidates = {}
         self._sampleable_latched = False
         # Sampleability of the last-synced state: a window that opens with the
@@ -231,10 +261,21 @@ class ProfiledReplayBufferAsync(ReplayBufferAsync):
         if self._profiling_active and result and not self._sampleable_latched:
             self._sampleable_latched = True
             if not self._sampleable_at_window_open:
-                # The sync that discovered the completing group stages its
-                # detection in the candidate; waits for earlier-completing
-                # groups were generation-bound and stay in the residual.
-                self._segment_timings["detection"] += self._sync_detection_candidates.get(partition_id, 0.0)
+                # The sync that turned the window ready stages the arrivals it
+                # discovered; restricted to the eligible set, the batch needed
+                # ``len(sampleable) - discovered`` groups that earlier syncs
+                # already knew about, so the ``needed``-th earliest staged
+                # arrival is the group whose completion crossed the
+                # sampleability threshold. Surplus, nonterminal, and evictable
+                # groups never enter this ordering, and an untagged crossing
+                # group simply leaves detection at zero (its wait stays in the
+                # generation_bound residual).
+                staged, now, cap = self._sync_detection_candidates.get(partition_id, ({}, 0.0, 0.0))
+                eligible_arrivals = sorted(t for uid, t in staged.items() if uid in sampleable_keys)
+                needed = batch_size - (len(sampleable_keys) - len(eligible_arrivals))
+                if 0 < needed <= len(eligible_arrivals):
+                    detection = min(max(now - eligible_arrivals[needed - 1], 0.0), cap)
+                    self._segment_timings["detection"] += detection
         return result
 
     def wait_for_sampleable(self, global_steps: int, partition_id: str, target_count: int):

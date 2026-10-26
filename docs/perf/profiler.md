@@ -615,7 +615,7 @@ were already being taken, promoted to the metrics dict; see
 |--------|---------|
 | `timing_s/sample_wait/total` | Wall time inside `replay_buffer.sample()` |
 | `timing_s/sample_wait/generation_bound` | Wait while the needed trajectories were still generating (rollout-bound idle) |
-| `timing_s/sample_wait/detection` | Batch-readiness discovery latency: how long the group that completed the requested batch sat between publication and the poll that made the batch sampleable (recoverable by a smaller `poll_interval`) |
+| `timing_s/sample_wait/detection` | Batch-readiness discovery latency: how long the group whose completion made the requested batch sampleable sat between its terminal publication and the metadata sync that discovered it (recoverable by a smaller `poll_interval`) |
 | `timing_s/sample_wait/metadata_sync` | `kv_list` metadata round trips while polling |
 | `timing_s/sample_wait/eviction` | Stale / DAPO / failure eviction passes |
 | `timing_s/sample_wait/polls` | Poll iterations while waiting |
@@ -630,12 +630,17 @@ were already being taken, promoted to the metrics dict; see
 | `separate_async/idle_ratio/{generation_bound,detection,metadata_sync,eviction}` | Idle decomposition |
 
 The wait split is event-based, not sleep-based: the rollout stamps each
-written row with the moment its payload put completed, and the buffer charges
-detection once, at the poll where the requested batch first became sampleable
--- earlier-completing groups were waited on for their generation, so their
-undiscovered time stays in `generation_bound`. Plain poll-sleep time cannot
-make this split — a slow generation and a coarse `poll_interval` both show up
-as sleep.
+written row with the moment its prompt group became terminal (published
+after the `status=finished` put, the state the buffer actually waits for),
+and the buffer charges detection once, at the poll where the requested batch
+first became sampleable -- for the group whose completion crossed that
+threshold, with already-sampleable and surplus groups excluded. Earlier-
+completing groups were waited on for their generation, so their undiscovered
+time stays in `generation_bound`. Detection is measured up to the start of
+the discovering metadata sync, so it never overlaps `metadata_sync`: an
+arrival inside a sync is that sync's service time, and the segments stay
+within the wall time. Plain poll-sleep time cannot make this split — a slow
+generation and a coarse `poll_interval` both show up as sleep.
 
 Read them straight off wandb / TensorBoard, or point
 [`scripts/analyze_step_metrics.py`](https://github.com/verl-project/verl-omni/blob/main/scripts/analyze_step_metrics.py)
