@@ -571,9 +571,30 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         replay_buffer = getattr(self, "replay_buffer", None)
         sample_timing = getattr(replay_buffer, "last_sample_timing", None)
         if sample_timing:
+            polls = float(sample_timing.get("sample_wait/polls", 0.0))
             for name, value in sample_timing.items():
-                timing_raw.setdefault(name, 0.0)
-                timing_raw[name] += value
+                if not name.startswith("sample_wait/buffer_"):
+                    # Wall-time segments and the poll count accumulate across
+                    # the step's local updates (parameter_sync_step > 1 runs
+                    # this once per update against the same timing_raw).
+                    timing_raw[name] = timing_raw.get(name, 0.0) + value
+                elif name.endswith("_mean"):
+                    # Poll-weighted mean: the per-sample means weighted by
+                    # their poll counts equal the mean over every poll of the
+                    # step. ``sample_wait/polls`` may already hold this
+                    # sample's contribution, so subtract it to weight what
+                    # earlier updates accumulated.
+                    prev = timing_raw.get(name)
+                    if prev is None:
+                        timing_raw[name] = value
+                    else:
+                        prev_polls = timing_raw.get("sample_wait/polls", 0.0) - polls
+                        total = prev_polls + polls
+                        timing_raw[name] = (prev * prev_polls + value * polls) / total if total > 0 else value
+                elif name.endswith("_min"):
+                    timing_raw[name] = value if name not in timing_raw else min(timing_raw[name], value)
+                else:
+                    timing_raw[name] = value if name not in timing_raw else max(timing_raw[name], value)
         metrics.update(aggregate_tq_write_stats(batch_meta))
 
     def _convert_and_dispatch(self, batch_meta: KVBatchMeta, timing_raw: dict | None = None):

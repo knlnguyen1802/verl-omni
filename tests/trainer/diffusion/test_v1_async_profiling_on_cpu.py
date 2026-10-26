@@ -428,6 +428,60 @@ def test_aggregate_tq_write_stats_sums_tags():
     assert "tq/put/bytes_per_second" not in stats
 
 
+def test_sample_profile_depth_stats_combine_across_local_updates():
+    """parameter_sync_step > 1 records one profile per local update into the
+    same ``timing_raw``: the wall-time segments and poll count sum, but the
+    buffer-depth stats must keep their own semantics -- min stays the minimum,
+    max the maximum, and the means combine weighted by each sample's polls.
+    """
+    from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
+
+    def record(timing_raw, sample_timing):
+        trainer = SimpleNamespace(replay_buffer=SimpleNamespace(last_sample_timing=sample_timing))
+        PolicyGradientDiffusionTrainerV1._record_async_sample_profile(
+            trainer, {}, timing_raw, SimpleNamespace(tags=[])
+        )
+
+    first = {
+        "sample_wait/detection": 0.2,
+        "sample_wait/metadata_sync": 0.05,
+        "sample_wait/generation_bound": 1.0,
+        "sample_wait/total": 1.25,
+        "sample_wait/polls": 3.0,
+        "sample_wait/buffer_finished_mean": 2.0,
+        "sample_wait/buffer_finished_min": 1.0,
+        "sample_wait/buffer_finished_max": 4.0,
+        "sample_wait/buffer_pending_mean": 5.0,
+        "sample_wait/buffer_running_mean": 7.0,
+    }
+    second = {
+        "sample_wait/detection": 0.1,
+        "sample_wait/metadata_sync": 0.05,
+        "sample_wait/generation_bound": 0.5,
+        "sample_wait/total": 0.65,
+        "sample_wait/polls": 1.0,
+        "sample_wait/buffer_finished_mean": 10.0,
+        "sample_wait/buffer_finished_min": 8.0,
+        "sample_wait/buffer_finished_max": 12.0,
+        "sample_wait/buffer_pending_mean": 3.0,
+        "sample_wait/buffer_running_mean": 9.0,
+    }
+
+    timing_raw = {}
+    record(timing_raw, first)
+    record(timing_raw, second)
+
+    assert timing_raw["sample_wait/total"] == pytest.approx(1.9)
+    assert timing_raw["sample_wait/polls"] == 4.0
+    # The depth stats keep their semantics instead of summing: summing turned
+    # min into min1+min2 (9.0) and doubled every mean.
+    assert timing_raw["sample_wait/buffer_finished_min"] == 1.0
+    assert timing_raw["sample_wait/buffer_finished_max"] == 12.0
+    assert timing_raw["sample_wait/buffer_finished_mean"] == pytest.approx((2.0 * 3 + 10.0 * 1) / 4)
+    assert timing_raw["sample_wait/buffer_pending_mean"] == pytest.approx((5.0 * 3 + 3.0 * 1) / 4)
+    assert timing_raw["sample_wait/buffer_running_mean"] == pytest.approx((7.0 * 3 + 9.0 * 1) / 4)
+
+
 def test_tq_put_counters_sum_across_local_updates():
     """With parameter_sync_step > 1 the counters must sum, not weighted-average.
 
