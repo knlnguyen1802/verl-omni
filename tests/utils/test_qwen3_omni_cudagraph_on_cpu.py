@@ -90,7 +90,6 @@ def _compile(model, args, monkeypatch):
     # CPU CI disables compile globally; this test must still exercise the real hook.
     monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
     monkeypatch.setenv("TORCHINDUCTOR_DISABLE", "0")
-    monkeypatch.setattr(torch._dynamo.config, "disable", False)
     torch._dynamo.reset()
     handle = register_bytecode_hook(model.bytecode_hook)
     try:
