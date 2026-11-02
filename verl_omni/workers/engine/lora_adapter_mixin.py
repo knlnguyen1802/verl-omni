@@ -84,10 +84,10 @@ class LoRAAdapterMixin:
     @contextmanager
     def _adapter_state_context(self):
         """Open writable adapter parameter access (FSDP summon when applicable)."""
-        from verl.utils.fsdp_utils import fsdp_version, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+        from verl.utils.fsdp_utils import fsdp_version, load_fsdp_model_to_gpu
         from verl.utils.memory_utils import aggressive_empty_cache
 
-        from verl_omni.utils.fsdp_utils import fsdp_summon_full_params
+        from verl_omni.utils.fsdp_utils import fsdp_summon_full_params, offload_fsdp_model_to_cpu
 
         is_fsdp_module = fsdp_version(self.module) in (1, 2)
         is_offload_param = getattr(self, "_is_offload_param", False)

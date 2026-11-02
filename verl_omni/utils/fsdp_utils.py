@@ -27,9 +27,12 @@ import peft
 import torch
 from peft.utils.save_and_load import get_peft_model_state_dict
 from safetensors.torch import save_file
+from torch.distributed.tensor import DTensor
+from verl.utils.device import get_torch_device
 from verl.utils.fsdp_utils import collect_lora_params as _upstream_collect_lora_params
 from verl.utils.fsdp_utils import fsdp_version
 from verl.utils.fsdp_utils import layered_summon_lora_params as _upstream_layered_summon_lora_params
+from verl.utils.fsdp_utils import offload_fsdp_model_to_cpu as _upstream_offload_fsdp_model_to_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ __all__ = [
     "collect_lora_params",
     "export_fsdp_lora_adapter",
     "fsdp_summon_full_params",
+    "offload_fsdp_model_to_cpu",
     "split_fused_moe_lora_targets",
 ]
 
@@ -155,6 +159,46 @@ def apply_fsdp2(model, fsdp_kwargs, config, ignored_names: Sequence[str] = ()):
             next_targets = fsdp_modules[i + 1 : i + 2]  # depth=1, mirrors FSDP1's forward_prefetch_limit=1
             if next_targets and hasattr(m, "set_modules_to_forward_prefetch"):
                 m.set_modules_to_forward_prefetch(next_targets)
+
+
+def _shard_repadded_on_cpu(tensor: torch.Tensor) -> bool:
+    """Return whether FSDP2 copies this local shard on the host as soon as it reaches CPU.
+
+    ``FSDPParam.reset_sharded_param`` repads shards shorter than ``ceil(global / shard_count)``.
+    Layouts sharded over several mesh dimensions are treated as repadded.
+    """
+    if not isinstance(tensor, DTensor):
+        return False
+    shards = [(mesh_dim, placement) for mesh_dim, placement in enumerate(tensor.placements) if placement.is_shard()]
+    if len(shards) != 1:
+        return True
+    mesh_dim, placement = shards[0]
+    shard_count = tensor.device_mesh.size(mesh_dim)
+    padded_size = (tensor.size(placement.dim) + shard_count - 1) // shard_count
+    return tensor.to_local().size(placement.dim) != padded_size
+
+
+@torch.no_grad()
+def offload_fsdp_model_to_cpu(model: torch.nn.Module, empty_cache: bool = True) -> None:
+    """Offload a model to CPU, keeping FSDP2 copies asynchronous unless FSDP2 reads the result.
+
+    Only shards FSDP2 repads on this rank use a blocking copy, because the repad reads the
+    destination inside ``_apply``. All other shards stay non-blocking in pinned host memory,
+    which keeps the following ``non_blocking=True`` reload fast. Other models use verl's helper.
+
+    Reloading on the same device stream is ordered after these copies. A caller that reads the
+    CPU shards on the host, or reloads them on another stream, must synchronize first.
+
+    Args:
+        model: The model to offload.
+        empty_cache: Whether to release the device's cached memory afterwards.
+    """
+    if fsdp_version(model) != 2:
+        _upstream_offload_fsdp_model_to_cpu(model, empty_cache)
+        return
+    model._apply(lambda tensor: tensor.to("cpu", non_blocking=not _shard_repadded_on_cpu(tensor)))
+    if empty_cache:
+        get_torch_device().empty_cache()
 
 
 @contextmanager

@@ -45,7 +45,6 @@ from verl.utils.fsdp_utils import (
     init_fn,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -66,7 +65,7 @@ from verl_omni.pipelines.utils import (
     prepare_noisy_latents,
 )
 from verl_omni.utils.diffusion_compile import _maybe_compile_repeated_blocks
-from verl_omni.utils.fsdp_utils import apply_fsdp2
+from verl_omni.utils.fsdp_utils import apply_fsdp2, offload_fsdp_model_to_cpu
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 from verl_omni.workers.engine.lora_export import export_lora_for_sync

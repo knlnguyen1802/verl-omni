@@ -978,3 +978,32 @@ def test_build_fsdp_module_skips_wrap_targets_under_ignored_subtrees(monkeypatch
 
     targets = [module.llm.layer, module.tower.embed_positions]
     assert _filter_ignored_wrap_targets(targets, module, []) == targets
+
+
+@pytest.mark.parametrize(
+    "device,forward_only,model,routed",
+    [
+        ("cpu", False, True, True),
+        ("cpu", False, False, False),
+        ("cpu", True, True, False),
+        ("cuda", False, True, False),
+    ],
+)
+def test_to_routes_only_model_offload_through_the_non_blocking_helper(monkeypatch, device, forward_only, model, routed):
+    omni_impl = _get_omni_impl_module()
+    engine = object.__new__(omni_impl.OmniFSDPEngine)
+    engine.engine_config = types.SimpleNamespace(forward_only=forward_only)
+    engine.module = object()
+    offload = MagicMock()
+    monkeypatch.setattr(omni_impl, "offload_fsdp_model_to_cpu", offload)
+    parent_to = MagicMock()
+    monkeypatch.setattr(omni_impl.FSDPEngineWithLMHead, "to", parent_to, raising=False)
+
+    engine.to(device, model=model, optimizer=True, grad=model)
+
+    # verl's engine must not move the model again through its blocking helper.
+    parent_to.assert_called_once_with(device, model=model and not routed, optimizer=True, grad=model and not routed)
+    if routed:
+        offload.assert_called_once_with(engine.module)
+    else:
+        offload.assert_not_called()

@@ -32,13 +32,12 @@ from verl.utils.fsdp_utils import (
     get_init_weight_context_manager,
     init_fn,
     load_fsdp_model_to_gpu,
-    offload_fsdp_model_to_cpu,
 )
 from verl.workers.engine.base import EngineRegistry
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine.fsdp.utils import get_sharding_strategy
 
-from verl_omni.utils.fsdp_utils import apply_fsdp2
+from verl_omni.utils.fsdp_utils import apply_fsdp2, offload_fsdp_model_to_cpu
 from verl_omni.workers.config import OmniModelConfig
 from verl_omni.workers.engine.lora_export import export_lora_for_sync
 
@@ -48,6 +47,13 @@ logger = logging.getLogger(__name__)
 @EngineRegistry.register(model_type="omni_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu", "xpu"])
 class OmniFSDPEngine(FSDPEngineWithLMHead):
     """FSDP engine for omni models"""
+
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        """Move the engine's state, routing model offload through the non-blocking helper."""
+        offload_model = model and device == "cpu" and not self.engine_config.forward_only
+        super().to(device, model=model and not offload_model, optimizer=optimizer, grad=grad and not offload_model)
+        if offload_model:
+            offload_fsdp_model_to_cpu(self.module)
 
     def prepare_model_inputs(self, micro_batch):
         """Prepare standard LM inputs, then add model-native replay fields."""
