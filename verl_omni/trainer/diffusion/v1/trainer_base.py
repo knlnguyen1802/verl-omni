@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import cached_property
 from numbers import Integral
 from pprint import pprint
 
@@ -81,6 +82,12 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     track_nonfinite_grad_streak,
     validate_distillation_config,
 )
+from verl_omni.trainer.diffusion.performance_watchdog import (
+    PerformanceWatchdogResult,
+    StepTimePerformanceWatchdog,
+    StepTimeRegressionAlert,
+    validate_performance_watchdog_config,
+)
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     BaseRayDiffusionTrainer,
     _resolve_rollout_media_field,
@@ -108,6 +115,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
 )
 from verl_omni.utils.config import resolve_lora_config
 from verl_omni.utils.net_utils import worker_group_port_ranges
+from verl_omni.utils.skip import init_skip_manager, log_skip_summary
 from verl_omni.utils.tracking import batch_items, validate_audio_batch
 from verl_omni.workers.config.reward import (
     reward_is_enabled,
@@ -228,6 +236,28 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             raise ValueError("trainer.v1.watchdog.enabled must be a boolean")
         self._training_watchdog = TrainingWatchdog(loss_mode=loss_mode, **watchdog_config) if watchdog_enabled else None
 
+        performance_watchdog_config = dict(config.trainer.v1.get("performance_watchdog", {}))
+        performance_watchdog_enabled = performance_watchdog_config.pop("enabled", False)
+        if not isinstance(performance_watchdog_enabled, bool):
+            raise ValueError("trainer.v1.performance_watchdog.enabled must be a boolean")
+        self._performance_watchdog = None
+        self._performance_profile_step: int | None = None
+        self._pending_performance_profile_report: StepTimeRegressionAlert | None = None
+        self._completed_performance_profile_report: StepTimeRegressionAlert | None = None
+        self._profiled_step_this_iteration = False
+        self._last_performance_insufficient_reason: str | None = None
+        self._performance_profile_tool: str | None = None
+        self._performance_profile_roles: tuple[str, ...] = ()
+        self._performance_watchdog_workload: dict[str, object] = {}
+        if performance_watchdog_enabled:
+            self._performance_profile_tool, self._performance_profile_roles = validate_performance_watchdog_config(
+                config,
+                trainer_mode=self.trainer_mode,
+                use_reference_policy=self.use_reference_policy,
+            )
+            self._performance_watchdog = StepTimePerformanceWatchdog(**performance_watchdog_config)
+            self._performance_watchdog_workload = self._performance_workload_dimensions()
+
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
         if sampler_config.get("drop_incomplete_groups", False):
@@ -315,11 +345,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def _stop_profiling(self) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
         this_step_profile = self.curr_step_profile
+        performance_watchdog_enabled = self._performance_watchdog is not None
+        this_step_performance_profile = (
+            performance_watchdog_enabled and self._performance_profile_step == self.global_steps
+        )
         self.next_step_profile = (
             self.global_steps + 1 in self.config.global_profiler.steps
             if self.config.global_profiler.steps is not None
             else False
         )
+        if performance_watchdog_enabled and self._performance_profile_step == self.global_steps + 1:
+            self.next_step_profile = True
         do_profile = (
             self.curr_step_profile and not self.next_step_profile
             if self.config.global_profiler.profile_continuous_steps
@@ -336,7 +372,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             profiled_steps = self.config.global_profiler.steps
             is_last_step = self.global_steps >= self.total_training_steps
             run_command = bool(
-                this_step_profile and profiled_steps and (self.global_steps == max(profiled_steps) or is_last_step)
+                this_step_performance_profile
+                or (this_step_profile and profiled_steps and (self.global_steps == max(profiled_steps) or is_last_step))
             )
             # See _start_profiling: skip aliased worker groups so the finish hook (and any trace
             # upload it triggers) fires exactly once per distinct process, not once per role alias.
@@ -349,12 +386,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 seen.add(id(self.critic_wg))
                 self.critic_wg.stop_profile(run_command=run_command)
 
+        if performance_watchdog_enabled:
+            self._profiled_step_this_iteration = this_step_profile
+            if this_step_performance_profile:
+                self._performance_profile_step = None
+                self._completed_performance_profile_report = self._pending_performance_profile_report
+                self._pending_performance_profile_report = None
+
     def fit(self, agent_loop_manager: AgentLoopManager):
         """Run the v1 training loop, mirroring upstream ``PPOTrainer.fit``."""
         self.agent_loop_manager = agent_loop_manager
 
-        # initialize SkipManager for V1 rollout skip support (no-op until configured).
-        SkipManager.init(self.config)
+        # initialize SkipManager (verl rollout skip + verl-omni stage skip; no-op until configured).
+        init_skip_manager(self.config)
 
         self.logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -381,6 +425,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         if self._training_watchdog is not None:
             self._training_watchdog.reset()
+        if self._performance_watchdog is not None:
+            self._performance_watchdog.reset()
         current_epoch = self.global_steps // self.steps_per_epoch
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Diffusion Training")
 
@@ -393,12 +439,24 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if self.config.global_profiler.steps is not None
             else False
         )
+        self._performance_profile_step = None
+        self._pending_performance_profile_report = None
+        self._completed_performance_profile_report = None
+        self._profiled_step_this_iteration = False
+        self._last_performance_insufficient_reason = None
         self.next_step_profile = False
 
         self.on_train_begin()
         last_val_metrics = None
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
             is_last_step = self.global_steps >= self.total_training_steps
+            if self._performance_watchdog is not None:
+                static_profile_steps = self.config.global_profiler.steps or ()
+                self.curr_step_profile = (
+                    self.global_steps in static_profile_steps
+                    or getattr(self, "_performance_profile_step", None) == self.global_steps
+                )
+                self._profiled_step_this_iteration = self.curr_step_profile
             metrics: dict = {}
             self.timing_raw: dict = {}
             with marked_timer("step", self.timing_raw):
@@ -427,6 +485,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
             self._compute_metrics(batch, metrics, self.timing_raw, self.global_steps, current_epoch)
             self._report_training_watchdog(metrics)
+            self._report_performance_watchdog(metrics)
 
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             rollout_data_save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
@@ -441,6 +500,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             SkipManager.set_step(self.global_steps)
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
             if is_last_step:
+                log_skip_summary(self.logger, self.global_steps)
                 self._shutdown_dump_executor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
@@ -448,6 +508,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 return
 
         self.on_train_end()
+        log_skip_summary(self.logger, self.global_steps)
         self._shutdown_dump_executor()
         self._shutdown_dataloaders()
 
@@ -468,6 +529,130 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
         metrics.update(diagnostics)
         metrics["watchdog/processing_time_s"] = time.perf_counter() - started
+
+    def _performance_workload_dimensions(self) -> dict[str, object]:
+        """Return only fixed, numeric workload dimensions; never inspect sample payloads."""
+        dimensions = {
+            "train_batch_size": OmegaConf.select(self.config, "data.train_batch_size"),
+            "rollout_n": OmegaConf.select(self.config, "actor_rollout_ref.rollout.n"),
+            "height": OmegaConf.select(self.config, "actor_rollout_ref.rollout.height"),
+            "width": OmegaConf.select(self.config, "actor_rollout_ref.rollout.width"),
+            "num_inference_steps": OmegaConf.select(self.config, "actor_rollout_ref.rollout.num_inference_steps"),
+            "parameter_sync_step": self.parameter_sync_step,
+            "nnodes": OmegaConf.select(self.config, "trainer.nnodes"),
+            "n_gpus_per_node": OmegaConf.select(self.config, "trainer.n_gpus_per_node"),
+        }
+        return {name: value for name, value in dimensions.items() if value is not None}
+
+    def _performance_profile_selection(self) -> str:
+        """Summarize configured roles/ranks without adding metric labels."""
+        selections = []
+        for role in self._performance_profile_roles:
+            role_config = OmegaConf.select(self.config, f"actor_rollout_ref.{role}.profiler")
+            if role_config is None:
+                continue
+            all_ranks = OmegaConf.select(role_config, "all_ranks", default=False)
+            ranks = OmegaConf.select(role_config, "ranks", default=[])
+            rank_selection = "all" if all_ranks else f"{list(ranks or [])}"
+            selections.append(f"{role}(ranks={rank_selection})")
+        return ",".join(selections) or "configured roles unavailable"
+
+    def _log_performance_profile_report(
+        self,
+        alert: StepTimeRegressionAlert,
+        *,
+        profile_step: int | None,
+        captured: bool,
+    ) -> None:
+        phase_deltas = (
+            ",".join(
+                f"{delta.name}={delta.delta_s:+.3f}s"
+                + (f"({delta.delta_ratio:+.1%})" if delta.delta_ratio is not None else "")
+                for delta in alert.phase_deltas
+            )
+            or "none"
+        )
+        artifact_ref = (
+            str(OmegaConf.select(self.config, "global_profiler.save_path"))
+            if captured
+            else "none (no next eligible step)"
+        )
+        logger.warning(
+            "Performance watchdog report status=%s trigger=sustained_step_time_ratio %.3f >= %.3f "
+            "trigger_window=[%d,%d] baseline_window=[%d,%d] baseline_median_s=%.3f "
+            "current_median_s=%.3f baseline_observations=%d current_observations=%d "
+            "workload_fingerprint=%s phase_deltas=[%s] capture_step=%s tool=%s roles=[%s] "
+            "artifact_ref=%s trace_scope='step() plus enabled synchronous rollout generation; excludes checkpoint, "
+            "post-step weight sync, and validation; perf/time_per_step includes checkpoint and weight sync'",
+            "captured" if captured else "triggered_without_eligible_step",
+            alert.slowdown_ratio,
+            OmegaConf.select(self.config, "trainer.v1.performance_watchdog.regression_ratio"),
+            alert.first_step,
+            alert.last_step,
+            alert.baseline_first_step,
+            alert.baseline_last_step,
+            alert.baseline_median_s,
+            alert.current_median_s,
+            alert.baseline_observations,
+            alert.current_observations,
+            alert.workload_fingerprint,
+            phase_deltas,
+            profile_step,
+            self._performance_profile_tool,
+            self._performance_profile_selection(),
+            artifact_ref,
+        )
+
+    def _report_performance_watchdog(self, metrics: dict) -> None:
+        watchdog = getattr(self, "_performance_watchdog", None)
+        if watchdog is None:
+            return
+
+        completed_report = self._completed_performance_profile_report
+        if completed_report is not None:
+            self._log_performance_profile_report(
+                completed_report,
+                profile_step=self.global_steps,
+                captured=True,
+            )
+            self._completed_performance_profile_report = None
+
+        if self._profiled_step_this_iteration:
+            metrics["performance_watchdog/profiled_step_excluded"] = 1.0
+            self._last_performance_insufficient_reason = None
+            return
+
+        observation: PerformanceWatchdogResult = watchdog.observe(
+            self.global_steps,
+            metrics,
+            self._performance_watchdog_workload,
+        )
+        metrics["performance_watchdog/insufficient_evidence"] = float(observation.insufficient_evidence)
+        metrics["performance_watchdog/regression_detected"] = float(observation.alert is not None)
+
+        if observation.insufficient_evidence:
+            if observation.reason != self._last_performance_insufficient_reason:
+                logger.info(
+                    "Performance watchdog insufficient evidence step=%d reason=%s",
+                    self.global_steps,
+                    observation.reason,
+                )
+            self._last_performance_insufficient_reason = observation.reason
+        else:
+            self._last_performance_insufficient_reason = None
+
+        alert = observation.alert
+        if alert is None:
+            return
+
+        next_profile_step = self.global_steps + 1
+        if next_profile_step > self.total_training_steps:
+            self._log_performance_profile_report(alert, profile_step=None, captured=False)
+            return
+
+        self._performance_profile_step = next_profile_step
+        self._pending_performance_profile_report = alert
+        metrics["performance_watchdog/profile_scheduled"] = 1.0
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         """Feed one train batch and run ``parameter_sync_step`` local updates."""
@@ -588,7 +773,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     # syncs the standalone rollout, and switch_to_rollout is
                     # not guaranteed to fire), so keep the mid-cycle wake+sync
                     # or colocated generation stalls on stale weights.
-                    self.checkpoint_manager.update_weights(self.global_steps)
+                    self._update_rollout_weights_mid_cycle()
                 # In sync mode the replicas must stay asleep through the
                 # training phases below: update_weights resumes their weights
                 # (~55GB for Qwen-Image at rollout TP=1) and the actor update
@@ -684,6 +869,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         reward_tensor = reward_tensor.squeeze(-1).float() if reward_tensor.ndim > 1 else reward_tensor.float()
         return self._loss_fn.prepare_actor_batch(batch, reward_tensor, self.config)
 
+    @SkipManager.annotate(role="ref_log_prob")
     def _compute_ref_noise_pred(self, data: DataProto) -> DataProto | None:
         """Reference transformer output and shared flow tensors for DPO."""
         batch_td = _to_diffusion_worker_tensordict(data)
@@ -1361,26 +1547,41 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         batch = self._next_train_batch(num_prompts)
         return self._submit_batch_to_rollout(batch)
 
+    @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
     def _add_batch_to_generate(self):
         batch = self._next_train_batch()
         self._submit_batch_to_rollout(batch)
 
+    @SkipManager.annotate(role="weight_sync")
+    def _update_rollout_weights_mid_cycle(self) -> None:
+        """Wake colocated replicas after the reward phase and refresh their weights (async modes).
+
+        Lifecycle syncs (init, step end, validation) always run; skipping this
+        refresh still wakes the replicas, on pre-update weights.
+        """
+        self.checkpoint_manager.update_weights(self.global_steps)
+
+    @SkipManager.annotate(role="reward")
     def _compute_reward_colocate(self, data: DataProto) -> DataProto:
         """Compute reward score with a colocated reward model on a DataProto batch."""
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
         return self.reward_loop_manager.compute_rm_score(data)
 
+    @cached_property
+    def _actor_dp_size(self) -> int:
+        """Actor DP size, queried once: the dispatch mapping is fixed for the worker group's lifetime."""
+        if not hasattr(self.actor_rollout_wg, "_query_dispatch_info"):
+            return 1
+        info = self.actor_rollout_wg._query_dispatch_info("actor")
+        if isinstance(info, dict):
+            return max(info.values()) + 1 if info else 1
+        if isinstance(info, list | tuple | set):
+            return max(info) + 1 if info else 1
+        # ONE_TO_ALL dispatch may return a scalar dp rank per worker.
+        return int(info) + 1 if info is not None else 1
+
     def _balance_batch(self, data: DataProto, metrics: dict) -> DataProto:
-        dp_size = 1
-        if hasattr(self.actor_rollout_wg, "_query_dispatch_info"):
-            info = self.actor_rollout_wg._query_dispatch_info("actor")
-            if isinstance(info, dict):
-                dp_size = max(info.values()) + 1 if info else 1
-            elif isinstance(info, list | tuple | set):
-                dp_size = max(info) + 1 if info else 1
-            else:
-                # ONE_TO_ALL dispatch may return a scalar dp rank per worker.
-                dp_size = int(info) + 1 if info is not None else 1
+        dp_size = self._actor_dp_size
         actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
         if self.trainer_mode == "separate_async":
@@ -1423,6 +1624,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         advantages[is_pad] = 0.0
         return data
 
+    @SkipManager.annotate(role="old_log_prob")
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
         """Recompute old log-probs over diffusion latents with the actor engine."""
         batch_td = _to_diffusion_worker_tensordict(data)
@@ -1451,6 +1653,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             old_log_prob.meta_info["metrics"] = {"perf/mfu/actor_infer": mfu}
         return old_log_prob
 
+    @SkipManager.annotate(role="ref_log_prob")
     def _compute_ref_log_prob(self, data: DataProto) -> DataProto:
         """Compute reference log-probs over diffusion latents."""
         batch_td = _to_diffusion_worker_tensordict(data)
@@ -1475,6 +1678,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             ref_dict["ref_prev_sample_mean"] = prev_sample_mean.float()
         return DataProto.from_tensordict(tu.get_tensordict(ref_dict))
 
+    @SkipManager.annotate(role="advantage")
     def _compute_advantage(self, data: DataProto) -> DataProto:
         """Compute diffusion (Flow-GRPO) advantages on the driver."""
         reward_tensor, reward_extra_infos_dict = extract_reward(data)
@@ -1495,6 +1699,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         )
         return data
 
+    @SkipManager.annotate(role="actor_update")
     def _update_actor(self, data: DataProto) -> DataProto:
         """Update the diffusion actor network."""
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1589,6 +1794,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 )
                 tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
                 continue
+
+            # Stage-skip decorators bypass marked calls: validation must never poison training caches.
+            data.meta_info["validate"] = True
 
             if self.use_rm and self.reward_loop_manager.reward_loop_worker_handles is None:
                 self.checkpoint_manager.sleep_replicas()
